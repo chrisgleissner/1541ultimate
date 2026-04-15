@@ -1163,7 +1163,6 @@ void UsbHidDriver :: interrupt_handler()
             bool reversed_wheel = usb_hid_get_wheel_direction() == WHEEL_DIRECTION_REVERSED;
             int scroll_factor = usb_hid_get_scroll_factor();
             uint8_t output_mouse_joy = mouse_joy;
-            uint32_t now_ticks = (uint32_t)xTaskGetTickCount();
             int wheel_h_normalized = HidMouseInterpreter::normalizeHorizontalWheel(wheel_h);
             int wheel_v_normalized = HidMouseInterpreter::normalizeVerticalWheel(wheel_v);
             int wheel_h_keys = HidMouseInterpreter::applyWheelDirection(wheel_h_normalized, reversed_wheel);
@@ -1209,6 +1208,7 @@ void UsbHidDriver :: interrupt_handler()
                     wheel_axis_v_remainder = 0;
                     wheel_key_h_remainder = 0;
                     wheel_key_v_remainder = 0;
+                    uint32_t now_ticks = (uint32_t)xTaskGetTickCount();
                     int menu_wheel_h = usb_hid_filter_menu_wheel_step(HidMouseInterpreter::scaleMenuWheelKeys(wheel_h_keys), menu_wheel_h_latch);
                     int menu_wheel_v = HidMouseInterpreter::scaleMenuWheelBurst(
                         wheel_v_keys,
