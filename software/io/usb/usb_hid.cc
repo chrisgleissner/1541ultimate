@@ -45,7 +45,7 @@ static const uint32_t USB_HID_MENU_WHEEL_FAST_GAP_TICKS = (pdMS_TO_TICKS(30) > 0
 static const uint32_t USB_HID_MENU_WHEEL_SLOW_GAP_TICKS = (pdMS_TO_TICKS(90) > 0) ? pdMS_TO_TICKS(90) : USB_HID_MENU_WHEEL_FAST_GAP_TICKS;
 static const uint32_t USB_HID_MENU_WHEEL_RESET_GAP_TICKS = (pdMS_TO_TICKS(210) > 0) ? pdMS_TO_TICKS(210) : USB_HID_MENU_WHEEL_SLOW_GAP_TICKS;
 static const uint32_t USB_HID_MOUSE_WHEEL_PULSE_TICKS = (pdMS_TO_TICKS(50) > 0) ? pdMS_TO_TICKS(50) : 1;
-static const uint8_t USB_HID_MOUSE_WHEEL_BURST_LIMIT = 4;
+static const uint8_t USB_HID_MOUSE_WHEEL_BURST_LIMIT = 16;
 static const int USB_HID_MENU_WHEEL_EXTRA_STEP_THRESHOLD = 15;
 static const int USB_HID_MENU_MAX_PENDING_VERTICAL_KEYS = 2;
 
@@ -987,11 +987,10 @@ void UsbHidDriver :: poll(void)
                                            native_wheel_delta,
                                            output_mouse_joy)) {
         had_native_wheel_input = true;
-        HidMouseInterpreter::mergeNativeWheelBurst(
-            native_wheel_delta,
-            USB_HID_MOUSE_WHEEL_BURST_LIMIT,
-            wheel_pulse_burst_direction,
-            wheel_pulse_burst_count);
+        HidMouseInterpreter::mergeNativeWheelBurst(native_wheel_delta,
+                                                   USB_HID_MOUSE_WHEEL_BURST_LIMIT,
+                                                   wheel_pulse_burst_direction,
+                                                   wheel_pulse_burst_count);
     }
 
     output_mouse_joy = HidMouseInterpreter::applyWheelPulseMask(output_mouse_joy,

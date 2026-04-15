@@ -449,21 +449,23 @@ class HidMouseInterpreter
 
     static int computeNativeWheelGain(int sensitivity)
     {
-        // Native wheel mode already works in promoted detent units (8 per
-        // notch), so keep its sensitivity curve deliberately compressed. This
-        // preserves one native step per notch through the low settings while
-        // still allowing moderate extra amplification at the high end.
-        return 1 + ((clampWheelSetting(sensitivity) - 1) * 6) / 15;
+        // Mouse + Wheel mode emits discrete Micromys pulses, so map the
+        // promoted detent directly to the configured sensitivity. This keeps
+        // sensitivity 1 unchanged and lets higher settings expand a single
+        // notch into multiple native wheel pulses.
+        return clampWheelSetting(sensitivity);
     }
 
     static int computeNativeWheelThreshold(int sensitivity)
     {
-        return 9 - computeNativeWheelGain(sensitivity);
+        (void)sensitivity;
+        return 8;
     }
 
     static int accumulateNativeWheelSteps(int wheel_delta, int sensitivity, int& accumulator)
     {
         int threshold = computeNativeWheelThreshold(sensitivity);
+        int scaled_delta = wheel_delta * computeNativeWheelGain(sensitivity);
         int steps = 0;
 
         if (((wheel_delta > 0) && (accumulator < 0)) ||
@@ -471,7 +473,7 @@ class HidMouseInterpreter
             accumulator = 0;
         }
 
-        accumulator += wheel_delta;
+        accumulator += scaled_delta;
         while (accumulator >= threshold) {
             accumulator -= threshold;
             steps++;

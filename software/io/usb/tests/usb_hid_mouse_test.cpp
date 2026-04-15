@@ -267,35 +267,35 @@ TEST(HidMouseInterpreterTest, WheelStepAccumulationPreservesRemainder)
 {
 	int accumulator = 0;
 
-	EXPECT_EQ(0, HidMouseInterpreter::accumulateNativeWheelSteps(3, 8, accumulator));
-	EXPECT_EQ(3, accumulator);
-	EXPECT_EQ(1, HidMouseInterpreter::accumulateNativeWheelSteps(3, 8, accumulator));
+	EXPECT_EQ(0, HidMouseInterpreter::accumulateNativeWheelSteps(1, 4, accumulator));
+	EXPECT_EQ(4, accumulator);
+	EXPECT_EQ(1, HidMouseInterpreter::accumulateNativeWheelSteps(1, 4, accumulator));
 	EXPECT_EQ(0, accumulator);
-	EXPECT_EQ(0, HidMouseInterpreter::accumulateNativeWheelSteps(3, 8, accumulator));
-	EXPECT_EQ(3, accumulator);
-	EXPECT_EQ(-1, HidMouseInterpreter::accumulateNativeWheelSteps(-9, 8, accumulator));
-	EXPECT_EQ(-3, accumulator);
+	EXPECT_EQ(0, HidMouseInterpreter::accumulateNativeWheelSteps(1, 4, accumulator));
+	EXPECT_EQ(4, accumulator);
+	EXPECT_EQ(-1, HidMouseInterpreter::accumulateNativeWheelSteps(-3, 4, accumulator));
+	EXPECT_EQ(-4, accumulator);
 }
 
 TEST(HidMouseInterpreterTest, WheelStepAccumulationSupportsMultipleQueuedSteps)
 {
 	int accumulator = 0;
 
-	EXPECT_EQ(2, HidMouseInterpreter::accumulateNativeWheelSteps(17, 8, accumulator));
-	EXPECT_EQ(5, accumulator);
-	EXPECT_EQ(-2, HidMouseInterpreter::accumulateNativeWheelSteps(-17, 8, accumulator));
-	EXPECT_EQ(-5, accumulator);
+	EXPECT_EQ(2, HidMouseInterpreter::accumulateNativeWheelSteps(17, 1, accumulator));
+	EXPECT_EQ(1, accumulator);
+	EXPECT_EQ(-2, HidMouseInterpreter::accumulateNativeWheelSteps(-17, 1, accumulator));
+	EXPECT_EQ(-1, accumulator);
 
-	EXPECT_EQ(4, HidMouseInterpreter::accumulateNativeWheelSteps(8, 16, accumulator));
+	EXPECT_EQ(16, HidMouseInterpreter::accumulateNativeWheelSteps(8, 16, accumulator));
 	EXPECT_EQ(0, accumulator);
 }
 
-TEST(HidMouseInterpreterTest, NativeWheelThresholdMatchesExistingSensitivityDirection)
+TEST(HidMouseInterpreterTest, NativeWheelThresholdStaysCanonicalDetentSize)
 {
 	EXPECT_EQ(8, HidMouseInterpreter::computeNativeWheelThreshold(1));
-	EXPECT_EQ(7, HidMouseInterpreter::computeNativeWheelThreshold(4));
-	EXPECT_EQ(6, HidMouseInterpreter::computeNativeWheelThreshold(8));
-	EXPECT_EQ(2, HidMouseInterpreter::computeNativeWheelThreshold(16));
+	EXPECT_EQ(8, HidMouseInterpreter::computeNativeWheelThreshold(4));
+	EXPECT_EQ(8, HidMouseInterpreter::computeNativeWheelThreshold(8));
+	EXPECT_EQ(8, HidMouseInterpreter::computeNativeWheelThreshold(16));
 }
 
 TEST(HidMouseInterpreterTest, HigherNativeWheelSensitivityProducesMoreSteps)
@@ -305,10 +305,10 @@ TEST(HidMouseInterpreterTest, HigherNativeWheelSensitivityProducesMoreSteps)
 	int fast_accumulator = 0;
 
 	EXPECT_EQ(1, HidMouseInterpreter::accumulateNativeWheelSteps(8, 1, slow_accumulator));
-	EXPECT_EQ(1, HidMouseInterpreter::accumulateNativeWheelSteps(8, 8, medium_accumulator));
-	EXPECT_EQ(4, HidMouseInterpreter::accumulateNativeWheelSteps(8, 16, fast_accumulator));
+	EXPECT_EQ(8, HidMouseInterpreter::accumulateNativeWheelSteps(8, 8, medium_accumulator));
+	EXPECT_EQ(16, HidMouseInterpreter::accumulateNativeWheelSteps(8, 16, fast_accumulator));
 	EXPECT_EQ(0, slow_accumulator);
-	EXPECT_EQ(2, medium_accumulator);
+	EXPECT_EQ(0, medium_accumulator);
 	EXPECT_EQ(0, fast_accumulator);
 }
 
@@ -316,8 +316,8 @@ TEST(HidMouseInterpreterTest, NativeWheelLowSensitivityKeepsSingleDetentLinear)
 {
 	int accumulator = 0;
 
-	EXPECT_EQ(1, HidMouseInterpreter::accumulateNativeWheelSteps(8, 4, accumulator));
-	EXPECT_EQ(1, accumulator);
+	EXPECT_EQ(1, HidMouseInterpreter::accumulateNativeWheelSteps(8, 1, accumulator));
+	EXPECT_EQ(0, accumulator);
 }
 
 TEST(HidMouseInterpreterTest, SingleNormalizedDetentAlwaysProducesAtLeastOneNativeStep)
@@ -332,8 +332,8 @@ TEST(HidMouseInterpreterTest, NativeWheelAccumulatorDropsOppositeRemainder)
 {
 	int accumulator = 5;
 
-	EXPECT_EQ(-1, HidMouseInterpreter::accumulateNativeWheelSteps(-8, 8, accumulator));
-	EXPECT_EQ(-2, accumulator);
+	EXPECT_EQ(-1, HidMouseInterpreter::accumulateNativeWheelSteps(-8, 1, accumulator));
+	EXPECT_EQ(0, accumulator);
 }
 
 TEST(HidMouseInterpreterTest, NativeWheelBurstUsesLatestDirection)
