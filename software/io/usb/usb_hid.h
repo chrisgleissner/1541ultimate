@@ -30,9 +30,13 @@ class UsbHidDriver : public UsbDriver
     bool mouse;
     bool descriptor_keyboard;
     bool descriptor_mouse;
-    SemaphoreHandle_t state_mutex;
     int16_t mouse_x, mouse_y;
     uint8_t mouse_joy;
+    int native_wheel_delta_queue[8];
+    uint8_t native_wheel_queue_head;
+    uint8_t native_wheel_queue_tail;
+    uint8_t native_wheel_base_joy;
+    uint8_t native_wheel_output_active;
     uint8_t keyboard_data[8];
     HidItemList report_items;
     t_item_location rep_button1;
