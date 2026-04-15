@@ -597,6 +597,7 @@ UsbHidDriver :: UsbHidDriver(UsbInterface *intf) : UsbDriver(intf)
     mouse = false;
     descriptor_keyboard = false;
     descriptor_mouse = false;
+    state_mutex = xSemaphoreCreateMutex();
     mouse_x = mouse_y = 0;
     mouse_joy = 0x1F;
     memset(keyboard_data, 0, sizeof(keyboard_data));
@@ -641,6 +642,10 @@ UsbHidDriver :: UsbHidDriver(UsbInterface *intf) : UsbDriver(intf)
 
 UsbHidDriver :: ~UsbHidDriver()
 {
+    if (state_mutex) {
+        vSemaphoreDelete(state_mutex);
+        state_mutex = NULL;
+    }
 }
 
 bool UsbHidDriver :: has_active_report_keyboard(void) const
@@ -832,6 +837,11 @@ void UsbHidDriver :: disable()
         mouse_registered = false;
         usb_hid_apply_mouse_output_enable();
     }
+
+    if (state_mutex) {
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+    }
+
     mouse_joy = 0x1F;
 #if U64
     if (usb_hid_active_mouse_interfaces == 0) {
@@ -862,6 +872,10 @@ void UsbHidDriver :: disable()
     pointer_sensitivity_remainder_y = 0;
     adaptive_accel_ema_x16 = 0;
     adaptive_accel_scale_factor = HidMouseInterpreter::ADAPTIVE_ACCELERATION_FALLBACK_SCALE;
+
+    if (state_mutex) {
+        xSemaphoreGive(state_mutex);
+    }
 }
 
 void UsbHidDriver :: deinstall(UsbInterface *intf)
@@ -885,6 +899,10 @@ void UsbHidDriver :: poll(void)
         return;
     }
 
+    if (state_mutex) {
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+    }
+
     if (!HidMouseInterpreter::mouseModeRoutesWheelToNative(usb_hid_get_mouse_mode())) {
         if ((wheel_pulse_phase != HidMouseInterpreter::WHEEL_PULSE_PHASE_IDLE) ||
             (wheel_pulse_burst_count != 0) ||
@@ -901,6 +919,9 @@ void UsbHidDriver :: poll(void)
             C64_PADDLE_1_X = mouse_x & 0x7F;
             C64_PADDLE_1_Y = mouse_y & 0x7F;
         }
+        if (state_mutex) {
+            xSemaphoreGive(state_mutex);
+        }
         return;
     }
 
@@ -916,6 +937,10 @@ void UsbHidDriver :: poll(void)
         C64_JOY1_SWOUT = output_mouse_joy;
         C64_PADDLE_1_X = mouse_x & 0x7F;
         C64_PADDLE_1_Y = mouse_y & 0x7F;
+    }
+
+    if (state_mutex) {
+        xSemaphoreGive(state_mutex);
     }
 #endif
 }
@@ -959,6 +984,10 @@ void UsbHidDriver :: interrupt_handler()
     }
 
     if (mouse) {
+        if (state_mutex) {
+            xSemaphoreTake(state_mutex, portMAX_DELAY);
+        }
+
         int mouse_mode = usb_hid_get_mouse_mode();
         bool motion_to_cursor = HidMouseInterpreter::mouseModeRoutesMotionToCursor(mouse_mode);
         bool motion_to_pointer = HidMouseInterpreter::mouseModeRoutesMotionToPointer(mouse_mode);
@@ -1209,6 +1238,10 @@ void UsbHidDriver :: interrupt_handler()
 #endif
             previous_left_button_pressed = left_button_pressed;
             handled = true;
+        }
+
+        if (state_mutex) {
+            xSemaphoreGive(state_mutex);
         }
     }
 
