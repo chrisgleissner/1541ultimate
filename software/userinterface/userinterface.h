@@ -129,6 +129,7 @@ public:
     void swapDisk(void);
     void send_keystroke(int key);
     static bool anyMenuActive(void);
+    static bool copy_active_screen_matrix(uint8_t *dest, int dest_len);
 
     UIObject *get_root_object(void) { return ui_objects[0]; }
 

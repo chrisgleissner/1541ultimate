@@ -73,6 +73,23 @@ void Screen_MemMappedCharMatrix :: restore(void)
     backup_size = 0;
 }
 
+bool Screen_MemMappedCharMatrix :: copy_matrix(uint8_t *chars, uint8_t *colors, int max_cells, int *width, int *height)
+{
+    int cells = size_x * size_y;
+    if (width) {
+        *width = size_x;
+    }
+    if (height) {
+        *height = size_y;
+    }
+    if ((max_cells < cells) || !chars || !colors) {
+        return false;
+    }
+    memcpy(chars, char_base, cells);
+    memcpy(colors, color_base, cells);
+    return true;
+}
+
 void  Screen_MemMappedCharMatrix :: cursor_visible(int a) {
 	if (cursor_on != a) {
 		char *p = char_base + pointer;

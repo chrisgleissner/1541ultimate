@@ -4,6 +4,7 @@
 #include "subsys.h"
 #include "c64.h"
 #include "c64_subsys.h"
+#include "userinterface.h"
 #if U64
 #include "keyboard_usb.h"
 #include "joystick_output.h"
@@ -217,6 +218,23 @@ API_CALL(GET, machine, readmem, NULL, ARRAY( { {"address", P_REQUIRED}, {"length
         resp->error(SubsysCommand::error_string(retval.status));
         resp->json_response(SubsysCommand::http_response_map(retval.status));
         delete[] buffer;
+    }
+}
+
+API_CALL(GET, machine, menu_screen, NULL, ARRAY( {  }))
+{
+    static const int screen_size = 2000;
+    uint8_t *buffer = new uint8_t[screen_size];
+
+    if (UserInterface::copy_active_screen_matrix(buffer, screen_size)) {
+        StreamRamFile *rf = resp->add_attachment();
+        rf->write(buffer, screen_size);
+        delete[] buffer;
+        resp->binary_response();
+    } else {
+        delete[] buffer;
+        resp->error("Menu screen unavailable.");
+        resp->json_response(HTTP_NOT_FOUND);
     }
 }
 

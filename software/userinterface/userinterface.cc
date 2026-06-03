@@ -1,6 +1,10 @@
 #include "userinterface.h"
 #include <stdio.h>
 
+#if !defined(RUNS_ON_PC) && !defined(RECOVERYAPP)
+#include "c64.h"
+#endif
+
 #ifndef NO_FILE_ACCESS
 #include "FreeRTOS.h"
 #include "task.h"
@@ -502,6 +506,49 @@ bool UserInterface :: anyMenuActive(void)
     active = active_user_interface_count > 0;
     portEXIT_CRITICAL();
     return active;
+}
+
+static bool active_screen_read_safe(UserInterface *ui)
+{
+    if (!ui || !ui->screen) {
+        return false;
+    }
+#if !defined(RUNS_ON_PC) && !defined(RECOVERYAPP)
+    C64 *machine = C64::getMachine();
+    if (machine && ui->host == (GenericHost *)machine && !machine->is_accessible()) {
+        return false;
+    }
+#endif
+    return true;
+}
+
+bool UserInterface :: copy_active_screen_matrix(uint8_t *dest, int dest_len)
+{
+    static const int width = 40;
+    static const int height = 25;
+    static const int cells = width * height;
+    if (!dest || (dest_len < (2 * cells))) {
+        return false;
+    }
+
+    IndexedList<UserInterface *> *interfaces = get_user_interfaces();
+    for (int i = 0; i < interfaces->get_elements(); i++) {
+        UserInterface *ui = (*interfaces)[i];
+        if (!ui || !ui->is_available() || !active_screen_read_safe(ui)) {
+            continue;
+        }
+
+        int screen_width = 0;
+        int screen_height = 0;
+        if (!ui->screen->copy_matrix(dest, dest + cells, cells, &screen_width, &screen_height)) {
+            continue;
+        }
+        if ((screen_width != width) || (screen_height != height)) {
+            continue;
+        }
+        return true;
+    }
+    return false;
 }
 
 extern "C" bool userinterface_any_menu_active(void)

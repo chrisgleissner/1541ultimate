@@ -1,6 +1,8 @@
 #ifndef SCREEN_H
 #define SCREEN_H
 
+#include <stdint.h>
+
 #define CHR_LOWER_RIGHT_CORNER  0x01
 #define CHR_HORIZONTAL_LINE     0x02
 #define CHR_LOWER_LEFT_CORNER   0x03
@@ -53,6 +55,7 @@ public:
 
     // raw
     virtual void output_raw(char c) { }
+    virtual bool copy_matrix(uint8_t *chars, uint8_t *colors, int max_cells, int *width, int *height) { return false; }
 
     // Synchronization
     virtual void sync(void) { }
@@ -123,6 +126,7 @@ public:
     int  output(const char *c);
     void repeat(char c, int rep);
     void output_fixed_length(const char *string, int offset_x, int width);
+    bool copy_matrix(uint8_t *chars, uint8_t *colors, int max_cells, int *width, int *height);
 };
 
 class Window
