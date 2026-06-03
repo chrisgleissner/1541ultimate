@@ -223,7 +223,10 @@ API_CALL(GET, machine, readmem, NULL, ARRAY( { {"address", P_REQUIRED}, {"length
 
 API_CALL(GET, machine, menu_screen, NULL, ARRAY( {  }))
 {
-    static const int screen_size = 2000;
+    static const int screen_width = 40;
+    static const int screen_height = 25;
+    static const int screen_planes = 2;
+    static const int screen_size = screen_width * screen_height * screen_planes;
     uint8_t *buffer = new uint8_t[screen_size];
 
     if (UserInterface::copy_active_screen_matrix(buffer, screen_size)) {

@@ -527,11 +527,13 @@ bool UserInterface :: copy_active_screen_matrix(uint8_t *dest, int dest_len)
     static const int width = 40;
     static const int height = 25;
     static const int cells = width * height;
+    bool copied = false;
     if (!dest || (dest_len < (2 * cells))) {
         return false;
     }
 
     IndexedList<UserInterface *> *interfaces = get_user_interfaces();
+    portENTER_CRITICAL();
     for (int i = 0; i < interfaces->get_elements(); i++) {
         UserInterface *ui = (*interfaces)[i];
         if (!ui || !ui->is_available() || !active_screen_read_safe(ui)) {
@@ -546,9 +548,11 @@ bool UserInterface :: copy_active_screen_matrix(uint8_t *dest, int dest_len)
         if ((screen_width != width) || (screen_height != height)) {
             continue;
         }
-        return true;
+        copied = true;
+        break;
     }
-    return false;
+    portEXIT_CRITICAL();
+    return copied;
 }
 
 extern "C" bool userinterface_any_menu_active(void)
