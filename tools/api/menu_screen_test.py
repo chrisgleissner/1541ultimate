@@ -21,6 +21,7 @@ SCREEN_HEIGHT = 25
 SCREEN_CELLS = SCREEN_WIDTH * SCREEN_HEIGHT
 SCREEN_PLANES = 2
 SCREEN_BYTES = SCREEN_CELLS * SCREEN_PLANES
+MENU_TOGGLE_SETTLE_SECONDS = 0.25
 
 
 class Failure(RuntimeError):
@@ -82,6 +83,13 @@ class RestSession:
         except (OSError, TimeoutError, urllib.error.URLError) as exc:
             raise Failure(f"{method} {self.url(path, params)} failed: {format_exception(exc)}") from exc
 
+    def menu_button(self, label: str) -> None:
+        with check(label):
+            status, _, body = self.request("PUT", MENU_BUTTON_PATH)
+            if status != 200:
+                raise Failure(f"menu_button failed with HTTP {status}: {body[:160]!r}")
+        time.sleep(MENU_TOGGLE_SETTLE_SECONDS)
+
 
 def header_value(headers: Dict[str, str], name: str) -> str:
     wanted = name.lower()
@@ -136,10 +144,15 @@ def run_contract(session: RestSession, open_menu: bool) -> None:
         verify_binary_contract(status, headers, body)
 
 
-def run_unavailable(session: RestSession, open_menu: bool) -> None:
-    if open_menu:
-        print("menu_screen_test: SKIP unavailable (--open-menu expects an active menu)", file=sys.stderr)
-        return
+def run_contract_with_open_menu(session: RestSession) -> None:
+    session.menu_button("open menu")
+    try:
+        run_contract(session, open_menu=True)
+    finally:
+        session.menu_button("close menu")
+
+
+def run_unavailable(session: RestSession) -> None:
     with check("GET menu_screen unavailable"):
         status, headers, body = session.request("GET", MENU_SCREEN_PATH)
         if status != 404:
@@ -166,7 +179,7 @@ def run_auth(session: RestSession) -> None:
 
 def expand_tests(selected: Optional[List[str]]) -> List[str]:
     if not selected:
-        selected = ["contract", "auth"]
+        selected = ["contract", "unavailable", "auth"]
     expanded: List[str] = []
     for name in selected:
         names = ["contract", "unavailable", "auth"] if name == "all" else [name]
@@ -199,36 +212,23 @@ def main() -> int:
     parser.add_argument(
         "--open-menu",
         action="store_true",
-        help="Toggle the menu open for the positive menu_screen contract check.",
+        help="Toggle the menu open for the positive contract check, then close it before later checks.",
     )
     args = parser.parse_args()
 
     rest_host = args.rest_host or args.host
     session = RestSession(rest_host, args.password, args.timeout)
     tests = expand_tests(args.test)
-    opened = False
 
-    try:
-        if args.open_menu and "contract" in tests:
-            with check("open menu"):
-                status, _, body = session.request("PUT", MENU_BUTTON_PATH)
-                if status != 200:
-                    raise Failure(f"menu_button open failed with HTTP {status}: {body[:160]!r}")
-            opened = True
-            time.sleep(0.25)
-
-        if "contract" in tests:
+    if "contract" in tests:
+        if args.open_menu:
+            run_contract_with_open_menu(session)
+        else:
             run_contract(session, args.open_menu)
-        if "unavailable" in tests:
-            run_unavailable(session, args.open_menu)
-        if "auth" in tests:
-            run_auth(session)
-    finally:
-        if opened:
-            with check("close menu"):
-                status, _, body = session.request("PUT", MENU_BUTTON_PATH)
-                if status != 200:
-                    raise Failure(f"menu_button close failed with HTTP {status}: {body[:160]!r}")
+    if "unavailable" in tests:
+        run_unavailable(session)
+    if "auth" in tests:
+        run_auth(session)
 
     print(f"menu_screen_test: OK ({CHECK_COUNT} checks)")
     return 0
