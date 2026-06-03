@@ -77,6 +77,8 @@ class Screen_MemMappedCharMatrix : public Screen
 
 	char *char_base;
     char *color_base;
+    char *cell_colour_codes;
+    int cell_colour_codes_size;
 
 	int size_x;
 	int size_y;
@@ -89,6 +91,7 @@ class Screen_MemMappedCharMatrix : public Screen
 	// private stuff
 	void scroll_up(void);
     void scroll_down(void);
+    void resize_cell_colour_codes(void);
 
 protected:
     // draw mode
@@ -103,7 +106,7 @@ protected:
     void output_raw(char c);
 public:
     Screen_MemMappedCharMatrix(char *, char *, int, int);
-    ~Screen_MemMappedCharMatrix() { }
+    ~Screen_MemMappedCharMatrix();
 
     void backup(void);
     void restore(void);

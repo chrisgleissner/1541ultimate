@@ -9,6 +9,7 @@
 #include "keyboard_usb.h"
 #include "joystick_output.h"
 extern "C" void route_input_note_menu_button(void);
+extern "C" bool push_active_menu_button(void) __attribute__((weak));
 #endif
 
 #define MENU_C64_PAUSE      0x640B
@@ -29,6 +30,10 @@ API_CALL(PUT, machine, menu_button, NULL, ARRAY( {  }))
 {
 #if U64
     route_input_note_menu_button();
+    if (push_active_menu_button && push_active_menu_button()) {
+        resp->json_response(HTTP_OK);
+        return;
+    }
 #endif
     SubsysCommand *cmd = new SubsysCommand(NULL, SUBSYSID_C64, C64_PUSH_BUTTON, 0);
     SubsysResultCode_t retval = cmd->execute();

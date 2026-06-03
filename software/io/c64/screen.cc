@@ -13,7 +13,7 @@ extern "C" {
 
 
 /**
- * Basic screen implementation, on a memory mapped character grid and a memory mapped attribute grid
+ * Basic screen implementation, on a memory mapped character grid and a memory mapped colour grid
  */
 Screen_MemMappedCharMatrix :: Screen_MemMappedCharMatrix(char *b, char *c, int sx, int sy)
 {
@@ -21,6 +21,8 @@ Screen_MemMappedCharMatrix :: Screen_MemMappedCharMatrix(char *b, char *c, int s
 
 	char_base  = b;
     color_base = c;
+    cell_colour_codes = 0;
+    cell_colour_codes_size = 0;
 
     size_x     = sx;
     size_y     = sy;
@@ -38,12 +40,40 @@ Screen_MemMappedCharMatrix :: Screen_MemMappedCharMatrix(char *b, char *c, int s
     backup_chars = 0;
     backup_color = 0;
     backup_x = backup_y = backup_size = 0;
+    resize_cell_colour_codes();
+}
+
+Screen_MemMappedCharMatrix :: ~Screen_MemMappedCharMatrix()
+{
+    delete[] cell_colour_codes;
+}
+
+void Screen_MemMappedCharMatrix :: resize_cell_colour_codes(void)
+{
+    int size = size_x * size_y;
+    if ((size <= 0) || ((size == cell_colour_codes_size) && cell_colour_codes)) {
+        return;
+    }
+
+    char *old_cell_colour_codes = cell_colour_codes;
+    int old_size = cell_colour_codes_size;
+
+    cell_colour_codes = new char[size];
+    memset(cell_colour_codes, 15, size);
+
+    if (old_cell_colour_codes) {
+        int copy_size = old_size < size ? old_size : size;
+        memcpy(cell_colour_codes, old_cell_colour_codes, copy_size);
+        delete[] old_cell_colour_codes;
+    }
+    cell_colour_codes_size = size;
 }
 
 void Screen_MemMappedCharMatrix :: update_size(int sx, int sy)
 {
     size_x = sx;
     size_y = sy;
+    resize_cell_colour_codes();
 }
 
 void Screen_MemMappedCharMatrix :: backup(void)
@@ -56,8 +86,9 @@ void Screen_MemMappedCharMatrix :: backup(void)
 	backup_color = new char[backup_size];
 	backup_x = cursor_x;
 	backup_y = cursor_y;
+    resize_cell_colour_codes();
 	memcpy(backup_chars, char_base, backup_size);
-	memcpy(backup_color, color_base, backup_size);
+	memcpy(backup_color, cell_colour_codes, backup_size);
 }
 
 void Screen_MemMappedCharMatrix :: restore(void)
@@ -67,6 +98,8 @@ void Screen_MemMappedCharMatrix :: restore(void)
     }
 	memcpy(char_base, backup_chars, backup_size);
 	memcpy(color_base, backup_color, backup_size);
+    resize_cell_colour_codes();
+	memcpy(cell_colour_codes, backup_color, backup_size);
 	move_cursor(backup_x, backup_y);
 	delete[] backup_chars;
 	delete[] backup_color;
@@ -85,8 +118,11 @@ bool Screen_MemMappedCharMatrix :: copy_matrix(uint8_t *chars, uint8_t *colors, 
     if ((max_cells < cells) || !chars || !colors) {
         return false;
     }
+    if (!cell_colour_codes || (cell_colour_codes_size < cells)) {
+        return false;
+    }
     memcpy(chars, char_base, cells);
-    memcpy(colors, color_base, cells);
+    memcpy(colors, cell_colour_codes, cells);
     return true;
 }
 
@@ -128,13 +164,17 @@ void Screen_MemMappedCharMatrix :: scroll_up()
 	}
 	char *b = char_base;
     char *c = color_base;
+    resize_cell_colour_codes();
+    char *s = cell_colour_codes;
     for(int y=0;y<size_y-1;y++) {
         for(int x=0;x<size_x;x++) {
             b[x] = b[x+size_x];
             c[x] = c[x+size_x];
+            s[x] = s[x+size_x];
         }
         b+=size_x;
         c+=size_x;
+        s+=size_x;
     }
     for(int x=0;x<size_x;x++)
         b[x] = 0;
@@ -144,13 +184,17 @@ void Screen_MemMappedCharMatrix :: scroll_down()
 {
     char *b = &char_base[(size_y-2)*size_x];
     char *c = &color_base[(size_y-2)*size_x];
+    resize_cell_colour_codes();
+    char *s = &cell_colour_codes[(size_y-2)*size_x];
     for(int y=0;y<size_y-1;y++) {
         for(int x=0;x<size_x;x++) {
             b[x+size_x] = b[x];
             c[x+size_x] = c[x];
+            s[x+size_x] = s[x];
         }
         b-=size_x;
         c-=size_x;
+        s-=size_x;
     }
     for(int x=0;x<size_x;x++)
         b[x+size_x] = 0;
@@ -242,7 +286,9 @@ void Screen_MemMappedCharMatrix :: output_raw(char c)
             else
                 char_base[pointer] = c & 0x7F;
 
-            color_base[pointer] = (char)(color | background << 4);
+            char cell_colour_code = (char)((color & 15) | ((background & 15) << 4));
+            color_base[pointer] = cell_colour_code;
+            cell_colour_codes[pointer] = cell_colour_code;
             pointer ++;
             cursor_x++;
 
@@ -295,8 +341,10 @@ void Screen_MemMappedCharMatrix :: clear() {
 	reverse_mode(0);
 	set_color(15);
 	int size = get_size_x() * get_size_y();
+    resize_cell_colour_codes();
 	memset(char_base, 32, size);
 	memset(color_base, 15, size);
+	memset(cell_colour_codes, 15, size);
     move_cursor(0, 0);
 }
 

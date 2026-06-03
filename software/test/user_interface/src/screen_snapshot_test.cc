@@ -36,6 +36,7 @@ int main()
 {
     uint8_t chars[MATRIX_CELLS] = { 0x01, 0x82, 0x03, 0x44, 0x05, 0xC6 };
     uint8_t colors[MATRIX_CELLS] = { 0x10, 0x21, 0x32, 0x43, 0xF4, 0x8F };
+    uint8_t initial_cell_colour_codes[MATRIX_CELLS] = { 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F };
     uint8_t out_chars[MATRIX_CELLS] = { 0 };
     uint8_t out_colors[MATRIX_CELLS] = { 0 };
     int width = 0;
@@ -51,7 +52,21 @@ int main()
     if (expect_bytes("character", out_chars, chars, MATRIX_CELLS)) {
         return 1;
     }
-    if (expect_bytes("colour", out_colors, colors, MATRIX_CELLS)) {
+    if (expect_bytes("initial cell colour code", out_colors, initial_cell_colour_codes, MATRIX_CELLS)) {
+        return 1;
+    }
+
+    screen.move_cursor(0, 0);
+    screen.set_color(1);
+    screen.set_background(6);
+    screen.output('X');
+    colors[0] &= 0x0F;
+    memset(out_colors, 0, sizeof(out_colors));
+    if (!screen.copy_matrix(out_chars, out_colors, MATRIX_CELLS, &width, &height)) {
+        return fail("copy_matrix failed after writing a coloured cell.");
+    }
+    if (out_colors[0] != 0x61) {
+        printf("Unexpected cell colour code byte: %02X\n", out_colors[0]);
         return 1;
     }
 
