@@ -176,8 +176,11 @@ void Screen_MemMappedCharMatrix :: scroll_up()
         c+=size_x;
         s+=size_x;
     }
-    for(int x=0;x<size_x;x++)
+    for(int x=0;x<size_x;x++) {
         b[x] = 0;
+        c[x] = 15;
+        s[x] = 15;
+    }
 }
 
 void Screen_MemMappedCharMatrix :: scroll_down()
@@ -196,8 +199,11 @@ void Screen_MemMappedCharMatrix :: scroll_down()
         c-=size_x;
         s-=size_x;
     }
-    for(int x=0;x<size_x;x++)
+    for(int x=0;x<size_x;x++) {
         b[x+size_x] = 0;
+        c[x+size_x] = 15;
+        s[x+size_x] = 15;
+    }
 }
 
 void Screen_MemMappedCharMatrix :: repeat(char a, int len)

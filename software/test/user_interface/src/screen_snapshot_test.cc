@@ -70,6 +70,24 @@ int main()
         return 1;
     }
 
+    screen.clear();
+    screen.move_cursor(0, MATRIX_HEIGHT - 1);
+    screen.set_color(1);
+    screen.set_background(6);
+    screen.output('x');
+    screen.output('y');
+    screen.output('\n');
+    memset(out_colors, 0, sizeof(out_colors));
+    if (!screen.copy_matrix(out_chars, out_colors, MATRIX_CELLS, &width, &height)) {
+        return fail("copy_matrix failed after scrolling.");
+    }
+    for (int i = MATRIX_WIDTH; i < MATRIX_CELLS; i++) {
+        if (out_colors[i] != 0x0F) {
+            printf("Unexpected blank row colour code byte at %d: %02X\n", i, out_colors[i]);
+            return 1;
+        }
+    }
+
     width = 0;
     height = 0;
     if (screen.copy_matrix(out_chars, out_colors, MATRIX_CELLS - 1, &width, &height)) {

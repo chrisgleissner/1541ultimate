@@ -92,6 +92,8 @@ class Screen_MemMappedCharMatrix : public Screen
 	void scroll_up(void);
     void scroll_down(void);
     void resize_cell_colour_codes(void);
+    Screen_MemMappedCharMatrix(const Screen_MemMappedCharMatrix &);
+    Screen_MemMappedCharMatrix &operator=(const Screen_MemMappedCharMatrix &);
 
 protected:
     // draw mode
