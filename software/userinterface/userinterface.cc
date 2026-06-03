@@ -524,15 +524,14 @@ static bool active_screen_read_safe(UserInterface *ui)
 
 bool UserInterface :: copy_active_screen_matrix(uint8_t *dest, int dest_len)
 {
-    static const int width = 40;
-    static const int height = 25;
-    static const int cells = width * height;
     bool copied = false;
-    if (!dest || (dest_len < (2 * cells))) {
+    if (!dest || (dest_len < ACTIVE_SCREEN_MATRIX_BYTES)) {
         return false;
     }
 
     IndexedList<UserInterface *> *interfaces = get_user_interfaces();
+    // Keep the UI pointer stable while walking the shared list and making the
+    // bounded matrix copy; IndexedList mutations use the same critical section.
     portENTER_CRITICAL();
     for (int i = 0; i < interfaces->get_elements(); i++) {
         UserInterface *ui = (*interfaces)[i];
@@ -542,10 +541,12 @@ bool UserInterface :: copy_active_screen_matrix(uint8_t *dest, int dest_len)
 
         int screen_width = 0;
         int screen_height = 0;
-        if (!ui->screen->copy_matrix(dest, dest + cells, cells, &screen_width, &screen_height)) {
+        if (!ui->screen->copy_matrix(dest, dest + ACTIVE_SCREEN_MATRIX_CELLS,
+                ACTIVE_SCREEN_MATRIX_CELLS, &screen_width, &screen_height)) {
             continue;
         }
-        if ((screen_width != width) || (screen_height != height)) {
+        if ((screen_width != ACTIVE_SCREEN_MATRIX_WIDTH) ||
+                (screen_height != ACTIVE_SCREEN_MATRIX_HEIGHT)) {
             continue;
         }
         copied = true;

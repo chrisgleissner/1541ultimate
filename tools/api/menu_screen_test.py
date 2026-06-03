@@ -16,6 +16,11 @@ MENU_SCREEN_PATH = "/v1/machine:menu_screen"
 MENU_BUTTON_PATH = "/v1/machine:menu_button"
 MENU_SCREEN_UNAVAILABLE = "Menu screen unavailable."
 FORBIDDEN = "Forbidden."
+SCREEN_WIDTH = 40
+SCREEN_HEIGHT = 25
+SCREEN_CELLS = SCREEN_WIDTH * SCREEN_HEIGHT
+SCREEN_PLANES = 2
+SCREEN_BYTES = SCREEN_CELLS * SCREEN_PLANES
 
 
 class Failure(RuntimeError):
@@ -110,13 +115,13 @@ def verify_binary_contract(status: int, headers: Dict[str, str], body: bytes) ->
     content_type = header_value(headers, "Content-Type")
     if "application/octet-stream" not in content_type:
         raise Failure(f"expected application/octet-stream, got {content_type!r}")
-    if len(body) != 2000:
-        raise Failure(f"expected 2000 response bytes, got {len(body)}")
+    if len(body) != SCREEN_BYTES:
+        raise Failure(f"expected {SCREEN_BYTES} response bytes, got {len(body)}")
 
-    chars = body[:1000]
-    attrs = body[1000:]
-    if len(chars) != 1000 or len(attrs) != 1000:
-        raise Failure("response did not split into two 1000-byte planes")
+    chars = body[:SCREEN_CELLS]
+    attrs = body[SCREEN_CELLS:]
+    if len(chars) != SCREEN_CELLS or len(attrs) != SCREEN_CELLS:
+        raise Failure(f"response did not split into two {SCREEN_CELLS}-byte planes")
     if len(set(chars)) == 1 and len(set(attrs)) == 1:
         raise Failure("snapshot is trivially uniform in both planes")
 
