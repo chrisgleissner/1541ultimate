@@ -32,7 +32,7 @@ The machine code monitor can be opened in three ways:
 | -------------- | ------------------------- | ---------------------- | -------------------------------------------------------------------------------------------- |
 | **UI Freeze Mode**  | Frozen                    | Monitor is visible     | You want full-screen monitor use, automatic freezing, or monitor output in the video stream. |
 | **UI Overlay Mode** | Running, but can be frozen via `Z` shortcut or in debug mode                  | Monitor is invisible | You want to use the monitor while the C64 keeps running.                                     |
-| **Telnet**     | Dito                   | Monitor is invisible         | You want to use the monitor from another machine or in an automated way.                                            |
+| **Telnet**     | Ditto                   | Monitor is invisible         | You want to use the monitor from another machine or in an automated way.                                            |
 
 ### Switching between UI Freeze and UI Overlay Modes
 
@@ -377,7 +377,7 @@ When both banks are the same, the footer shows a single `CPUx` value, where `x` 
 
 ```text
 CPU7 $A:BAS $D:I/O $E:KRN VIC0 $0000
-````
+```
 
 When the CPU execution bank and monitor view bank differ, the footer shows both values as `CxOy`:
 
