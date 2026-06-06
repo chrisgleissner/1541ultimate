@@ -9,9 +9,9 @@
 //   - peek/poke use C64::peek / C64::poke (DMA into C64 RAM)
 //   - reset uses C64::reset
 //   - NMI pulse uses the cartridge C64_MODE_NMI register
-// U2 does NOT support volatile ROM-image patching, so BASIC/KERNAL stepping
-// is only available when the user has loaded code into RAM or has KERNAL
-// banked out by the CPU port.
+// U2 does NOT support visible ROM patching, so BASIC/KERNAL stepping is only
+// available when the code is actually executing from writable RAM (for
+// example after an explicit RAM shadow copy or with the ROM banked out).
 
 #include "monitor_debug_u2.h"
 
@@ -59,8 +59,18 @@ protected:
     }
     virtual void unfreeze_if_accessible(void)
     {
-        if (machine->is_accessible()) {
+        if (machine && machine->is_accessible()) {
             machine->unfreeze();
+        }
+    }
+    virtual bool machine_is_frozen(void) const
+    {
+        return machine ? machine->is_accessible() : false;
+    }
+    virtual void refreeze_machine(void)
+    {
+        if (machine) {
+            machine->refreeze();
         }
     }
     virtual bool reset_machine(void)
@@ -93,6 +103,11 @@ public:
     {
         machine = C64::getMachine();
     }
+
+    // Restore patches/handler while this subclass' hooks are still live. The
+    // abstract base destructor must not call cleanup() (its hooks are pure by
+    // then), so the leaf owns the final safety-net cleanup.
+    virtual ~U2DebugSession() { cleanup(); }
 };
 
 }

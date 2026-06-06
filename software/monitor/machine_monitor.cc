@@ -30,27 +30,27 @@ static const uint16_t monitor_cursor_blink_half_period_ms = 400;
 
 static const char *const monitor_help_lines[] = {
     "",
-    "M Memory    I ASCII     V Screen",
-    "A Assembly  B Binary    U Undoc/Case",
-    "J Jump      G Go",
+    "M Memory     I ASCII      V Screen",
+    "A Assembly   B Binary     U Undoc/Case",
+    "J Jump       G Go         D Debug",
     "",
-    "E Edit      F Fill      T Transfer",
-    "C Compare   H Hunt      N Number",
-    "W Width     R Range     P Poll",
-    "Z Freeze    O CPU Bank  SH+O VIC",
-    "L Load      S Save",
+    "E Edit       F Fill       T Transfer",
+    "C Compare    H Hunt       N Number",
+    "W Width      R Range      P Poll",
+    "Z Freeze     O CPU Bank   SH+O VIC",
+    "L Load       S Save",
     "",
-    "Bookmarks:  C=+B List   C=+0-9 Jump",
+    "Bookmarks:   C=+B List    C=+0-9 Jump",
     "",
-    "Open monitor:  C=+O",
-    "Close monitor: C=+O/RSTOP",
-    "Leave edit:    C=+E/RSTOP",
-    "Copy/Paste:    C=+C / C=+V",
-    "Reset/Follow:  C=+X Reset / RETURN",
+    "Monitor:        C=+O Open/Close",
+    "Leave edit:     C=+E/RSTOP",
+    "Copy/Paste:     C=+C / C=+V",
+    "Reset/Follow:   C=+X Reset / RETURN",
     NULL
 };
 
-static const char monitor_help_paging_line[] = "Page Up/Down:  F1/SH+SPACE / F7/SPACE";
+static const char monitor_help_paging_line[] = "Page Up/Down:   F1/SH+SPACE / F7/SPACE";
+static const char monitor_debug_help_paging_line[] = "Page Up/Down:  F1/SH+SPACE / F7/SPACE";
 
 static bool monitor_saved_state_valid = false;
 static MachineMonitorState monitor_saved_state = {
@@ -62,6 +62,32 @@ static MachineMonitorState monitor_saved_state = {
     MONITOR_SCREEN_CHARSET_UPPER_GRAPHICS,
     0x07
 };
+
+static bool monitor_reset_reopen_state_valid = false;
+static MachineMonitorState monitor_reset_reopen_state;
+static bool monitor_reset_reopen_debug_active = false;
+
+static const char *monitor_debug_result_name(DebugSession::Result result);
+static const char *monitor_view_name(MachineMonitorView view);
+static void monitor_log(const char *action);
+static void monitor_log_address(const char *action, uint16_t address);
+static void monitor_log_value(const char *action, uint16_t address, uint16_t value);
+static void monitor_log_byte(const char *action, uint16_t address, uint8_t value);
+static void monitor_log_range(const char *action, uint16_t start, uint16_t end);
+static void monitor_log_debug(const char *action, uint16_t pc, DebugSession::Result result);
+
+static MachineMonitorState monitor_reset_reentry_state(const MachineMonitorState &source)
+{
+    MachineMonitorState sanitized;
+    sanitized.view = source.view;
+    sanitized.current_addr = source.current_addr;
+    sanitized.base_addr = source.base_addr;
+    sanitized.disasm_offset = source.disasm_offset;
+    sanitized.illegal_enabled = source.illegal_enabled;
+    sanitized.screen_charset = source.screen_charset;
+    sanitized.cpu_port = source.cpu_port;
+    return sanitized;
+}
 
 // Persistent LOAD/SAVE/GO state (across monitor invocations within a single
 // firmware run). Defaults match the spec: a "press L, RETURN, RETURN" sequence
@@ -971,6 +997,8 @@ void monitor_reset_saved_state(void)
     monitor_saved_state.illegal_enabled = false;
     monitor_saved_state.screen_charset = MONITOR_SCREEN_CHARSET_UPPER_GRAPHICS;
     monitor_saved_state.cpu_port = 0x07;
+    monitor_reset_reopen_state_valid = false;
+    monitor_reset_reopen_debug_active = false;
 
     monitor_last_load_use_prg = true;
     monitor_last_load_start = 0x0801;
@@ -992,6 +1020,8 @@ void monitor_reset_saved_state(void)
 void monitor_invalidate_saved_state(void)
 {
     monitor_saved_state_valid = false;
+    monitor_reset_reopen_state_valid = false;
+    monitor_reset_reopen_debug_active = false;
 }
 
 void monitor_apply_go(MachineMonitorState *state, uint16_t address)
@@ -1117,6 +1147,21 @@ MonitorError monitor_parse_fill(const char *text, uint16_t *start, uint16_t *end
 
 MonitorError monitor_parse_transfer(const char *text, uint16_t *start, uint16_t *end, uint16_t *dest)
 {
+    bool relocate;
+    uint16_t reloc_start;
+    uint16_t reloc_end;
+    MonitorError error = monitor_parse_transfer_relocate(text, start, end, dest,
+                                                         &relocate, &reloc_start, &reloc_end);
+    if (error != MONITOR_OK) {
+        return error;
+    }
+    return relocate ? MONITOR_SYNTAX : MONITOR_OK;
+}
+
+MonitorError monitor_parse_transfer_relocate(const char *text, uint16_t *start, uint16_t *end,
+                                             uint16_t *dest, bool *relocate,
+                                             uint16_t *reloc_start, uint16_t *reloc_end)
+{
     const char *cursor = text;
     MonitorError error = parse_hex_digits(cursor, 1, 4, 0xFFFF, start);
     if (error != MONITOR_OK) {
@@ -1142,6 +1187,34 @@ MonitorError monitor_parse_transfer(const char *text, uint16_t *start, uint16_t 
         return MONITOR_ADDR;
     }
     skip_spaces(cursor);
+    if (*cursor == ',') {
+        cursor++;
+        error = parse_hex_digits(cursor, 1, 4, 0xFFFF, reloc_start);
+        if (error != MONITOR_OK) {
+            return MONITOR_ADDR;
+        }
+        error = expect_separator(cursor, '-', MONITOR_SYNTAX);
+        if (error != MONITOR_OK) {
+            return error;
+        }
+        error = parse_hex_digits(cursor, 1, 4, 0xFFFF, reloc_end);
+        if (error != MONITOR_OK) {
+            return MONITOR_ADDR;
+        }
+        if (*reloc_end <= *reloc_start) {
+            return MONITOR_RANGE;
+        }
+        skip_spaces(cursor);
+        *relocate = true;
+        return *cursor ? MONITOR_SYNTAX : MONITOR_OK;
+    }
+    *relocate = false;
+    if (reloc_start) {
+        *reloc_start = 0;
+    }
+    if (reloc_end) {
+        *reloc_end = 0;
+    }
     return *cursor ? MONITOR_SYNTAX : MONITOR_OK;
 }
 
@@ -1235,6 +1308,57 @@ void monitor_transfer_memory(MemoryBackend *backend, uint16_t start, uint16_t en
         for (index = 0; index < length; index++) {
             backend->write((uint16_t)(dest + index), backend->read((uint16_t)(start + index)));
         }
+    }
+}
+
+static bool monitor_transfer_source_contains(uint16_t start, uint16_t end, uint16_t address)
+{
+    return address >= start && address < end;
+}
+
+static uint16_t monitor_transfer_mapped_address(uint16_t start, uint16_t end,
+                                                uint16_t dest, uint16_t address)
+{
+    if (monitor_transfer_source_contains(start, end, address)) {
+        return (uint16_t)(dest + (uint16_t)(address - start));
+    }
+    return address;
+}
+
+static uint8_t monitor_transfer_read_code(MemoryBackend *backend, uint16_t start, uint16_t end,
+                                          uint16_t dest, uint16_t address)
+{
+    return backend->read(monitor_transfer_mapped_address(start, end, dest, address));
+}
+
+void monitor_transfer_memory_relocate(MemoryBackend *backend, uint16_t start, uint16_t end,
+                                      uint16_t dest, uint16_t reloc_start, uint16_t reloc_end)
+{
+    monitor_transfer_memory(backend, start, end, dest);
+
+    uint16_t address = reloc_start;
+    while (address < reloc_end) {
+        uint8_t bytes[3];
+        Disassembled6502 decoded;
+        uint8_t length;
+
+        bytes[0] = monitor_transfer_read_code(backend, start, end, dest, address);
+        bytes[1] = monitor_transfer_read_code(backend, start, end, dest, (uint16_t)(address + 1));
+        bytes[2] = monitor_transfer_read_code(backend, start, end, dest, (uint16_t)(address + 2));
+        disassemble_6502(address, bytes, true, &decoded);
+        length = decoded.valid && decoded.length ? decoded.length : 1;
+
+        if (decoded.valid && decoded.length == 3 && decoded.operand_bytes == 2 &&
+                (uint16_t)(address + 2) < reloc_end) {
+            uint16_t operand = (uint16_t)(bytes[1] | ((uint16_t)bytes[2] << 8));
+            if (monitor_transfer_source_contains(start, end, operand)) {
+                uint16_t relocated = (uint16_t)(dest + (uint16_t)(operand - start));
+                uint16_t write_addr = monitor_transfer_mapped_address(start, end, dest, address);
+                backend->write((uint16_t)(write_addr + 1), (uint8_t)(relocated & 0xFF));
+                backend->write((uint16_t)(write_addr + 2), (uint8_t)(relocated >> 8));
+            }
+        }
+        address = (uint16_t)(address + length);
     }
 }
 
@@ -1560,7 +1684,14 @@ MonitorError monitor_validate_load_size(uint32_t file_size, uint32_t offset, boo
 MachineMonitor :: MachineMonitor(UserInterface *ui, MemoryBackend *mem_backend) : UIObject(ui)
 {
     backend = mem_backend;
-    if (monitor_saved_state_valid) {
+    restore_debug_after_reset = false;
+    if (monitor_reset_reopen_state_valid) {
+        state = monitor_reset_reopen_state;
+        restore_debug_after_reset = monitor_reset_reopen_debug_active;
+        monitor_saved_state = state;
+        monitor_saved_state_valid = true;
+        monitor_reset_reopen_state_valid = false;
+    } else if (monitor_saved_state_valid) {
         state = monitor_saved_state;
     } else {
         state.view = MONITOR_VIEW_HEX;
@@ -1585,6 +1716,8 @@ MachineMonitor :: MachineMonitor(UserInterface *ui, MemoryBackend *mem_backend) 
     last_go_addr = monitor_last_go_addr;
     go_pending = false;
     go_pending_addr = 0;
+    go_pending_has_context = false;
+    debug_context_reset(&go_pending_context);
     memory_bytes_per_row = monitor_memory_bytes_per_row;
     binary_bytes_per_row = monitor_binary_bytes_per_row;
     clipboard.data = NULL;
@@ -1643,6 +1776,13 @@ MachineMonitor :: MachineMonitor(UserInterface *ui, MemoryBackend *mem_backend) 
     vic_bank_override = false;
     bookmarks = new MonitorBookmarks();
     debug_session = NULL;
+    debug_cursor_override = false;
+    debug_entry_context_valid = false;
+    debug_context_reset(&debug_entry_context);
+    debug_run_window_refreeze_enabled = false;
+    reset_exits_monitor = false;
+    reset_exit_pending = false;
+    reopen_after_reset = false;
     breakpoint_popup_active = false;
     breakpoint_selected = 0;
     bookmark_popup_active = false;
@@ -1658,6 +1798,34 @@ MachineMonitor :: MachineMonitor(UserInterface *ui, MemoryBackend *mem_backend) 
 #else
     edit_blink_ms = 0;
 #endif
+}
+
+void MachineMonitor :: set_debug_run_window_refreeze_enabled(bool enabled)
+{
+    debug_run_window_refreeze_enabled = enabled;
+    if (debug_session) {
+        debug_session->set_run_window_refreeze_enabled(enabled);
+    }
+}
+
+void MachineMonitor :: set_reset_exits_monitor(bool enabled)
+{
+    reset_exits_monitor = enabled;
+}
+
+void MachineMonitor :: request_reopen_after_reset(void)
+{
+    monitor_reset_reopen_state = monitor_reset_reentry_state(state);
+    monitor_reset_reopen_state_valid = true;
+    monitor_reset_reopen_debug_active = debug.is_active();
+    reopen_after_reset = true;
+}
+
+bool MachineMonitor :: consume_reopen_after_reset(void)
+{
+    bool ret = reopen_after_reset;
+    reopen_after_reset = false;
+    return ret;
 }
 
 uint8_t MachineMonitor :: memory_byte_stride(void) const
@@ -1688,6 +1856,7 @@ void MachineMonitor :: apply_go_local(uint16_t address)
 {
     uint16_t span = row_span();
     state.current_addr = address;
+    debug_cursor_override = restore_debug_after_reset || !debug.is_active() || !debug.has_context();
     if (state.view == MONITOR_VIEW_BINARY) {
         if (span == 0) span = 1;
         state.base_addr = (uint16_t)(address - (address % span));
@@ -1755,6 +1924,7 @@ uint8_t MachineMonitor :: canonical_read(uint16_t address)
 void MachineMonitor :: canonical_write(uint16_t address, uint8_t value)
 {
     backend->write(address, value);
+    monitor_log_byte("write", address, value);
 }
 
 void MachineMonitor :: read_row(uint16_t address, uint8_t *dst, uint16_t len) const
@@ -1897,6 +2067,7 @@ void MachineMonitor :: toggle_range_mode(void)
     if (!range_mode) {
         range_anchor = state.current_addr;
         range_mode = true;
+        monitor_log_address("range-start", range_anchor);
         return;
     }
     if (!clipboard_copy_range()) {
@@ -1905,6 +2076,7 @@ void MachineMonitor :: toggle_range_mode(void)
         return;
     }
     range_mode = false;
+    monitor_log_range("range-copy", range_anchor, state.current_addr);
 }
 
 void MachineMonitor :: open_number_picker(void)
@@ -1919,6 +2091,7 @@ void MachineMonitor :: open_number_picker(void)
 	    number_picker_refresh_preview_from_memory();
     number_picker_place_popup();
     number_picker_active = true;
+    monitor_log_address("number-picker open", number_picker_current_addr());
 }
 
 void MachineMonitor :: number_picker_resolve_target(void)
@@ -2246,6 +2419,7 @@ void MachineMonitor :: number_picker_commit(void)
     if (number_picker_current_bytes() == 2) {
         canonical_write((uint16_t)(target_addr + 1), high);
     }
+    monitor_log_value("number-picker commit", target_addr, number_preview_value);
     number_picker_refresh_preview_from_memory();
 }
 
@@ -2473,6 +2647,7 @@ void MachineMonitor :: ensure_current_visible()
 void MachineMonitor :: set_view(MachineMonitorView view)
 {
     state.view = view;
+    printf("MCM view %s\n", monitor_view_name(view));
     if (view == MONITOR_VIEW_ASM) {
         if (debug.is_active() && debug.has_context()) {
             debug_sync_cursor_to_context();
@@ -2787,6 +2962,7 @@ void MachineMonitor :: commit_pending_hex_nibble(void)
 void MachineMonitor :: toggle_help()
 {
     help_visible = !help_visible;
+    monitor_log(help_visible ? "help on" : "help off");
 }
 
 void MachineMonitor :: dismiss_bookmark_status(void)
@@ -2950,9 +3126,11 @@ bool MachineMonitor :: restore_bookmark(uint8_t slot)
     }
     if (!restore_location(bookmark)) {
         show_bookmark_status(slot, bookmark, MONITOR_BOOKMARK_STATUS_RESTORE_FAILED);
+        printf("MCM bookmark restore F%u failed\n", (unsigned)slot);
         return false;
     }
     show_bookmark_status(slot, bookmark, MONITOR_BOOKMARK_STATUS_RESTORED);
+    printf("MCM bookmark restore F%u $%04X\n", (unsigned)slot, bookmark->address);
     return true;
 }
 
@@ -2997,6 +3175,7 @@ void MachineMonitor :: follow_to_target(uint16_t target)
     if (target_visible(target)) {
         state.current_addr = target;
         asm_edit_history_reset(state.current_addr);
+        monitor_log_address("follow-visible", target);
         return;
     }
     apply_go_local(target);
@@ -3075,6 +3254,7 @@ bool MachineMonitor :: follow_current(void)
     index = return_stack_push_current();
     follow_to_target(target);
     show_navigation_status(index, "JMP", target);
+    monitor_log_address("follow", target);
     return true;
 }
 
@@ -3090,6 +3270,7 @@ bool MachineMonitor :: return_current(void)
         return false;
     }
     show_navigation_status(index, "RET", entry.location.address);
+    monitor_log_address("return", entry.location.address);
     return true;
 }
 
@@ -3103,8 +3284,10 @@ void MachineMonitor :: set_bookmark(uint8_t slot)
     if (saved) {
         const MonitorBookmarkSlot *stored = bookmarks ? bookmarks->get(slot) : NULL;
         show_bookmark_status(slot, stored ? stored : &bookmark, MONITOR_BOOKMARK_STATUS_SET);
+        printf("MCM bookmark set F%u $%04X\n", (unsigned)slot, bookmark.address);
     } else {
         show_bookmark_status(slot, &bookmark, MONITOR_BOOKMARK_STATUS_SAVE_FAILED);
+        printf("MCM bookmark set F%u failed\n", (unsigned)slot);
     }
 }
 
@@ -3132,8 +3315,10 @@ void MachineMonitor :: edit_bookmark_label(uint8_t slot)
         bookmarks->set_label(slot, normalized);
         const MonitorBookmarkSlot *updated = bookmarks->get(slot);
         show_bookmark_status(slot, updated, MONITOR_BOOKMARK_STATUS_LABEL_SAVED);
+        printf("MCM bookmark label F%u\n", (unsigned)slot);
     } else {
         show_bookmark_status(slot, current, MONITOR_BOOKMARK_STATUS_LABEL_CANCEL);
+        printf("MCM bookmark label F%u cancelled\n", (unsigned)slot);
     }
     draw();
 }
@@ -3143,6 +3328,7 @@ int MachineMonitor :: bookmark_popup_handle_key(int key)
     if (key == KEY_ESCAPE || key == KEY_BREAK || key == KEY_HELP || key == KEY_F3 ||
         key == '?' || monitor_key_is_bookmark_popup(key)) {
         bookmark_popup_active = false;
+        monitor_log("bookmark popup close");
         redraw_full();
         return 0;
     }
@@ -3183,6 +3369,7 @@ int MachineMonitor :: bookmark_popup_handle_key(int key)
                                              (uint8_t)(current_vic_bank & 0x03));
             const MonitorBookmarkSlot *reset = bookmarks->get(bookmark_selected);
             show_bookmark_status(bookmark_selected, reset, MONITOR_BOOKMARK_STATUS_LABEL_RESET);
+            printf("MCM bookmark reset F%u\n", (unsigned)bookmark_selected);
         }
         refresh_popup_overlay();
         draw_status();
@@ -3477,7 +3664,7 @@ void MachineMonitor :: draw_header()
     }
 
     if (help_visible) {
-        strcpy(line, "HELP");
+        strcpy(line, debug.is_active() ? "HELP ASM DEBUG" : "HELP");
     } else if (hunt_picker_active) {
         sprintf(line, "%s  %d/%d", hunt_picker_label ? hunt_picker_label : "RESULTS",
                 hunt_count ? (hunt_selected + 1) : 0, hunt_count);
@@ -3574,6 +3761,18 @@ void MachineMonitor :: draw_header()
     }
     draw_padded(window, 0, line, strlen(line));
     if (!help_visible && !hunt_picker_active) {
+        if (strncmp(line, "MONITOR ", 8) == 0) {
+            window->set_color(get_ui()->color_fg);
+            window->move_cursor(8, 0);
+            window->output_length(line + 8, 3);
+            const char *dollar = strchr(line, '$');
+            if (dollar) {
+                int ax = (int)(dollar - line);
+                window->move_cursor(ax, 0);
+                window->output_length(dollar, 5); // "$" + 4 hex digits
+            }
+            window->set_color(get_ui()->color_fg);
+        }
         if (debug.is_active()) {
             if (dbg_slot < 0) dbg_slot = 0;
             window->move_cursor(dbg_slot, 0);
@@ -3598,8 +3797,10 @@ void MachineMonitor :: draw_status()
     char line[40];
 
     if (help_visible) {
-        draw_padded(window, window->get_size_y() - 1, monitor_help_paging_line,
-                    (int)strlen(monitor_help_paging_line));
+        const char *paging_line = debug.is_active() ?
+            monitor_debug_help_paging_line : monitor_help_paging_line;
+        draw_padded(window, window->get_size_y() - 1, paging_line,
+                    (int)strlen(paging_line));
         return;
     }
 
@@ -3624,18 +3825,60 @@ void MachineMonitor :: draw_status()
     draw_padded(window, window->get_size_y() - 1, line, strlen(line));
 }
 
+void MachineMonitor :: debug_full_restore_screen(void)
+{
+    // After a freeze-mode debug step, the firmware chrome rows (UI title and
+    // border lines) are overwritten by the live BASIC screen during the
+    // temporary C64 unfreeze. Re-establish the chrome and redraw the monitor
+    // window so the user sees a correct display. No-op in overlay mode because
+    // overlay sessions disable freeze/refreeze run windows.
+    if (!debug_session || !debug_session->screen_render_target_invalidated()) {
+        return;
+    }
+    if (screen) {
+        get_ui()->set_screen_title();
+    }
+    redraw_full();
+}
+
 void MachineMonitor :: draw_debug_footer()
 {
     char header_row[40];
     char value_row[40];
+    int width;
+    int draw_len;
+    int highlight_len;
+    enum {
+        MONITOR_DEBUG_FOOTER_VALUE_HIGHLIGHT_END = 26,
+        MONITOR_DEBUG_FOOTER_WIDTH = 35,
+    };
 
     if (!window) {
         return;
     }
     MonitorDebug::format_footer_header(header_row, sizeof(header_row));
     MonitorDebug::format_footer_values(debug.context(), value_row, sizeof(value_row));
-    draw_padded(window, window->get_size_y() - 3, header_row, (int)strlen(header_row));
-    draw_padded(window, window->get_size_y() - 2, value_row, (int)strlen(value_row));
+    width = window->get_size_x();
+    draw_len = width;
+    if (draw_len > MONITOR_DEBUG_FOOTER_WIDTH) {
+        draw_len = MONITOR_DEBUG_FOOTER_WIDTH;
+    }
+    highlight_len = draw_len;
+    if (highlight_len > MONITOR_DEBUG_FOOTER_VALUE_HIGHLIGHT_END) {
+        highlight_len = MONITOR_DEBUG_FOOTER_VALUE_HIGHLIGHT_END;
+    }
+    window->set_color(get_ui()->color_fg);
+    draw_padded(window, window->get_size_y() - 3, header_row, draw_len);
+
+    window->move_cursor(0, window->get_size_y() - 2);
+    window->set_color(MONITOR_UI_ACCENT_COLOR);
+    window->output_length(value_row, highlight_len);
+    window->set_color(get_ui()->color_fg);
+    if (draw_len > highlight_len) {
+        window->output_length(value_row + highlight_len, draw_len - highlight_len);
+    }
+    window->repeat(' ', width - draw_len);
+    window->set_color(get_ui()->color_fg);
 }
 
 void MachineMonitor :: draw_help()
@@ -3656,34 +3899,6 @@ void MachineMonitor :: draw_help()
                             (int)strlen(dbg_lines[line_idx]));
             }
         }
-        static const char *const highlights[] = {
-            "D Debug/Over",
-            "G Go",
-            "T Trace",
-            "R Breakpt",
-            "O Out",
-            "SH+O Out",
-            "C=+R Brkpts",
-            "C=+D Exit",
-            "C=+D/RSTOP",
-            "C=+X Reset",
-            "RETURN",
-        };
-        window->set_color(MONITOR_UI_ACCENT_COLOR);
-        for (int line_idx = 0; line_idx < help_rows && line_idx < n; line_idx++) {
-            const char *line = dbg_lines[line_idx];
-            for (unsigned i = 0; i < sizeof(highlights) / sizeof(highlights[0]); i++) {
-                int token_len = (int)strlen(highlights[i]);
-                const char *at = line;
-                while ((at = strstr(at, highlights[i])) != NULL) {
-                    int x = (int)(at - line);
-                    window->move_cursor(x, line_idx + 1);
-                    window->output_length(at, token_len);
-                    at += token_len;
-                }
-            }
-        }
-        window->set_color(get_ui()->color_fg);
         return;
     }
     for (int line_idx = 0; line_idx < help_rows; line_idx++) {
@@ -3695,6 +3910,22 @@ void MachineMonitor :: draw_help()
             break;
         }
         draw_padded(window, line_idx + 1, text, strlen(text));
+    }
+}
+
+void MachineMonitor :: draw_popup_overlays()
+{
+    if (opcode_picker_active) {
+        draw_opcode_picker();
+    }
+    if (number_picker_active) {
+        draw_number_picker();
+    }
+    if (bookmark_popup_active) {
+        draw_bookmark_popup();
+    }
+    if (breakpoint_popup_active) {
+        debug_render_breakpoint_popup();
     }
 }
 
@@ -3749,6 +3980,7 @@ void MachineMonitor :: draw_bookmark_popup()
                  MONITOR_BOOKMARK_POPUP_INNER_HEIGHT + 2);
     popup.set_color(get_ui()->color_fg);
     popup.draw_border();
+    popup.set_color(get_ui()->color_fg);
 
     for (int row = 0; row < MONITOR_BOOKMARK_POPUP_INNER_HEIGHT; row++) {
         char line[MONITOR_BOOKMARK_POPUP_INNER_WIDTH + 1];
@@ -3870,15 +4102,7 @@ void MachineMonitor :: refresh_popup_overlay()
         return;
     }
     if (!help_visible && !hunt_picker_active) {
-        if (bookmark_popup_active) {
-            draw_bookmark_popup();
-        }
-        if (opcode_picker_active) {
-            draw_opcode_picker();
-        }
-        if (number_picker_active) {
-            draw_number_picker();
-        }
+        draw_popup_overlays();
     }
     screen->sync();
 }
@@ -4169,6 +4393,8 @@ void MachineMonitor :: draw_disassembly()
         int source_len;
         int source_pos;
         int bp_slot;
+        int bp_len = 0;
+        const char *bp_label = NULL;
         int indicator_start;
         int brk_pos = -1;
 
@@ -4197,7 +4423,17 @@ void MachineMonitor :: draw_disassembly()
         }
         source_pos = MONITOR_DISASM_ROW_CHARS - source_len - 2;
         if (bp_slot >= 0) {
-            brk_pos = source_pos - 6;
+            const MonitorBreakpointSlot *bp = breakpoints.get(bp_slot);
+            if (bp && bp->label[0]) {
+                bp_label = bp->label;
+                bp_len = (int)strlen(bp_label);
+                if (bp_len > MONITOR_BREAKPOINT_LABEL_MAX) {
+                    bp_len = MONITOR_BREAKPOINT_LABEL_MAX;
+                }
+            } else {
+                bp_len = 4;
+            }
+            brk_pos = source_pos - (bp_len + 2);
             if (brk_pos < MONITOR_DISASM_TEXT_COL) {
                 brk_pos = MONITOR_DISASM_TEXT_COL;
             }
@@ -4218,9 +4454,13 @@ void MachineMonitor :: draw_disassembly()
 
         if (bp_slot >= 0) {
             line[brk_pos] = '[';
-            memcpy(line + brk_pos + 1, "BRK", 3);
-            line[brk_pos + 4] = (char)('0' + bp_slot);
-            line[brk_pos + 5] = ']';
+            if (bp_label && bp_len > 0) {
+                memcpy(line + brk_pos + 1, bp_label, bp_len);
+            } else {
+                memcpy(line + brk_pos + 1, "BRK", 3);
+                line[brk_pos + 4] = (char)('0' + bp_slot);
+            }
+            line[brk_pos + 1 + bp_len] = ']';
         }
         line[source_pos] = '[';
         memcpy(line + source_pos + 1, source, source_len);
@@ -4289,7 +4529,7 @@ void MachineMonitor :: draw_disassembly()
             }
         }
         if (bp_slot >= 0) {
-            window->set_color(MONITOR_UI_ACCENT_COLOR);
+            window->set_color(get_ui()->color_fg);
         }
         draw_with_highlight(window, line_idx + 1, line, MONITOR_DISASM_ROW_CHARS, highlight < 0 ? -1 : hl_x, hl_len);
         if (bp_slot >= 0) {
@@ -4459,10 +4699,14 @@ void MachineMonitor :: hunt_picker_open_labeled(int count, const char *label)
     hunt_top = 0;
     hunt_picker_label = label ? label : "Results";
     hunt_picker_active = true;
+    printf("MCM results open %s %d\n", hunt_picker_label ? hunt_picker_label : "Results", hunt_count);
 }
 
 void MachineMonitor :: hunt_picker_close()
 {
+    if (hunt_picker_active) {
+        monitor_log("results close");
+    }
     hunt_picker_active = false;
 }
 
@@ -4472,6 +4716,7 @@ void MachineMonitor :: hunt_picker_jump()
         return;
     }
     apply_go_local(hunt_addrs[hunt_selected]);
+    monitor_log_address("results jump", hunt_addrs[hunt_selected]);
     hunt_picker_close();
 }
 
@@ -4508,6 +4753,8 @@ int MachineMonitor :: hunt_picker_handle_key(int key)
 
 void MachineMonitor :: draw()
 {
+    bool draw_overlays = !help_visible && !hunt_picker_active;
+
     draw_header();
     if (help_visible) {
         draw_help();
@@ -4531,23 +4778,14 @@ void MachineMonitor :: draw()
                 draw_hex();
                 break;
         }
-        if (opcode_picker_active) {
-            draw_opcode_picker();
-        }
-        if (number_picker_active) {
-            draw_number_picker();
-        }
-        if (bookmark_popup_active) {
-            draw_bookmark_popup();
-        }
-        if (breakpoint_popup_active) {
-            debug_render_breakpoint_popup();
-        }
     }
     if (debug.is_active() && !help_visible) {
         draw_debug_footer();
     }
     draw_status();
+    if (draw_overlays) {
+        draw_popup_overlays();
+    }
     if (screen) {
         screen->sync();
     }
@@ -4706,6 +4944,7 @@ bool MachineMonitor :: opcode_picker_open(char seed)
     }
 
     opcode_picker_active = true;
+    monitor_log_address("opcode-picker open", state.current_addr);
     opcode_drawn_rows = 0;
     opcode_prefix_len = 0;
     opcode_prefix[0] = 0;
@@ -4724,6 +4963,9 @@ bool MachineMonitor :: opcode_picker_open(char seed)
 
 void MachineMonitor :: opcode_picker_close()
 {
+    if (opcode_picker_active) {
+        monitor_log("opcode-picker close");
+    }
     opcode_picker_active = false;
     opcode_drawn_rows = 0;
     opcode_prefix_len = 0;
@@ -4771,6 +5013,7 @@ void MachineMonitor :: opcode_picker_commit()
         asm_edit_history_push(a, canonical_read(a), 0, 0);
     }
     canonical_write(state.current_addr, op);
+    monitor_log_byte("opcode-picker commit", state.current_addr, op);
     uint8_t new_len = disasm_length(state.current_addr);
     if (new_len == 0) new_len = 1;
     opcode_picker_close();
@@ -4943,6 +5186,7 @@ bool MachineMonitor :: opcode_picker_commit_typed()
     for (uint8_t i = 0; i < insn.length; i++) {
         canonical_write((uint16_t)(state.current_addr + i), insn.bytes[i]);
     }
+    printf("MCM opcode-typed commit $%04X len %u\n", state.current_addr, (unsigned)insn.length);
 
     opcode_picker_close();
     step_disassembly(1);
@@ -4955,6 +5199,9 @@ bool MachineMonitor :: opcode_picker_commit_typed()
 
 void MachineMonitor :: exit_edit_mode()
 {
+    if (edit_mode) {
+        monitor_log_address("edit exit", state.current_addr);
+    }
     edit_mode = false;
     edit_cursor_visible = true;
     pending_hex_nibble = -1;
@@ -4967,6 +5214,7 @@ void MachineMonitor :: enter_edit_mode()
 {
     help_visible = false;
     edit_mode = true;
+    monitor_log_address("edit enter", state.current_addr);
     pending_hex_nibble = -1;
     asm_edit_part = 0;
     asm_edit_pending = 0;
@@ -4979,8 +5227,12 @@ void MachineMonitor :: debug_enter()
     if (debug.is_active()) {
         return;
     }
+    monitor_log_address("debug enter", state.current_addr);
     help_visible = false;
     debug.enter();
+    if (restore_debug_after_reset) {
+        debug_cursor_override = true;
+    }
     // Debug mode reserves two rows above the normal status footer for the CPU
     // table. Recompute so all view drawers shrink uniformly.
     if (window) {
@@ -4988,12 +5240,21 @@ void MachineMonitor :: debug_enter()
         if (content_height < 1) content_height = 1;
     }
     // Best-effort capture: ask the backend for an immediate snapshot if it
-    // knows how. If not, the footer remains blank until the first execution
-    // command completes.
+    // knows how. Keep an explicitly selected cursor address authoritative:
+    // the first execution command should run where the user navigated, not
+    // silently switch to an unrelated live PC snapshot.
     DebugContext captured;
-    if (debug_capture_context(&captured)) {
-        debug.set_context(captured);
-        debug_sync_cursor_to_context();
+    debug_entry_context_valid = false;
+    debug_context_reset(&debug_entry_context);
+    bool skip_capture = debug_cursor_override && backend &&
+        disassembler_6502_is_illegal(backend->read(state.current_addr));
+    if (!restore_debug_after_reset && !skip_capture && debug_capture_context(&captured)) {
+        debug_entry_context = captured;
+        debug_entry_context_valid = captured.valid;
+        if (!debug_cursor_override) {
+            debug.set_context(captured);
+            debug_sync_cursor_to_context();
+        }
     }
 }
 
@@ -5002,9 +5263,17 @@ void MachineMonitor :: debug_leave()
     if (!debug.is_active()) {
         return;
     }
+    monitor_log("debug leave");
+    clear_pending_go();
     debug.leave();
-    // Leaving Debug must not invalidate the captured context (so re-entering
-    // shows the same numbers), but breakpoints/popup state are dismissed.
+    if (restore_debug_after_reset) {
+        debug.invalidate_context();
+        debug_entry_context_valid = false;
+        debug_context_reset(&debug_entry_context);
+    }
+    if (!restore_debug_after_reset) {
+        debug_cursor_override = false;
+    }
     breakpoint_popup_active = false;
     if (window) {
         content_height = window->get_size_y() - 2;
@@ -5014,8 +5283,28 @@ void MachineMonitor :: debug_leave()
     // for the rest of the monitor lifetime. The session destructor in
     // deinit() takes care of final teardown.
     if (debug_session) {
-        debug_session->cleanup();
+        DebugContext cleanup_context;
+        const DebugContext *cleanup_target = NULL;
+        debug_context_reset(&cleanup_context);
+        if (debug.has_context()) {
+            cleanup_context = debug.context();
+            cleanup_target = &cleanup_context;
+        } else if (debug_entry_context_valid) {
+            cleanup_target = &debug_entry_context;
+        }
+        debug_session->cleanup_to_context(cleanup_target);
+        debug_full_restore_screen();
+        // Forget the cached PC so re-entering Debug starts from the monitor
+        // cursor (where the user navigated) instead of resuming the previous
+        // session's program counter.
+        debug_session->forget_context();
     }
+    // Drop the displayed register context too; re-entry recaptures only if the
+    // backend can snapshot afresh, otherwise the cursor position drives the
+    // first step.
+    debug.invalidate_context();
+    debug_entry_context_valid = false;
+    debug_context_reset(&debug_entry_context);
 }
 
 void MachineMonitor :: debug_sync_cursor_to_context(void)
@@ -5023,7 +5312,28 @@ void MachineMonitor :: debug_sync_cursor_to_context(void)
     if (!debug.is_active() || !debug.has_context()) {
         return;
     }
-    apply_go_local(debug.context().pc);
+    state.current_addr = debug.context().pc;
+    if (state.view == MONITOR_VIEW_ASM) {
+        ensure_debug_pc_visible();
+    } else {
+        ensure_current_visible();
+    }
+}
+
+void MachineMonitor :: restore_debug_mode_after_reset(void)
+{
+    if (!restore_debug_after_reset || debug.is_active()) {
+        return;
+    }
+    monitor_log_address("debug restore-after-reset", state.current_addr);
+    help_visible = false;
+    debug.enter();
+    debug.invalidate_context();
+    debug_cursor_override = true;
+    if (window) {
+        content_height = window->get_size_y() - 4;
+        if (content_height < 1) content_height = 1;
+    }
 }
 
 DebugSession *MachineMonitor :: ensure_debug_session()
@@ -5037,6 +5347,7 @@ DebugSession *MachineMonitor :: ensure_debug_session()
     debug_session = backend->create_debug_session();
     if (debug_session) {
         debug_session->set_cancel_keyboard(keyboard);
+        debug_session->set_run_window_refreeze_enabled(debug_run_window_refreeze_enabled);
     }
     return debug_session;
 }
@@ -5069,13 +5380,28 @@ bool MachineMonitor :: debug_handle_terminal_result(DebugSession::Result result)
     if (result != DebugSession::DBG_RESET) {
         return false;
     }
+    request_reopen_after_reset();
+    monitor_log("debug reset-result");
+    clear_pending_go();
+    restore_debug_after_reset = debug.is_active();
+    if (restore_debug_after_reset) {
+        debug_cursor_override = true;
+    }
     debug.invalidate_context();
     debug_cleanup_session();
+    if (screen) {
+        get_ui()->set_screen_title();
+        redraw_full();
+    }
+    reset_exit_pending = reset_exits_monitor;
     return true;
 }
 
-bool MachineMonitor :: handle_reset_shortcut(void)
+int MachineMonitor :: handle_reset_shortcut(void)
 {
+    monitor_log("reset shortcut");
+    request_reopen_after_reset();
+    clear_pending_go();
     help_visible = false;
     hunt_picker_active = false;
     opcode_picker_active = false;
@@ -5083,33 +5409,124 @@ bool MachineMonitor :: handle_reset_shortcut(void)
     bookmark_popup_active = false;
     breakpoint_popup_active = false;
     exit_edit_mode();
+    restore_debug_after_reset = debug.is_active();
+    if (restore_debug_after_reset) {
+        debug_cursor_override = true;
+    }
     if (debug.is_active()) {
         debug.invalidate_context();
     }
     debug_cleanup_session();
     if (!backend || !backend->supports_reset() || !backend->reset_machine()) {
+        reopen_after_reset = false;
+        monitor_reset_reopen_state_valid = false;
         get_ui()->popup("RESET UNAVAILABLE", BUTTON_OK);
         redraw_full();
-        return true;
+        return 0;
     }
-    pending_hex_nibble = -1;
-    asm_edit_pending = 0;
-    edit_cursor_visible = true;
-    draw();
-    return true;
+    if (screen) {
+        get_ui()->set_screen_title();
+        redraw_full();
+    }
+    reset_exit_pending = reset_exits_monitor;
+    return reset_exits_monitor ? MENU_EXIT : 0;
 }
 
 namespace {
 static const char *const monitor_debug_session_refused = "DEBUG NOT SUPPORTED";
 static const char *const monitor_debug_session_unsafe = "UNSAFE TARGET";
+static const char *const monitor_debug_session_unsupported_opcode = "UNSUPPORTED OPCODE";
+static const char *const monitor_debug_session_not_in_subroutine = "NOT IN SUBROUTINE";
+static const char *const monitor_debug_session_return_not_reached = "RETURN NOT REACHED";
 static const char *const monitor_debug_session_timeout = "DEBUG TIMEOUT";
 static const char *const monitor_debug_session_patch = "PATCH FAILED";
+
+static const char *monitor_debug_result_name(DebugSession::Result result)
+{
+    switch (result) {
+        case DebugSession::DBG_OK: return "OK";
+        case DebugSession::DBG_NOT_SUPPORTED: return "NOT_SUPPORTED";
+        case DebugSession::DBG_REFUSED: return "UNSAFE_TARGET";
+        case DebugSession::DBG_UNSUPPORTED_OPCODE: return "UNSUPPORTED_OPCODE";
+        case DebugSession::DBG_NOT_IN_SUBROUTINE: return "NOT_IN_SUBROUTINE";
+        case DebugSession::DBG_RETURN_NOT_REACHED: return "RETURN_NOT_REACHED";
+        case DebugSession::DBG_TIMEOUT: return "TIMEOUT";
+        case DebugSession::DBG_CANCELLED: return "CANCELLED";
+        case DebugSession::DBG_RESET: return "RESET";
+        case DebugSession::DBG_PATCH_FAILED: return "PATCH_FAILED";
+    }
+    return "UNKNOWN";
+}
+
+static const char *monitor_view_name(MachineMonitorView view)
+{
+    switch (view) {
+        case MONITOR_VIEW_HEX: return "HEX";
+        case MONITOR_VIEW_ASM: return "ASM";
+        case MONITOR_VIEW_ASCII: return "ASCII";
+        case MONITOR_VIEW_SCREEN: return "SCREEN";
+        case MONITOR_VIEW_BINARY: return "BINARY";
+    }
+    return "UNKNOWN";
+}
+
+static void monitor_log(const char *action)
+{
+    printf("MCM %s\n", action);
+}
+
+static void monitor_log_address(const char *action, uint16_t address)
+{
+    printf("MCM %s $%04X\n", action, address);
+}
+
+static void monitor_log_value(const char *action, uint16_t address, uint16_t value)
+{
+    printf("MCM %s $%04X=$%04X\n", action, address, value);
+}
+
+static void monitor_log_byte(const char *action, uint16_t address, uint8_t value)
+{
+    printf("MCM %s $%04X=$%02X\n", action, address, value);
+}
+
+static void monitor_log_range(const char *action, uint16_t start, uint16_t end)
+{
+    printf("MCM %s $%04X-$%04X\n", action, start, end);
+}
+
+static void monitor_log_debug(const char *action, uint16_t pc, DebugSession::Result result)
+{
+    printf("MCM debug %s $%04X %s\n", action, pc, monitor_debug_result_name(result));
+}
+
+static void monitor_read_predict_bytes(DebugSession *session, MemoryBackend *backend,
+                                       uint16_t start_pc, uint8_t *bytes)
+{
+    if (!bytes) {
+        return;
+    }
+    bytes[0] = 0;
+    bytes[1] = 0;
+    bytes[2] = 0;
+    if (session && session->read_step_bytes(start_pc, bytes, 3)) {
+        return;
+    }
+    if (backend) {
+        for (int i = 0; i < 3; i++) {
+            bytes[i] = backend->read((uint16_t)(start_pc + i));
+        }
+    }
+}
 
 const char *monitor_debug_result_message(int result)
 {
     switch (result) {
         case DebugSession::DBG_NOT_SUPPORTED: return monitor_debug_session_refused;
         case DebugSession::DBG_REFUSED:       return monitor_debug_session_unsafe;
+        case DebugSession::DBG_UNSUPPORTED_OPCODE: return monitor_debug_session_unsupported_opcode;
+        case DebugSession::DBG_NOT_IN_SUBROUTINE: return monitor_debug_session_not_in_subroutine;
+        case DebugSession::DBG_RETURN_NOT_REACHED: return monitor_debug_session_return_not_reached;
         case DebugSession::DBG_TIMEOUT:       return monitor_debug_session_timeout;
         case DebugSession::DBG_CANCELLED:     return "DEBUG CANCELLED";
         case DebugSession::DBG_RESET:         return NULL;
@@ -5121,32 +5538,39 @@ const char *monitor_debug_result_message(int result)
 
 void MachineMonitor :: debug_request_over()
 {
+    DebugContext from = debug.context();
+    bool have_context = from.valid;
+    uint16_t start_pc = have_context ? from.pc : state.current_addr;
+    if (!have_context && debug_cursor_override && backend &&
+            disassembler_6502_is_illegal(backend->read(start_pc))) {
+        monitor_log_debug("over", start_pc, DebugSession::DBG_UNSUPPORTED_OPCODE);
+        debug.invalidate_context();
+        get_ui()->popup(monitor_debug_session_unsupported_opcode, BUTTON_OK);
+        redraw_full();
+        return;
+    }
     DebugSession *session = ensure_debug_session();
     if (!session) {
+        monitor_log_debug("over", state.current_addr, DebugSession::DBG_NOT_SUPPORTED);
         get_ui()->popup(monitor_debug_session_refused, BUTTON_OK);
         redraw_full();
         return;
     }
-    DebugContext from = debug.context();
-    bool have_context = from.valid;
-    uint16_t start_pc = have_context ? from.pc : state.current_addr;
-    if (!have_context) {
-        DebugContext snap;
-        if (debug_capture_context(&snap)) {
-            debug.set_context(snap);
-            from = snap;
-            have_context = true;
-            start_pc = from.pc;
-        }
-    }
     // Decode the current instruction so the session knows what to patch.
     uint8_t bytes[3] = { 0, 0, 0 };
-    if (backend) {
-        for (int i = 0; i < 3; i++) bytes[i] = backend->read((uint16_t)(start_pc + i));
+    monitor_read_predict_bytes(session, backend, start_pc, bytes);
+    if (disassembler_6502_is_illegal(bytes[0])) {
+        monitor_log_debug("over", start_pc, DebugSession::DBG_UNSUPPORTED_OPCODE);
+        debug.invalidate_context();
+        debug_cleanup_session();
+        get_ui()->popup(monitor_debug_session_unsupported_opcode, BUTTON_OK);
+        redraw_full();
+        return;
     }
     DebugPredictResult pred;
     debug_predict(start_pc, bytes, state.illegal_enabled, &pred);
     if (pred.kind == DBG_PREDICT_UNSAFE || pred.kind == DBG_PREDICT_BRK) {
+        monitor_log_debug("over", start_pc, DebugSession::DBG_REFUSED);
         get_ui()->popup(monitor_debug_session_unsafe, BUTTON_OK);
         redraw_full();
         return;
@@ -5154,6 +5578,8 @@ void MachineMonitor :: debug_request_over()
     DebugContext next;
     DebugSession::Result r = have_context ? session->over(from, pred, &next)
                                           : session->over_at(start_pc, pred, &next);
+    monitor_log_debug("over", start_pc, r);
+    debug_full_restore_screen();
     if (r == DebugSession::DBG_OK) {
         debug.set_context(next);
         debug_sync_cursor_to_context();
@@ -5171,31 +5597,38 @@ void MachineMonitor :: debug_request_over()
 
 void MachineMonitor :: debug_request_trace()
 {
+    DebugContext from = debug.context();
+    bool have_context = from.valid;
+    uint16_t start_pc = have_context ? from.pc : state.current_addr;
+    if (!have_context && debug_cursor_override && backend &&
+            disassembler_6502_is_illegal(backend->read(start_pc))) {
+        monitor_log_debug("trace", start_pc, DebugSession::DBG_UNSUPPORTED_OPCODE);
+        debug.invalidate_context();
+        get_ui()->popup(monitor_debug_session_unsupported_opcode, BUTTON_OK);
+        redraw_full();
+        return;
+    }
     DebugSession *session = ensure_debug_session();
     if (!session) {
+        monitor_log_debug("trace", state.current_addr, DebugSession::DBG_NOT_SUPPORTED);
         get_ui()->popup(monitor_debug_session_refused, BUTTON_OK);
         redraw_full();
         return;
     }
-    DebugContext from = debug.context();
-    bool have_context = from.valid;
-    uint16_t start_pc = have_context ? from.pc : state.current_addr;
-    if (!have_context) {
-        DebugContext snap;
-        if (debug_capture_context(&snap)) {
-            debug.set_context(snap);
-            from = snap;
-            have_context = true;
-            start_pc = from.pc;
-        }
-    }
     uint8_t bytes[3] = { 0, 0, 0 };
-    if (backend) {
-        for (int i = 0; i < 3; i++) bytes[i] = backend->read((uint16_t)(start_pc + i));
+    monitor_read_predict_bytes(session, backend, start_pc, bytes);
+    if (disassembler_6502_is_illegal(bytes[0])) {
+        monitor_log_debug("trace", start_pc, DebugSession::DBG_UNSUPPORTED_OPCODE);
+        debug.invalidate_context();
+        debug_cleanup_session();
+        get_ui()->popup(monitor_debug_session_unsupported_opcode, BUTTON_OK);
+        redraw_full();
+        return;
     }
     DebugPredictResult pred;
     debug_predict(start_pc, bytes, state.illegal_enabled, &pred);
     if (pred.kind == DBG_PREDICT_UNSAFE || pred.kind == DBG_PREDICT_BRK) {
+        monitor_log_debug("trace", start_pc, DebugSession::DBG_REFUSED);
         get_ui()->popup(monitor_debug_session_unsafe, BUTTON_OK);
         redraw_full();
         return;
@@ -5203,6 +5636,8 @@ void MachineMonitor :: debug_request_trace()
     DebugContext next;
     DebugSession::Result r = have_context ? session->trace(from, pred, &next)
                                           : session->trace_at(start_pc, pred, &next);
+    monitor_log_debug("trace", start_pc, r);
+    debug_full_restore_screen();
     if (r == DebugSession::DBG_OK) {
         debug.set_context(next);
         debug_sync_cursor_to_context();
@@ -5222,25 +5657,22 @@ void MachineMonitor :: debug_request_out()
 {
     DebugSession *session = ensure_debug_session();
     if (!session) {
+        monitor_log_debug("out", state.current_addr, DebugSession::DBG_NOT_SUPPORTED);
         get_ui()->popup(monitor_debug_session_refused, BUTTON_OK);
         redraw_full();
         return;
     }
     DebugContext from = debug.context();
     if (!from.valid) {
-        DebugContext snap;
-        if (debug_capture_context(&snap)) {
-            debug.set_context(snap);
-            from = snap;
-        }
-    }
-    if (!from.valid) {
-        get_ui()->popup("NO CONTEXT", BUTTON_OK);
+        monitor_log_debug("out", state.current_addr, DebugSession::DBG_NOT_IN_SUBROUTINE);
+        get_ui()->popup(monitor_debug_session_not_in_subroutine, BUTTON_OK);
         redraw_full();
         return;
     }
     DebugContext next;
     DebugSession::Result r = session->step_out(from, &next);
+    monitor_log_debug("out", from.pc, r);
+    debug_full_restore_screen();
     if (r == DebugSession::DBG_OK) {
         debug.set_context(next);
         debug_sync_cursor_to_context();
@@ -5258,18 +5690,6 @@ void MachineMonitor :: debug_request_out()
 
 void MachineMonitor :: debug_request_go()
 {
-    DebugSession *session = ensure_debug_session();
-    if (!session) {
-        // Backend has no native debug session - fall back to the existing
-        // non-debug `G` semantics (release/jump) so users with a non-stepping
-        // backend can still resume from the captured / cursor address.
-        last_go_addr = debug.has_context() ? debug.context().pc : state.current_addr;
-        last_go_valid = true;
-        go_pending = true;
-        go_pending_addr = last_go_addr;
-        debug.invalidate_context();
-        return;
-    }
     DebugContext from = debug.context();
     if (!from.valid) {
         DebugContext snap;
@@ -5278,14 +5698,50 @@ void MachineMonitor :: debug_request_go()
             from = snap;
         }
     }
+    DebugSession *session = ensure_debug_session();
+    if (!session) {
+        // Backend has no native debug session - fall back to the existing
+        // non-debug `G` semantics (release/jump) so users with a non-stepping
+        // backend can still resume from the captured / cursor address.
+        last_go_addr = from.valid ? from.pc : state.current_addr;
+        last_go_valid = true;
+        go_pending = true;
+        go_pending_addr = last_go_addr;
+        go_pending_has_context = false;
+        debug.invalidate_context();
+        monitor_log_address("debug go fallback", last_go_addr);
+        return;
+    }
     // Start PC for a fresh Go is the Assembly view cursor: this is what the
     // user is looking at and where they expect execution to begin. If a
     // captured context is already in hand, the session prefers `from.pc`
     // and ignores this fallback.
     uint16_t start_pc = state.current_addr;
+    if (debug_run_window_refreeze_enabled && !debug_has_enabled_breakpoint()) {
+        // Freeze-mode no-breakpoint Go must unwind through run_machine_monitor()
+        // so the C64 freezer ownership is released before execution starts.
+        last_go_addr = from.valid ? from.pc : start_pc;
+        last_go_valid = true;
+        go_pending = true;
+        go_pending_addr = last_go_addr;
+        go_pending_has_context = from.valid;
+        if (from.valid) {
+            go_pending_context = from;
+        } else {
+            debug_context_reset(&go_pending_context);
+        }
+        if (debug_session) {
+            debug_session->forget_context();
+        }
+        debug.invalidate_context();
+        monitor_log_address("debug go handoff", last_go_addr);
+        return;
+    }
     // Invalidate up-front; G discards the captured context per the spec.
     debug.invalidate_context();
     DebugSession::Result r = session->go(from, &breakpoints, start_pc);
+    monitor_log_debug("go", start_pc, r);
+    debug_full_restore_screen();
     if (r == DebugSession::DBG_OK) {
         // If the session captured a fresh context (BRK fired during this
         // Go), `snapshot` now returns it. Pull it back so the footer shows
@@ -5308,18 +5764,24 @@ void MachineMonitor :: debug_request_go()
     }
 }
 
+bool MachineMonitor :: debug_has_enabled_breakpoint(void) const
+{
+    for (int i = 0; i < breakpoints.slot_count(); i++) {
+        const MonitorBreakpointSlot *bp = breakpoints.get(i);
+        if (bp && bp->used && bp->enabled) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void MachineMonitor :: debug_toggle_breakpoint()
 {
-    char msg[32];
     uint16_t target = state.current_addr;
     int existing = breakpoints.find_at(target);
     if (existing >= 0) {
         breakpoints.clear_slot(existing);
-        // The Debug footer is reserved for CPU state, so breakpoint feedback
-        // goes through the popup channel instead of the bookmark status row.
-        sprintf(msg, "BRK %d CLR $%04X", existing, (unsigned)target);
-        get_ui()->popup(msg, BUTTON_OK);
-        redraw_full();
+        printf("MCM breakpoint clear %d $%04X\n", existing, target);
         return;
     }
     int slot = breakpoints.allocate(target, (uint8_t)(state.cpu_port & 0x07));
@@ -5328,14 +5790,13 @@ void MachineMonitor :: debug_toggle_breakpoint()
         redraw_full();
         return;
     }
-    sprintf(msg, "BRK %d SET $%04X", slot, (unsigned)target);
-    get_ui()->popup(msg, BUTTON_OK);
-    redraw_full();
+    printf("MCM breakpoint set %d $%04X\n", slot, target);
 }
 
 void MachineMonitor :: debug_open_breakpoint_popup()
 {
     breakpoint_popup_active = true;
+    monitor_log("breakpoint popup open");
     if (breakpoint_selected >= breakpoints.slot_count()) {
         breakpoint_selected = 0;
     }
@@ -5344,13 +5805,36 @@ void MachineMonitor :: debug_open_breakpoint_popup()
 void MachineMonitor :: debug_close_breakpoint_popup()
 {
     breakpoint_popup_active = false;
+    monitor_log("breakpoint popup close");
+}
+
+void MachineMonitor :: edit_breakpoint_label(uint8_t slot)
+{
+    const MonitorBreakpointSlot *bp = breakpoints.get(slot);
+    char buffer[MONITOR_BREAKPOINT_LABEL_STORAGE];
+    char normalized[MONITOR_BREAKPOINT_LABEL_STORAGE];
+    char title[16];
+
+    if (!bp || !bp->used) {
+        return;
+    }
+    strncpy(buffer, bp->label, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = 0;
+    sprintf(title, "Label BP%u", (unsigned)slot);
+    if (prompt_command(title, buffer, MONITOR_BREAKPOINT_LABEL_MAX, false, true)) {
+        MonitorBreakpoints::normalize_label(normalized, sizeof(normalized), buffer);
+        breakpoints.set_label(slot, normalized);
+        printf("MCM breakpoint label %u %s\n", (unsigned)slot, normalized);
+    } else {
+        printf("MCM breakpoint label %u cancelled\n", (unsigned)slot);
+    }
 }
 
 int MachineMonitor :: debug_breakpoint_popup_handle_key(int key)
 {
     if (key == KEY_ESCAPE || key == KEY_BREAK || key == KEY_CTRL_R) {
         debug_close_breakpoint_popup();
-        draw();
+        redraw_full();
         return 0;
     }
     if (key == KEY_CTRL_O) {
@@ -5359,23 +5843,25 @@ int MachineMonitor :: debug_breakpoint_popup_handle_key(int key)
     }
     if (key == KEY_UP) {
         if (breakpoint_selected > 0) breakpoint_selected--;
-        draw();
+        refresh_popup_overlay();
         return 0;
     }
     if (key == KEY_DOWN) {
         if (breakpoint_selected + 1 < (uint8_t)breakpoints.slot_count()) breakpoint_selected++;
-        draw();
+        refresh_popup_overlay();
         return 0;
     }
     if (key >= '0' && key <= '9') {
         breakpoint_selected = (uint8_t)(key - '0');
         const MonitorBreakpointSlot *bp = breakpoints.get(breakpoint_selected);
         if (bp && bp->used) {
-            state.current_addr = bp->address;
             apply_go_local(bp->address);
+            printf("MCM breakpoint jump %u $%04X\n", (unsigned)breakpoint_selected, bp->address);
             debug_close_breakpoint_popup();
+            redraw_full();
+        } else {
+            refresh_popup_overlay();
         }
-        draw();
         return 0;
     }
     if (key == KEY_RETURN) {
@@ -5383,28 +5869,42 @@ int MachineMonitor :: debug_breakpoint_popup_handle_key(int key)
         if (bp && bp->used) {
             state.current_addr = bp->address;
             apply_go_local(bp->address);
+            printf("MCM breakpoint jump %u $%04X\n", (unsigned)breakpoint_selected, bp->address);
         }
         debug_close_breakpoint_popup();
-        draw();
+        redraw_full();
         return 0;
     }
     if (key == 's' || key == 'S') {
         breakpoints.store_slot(breakpoint_selected, state.current_addr,
                                (uint8_t)(state.cpu_port & 0x07));
-        draw();
+        printf("MCM breakpoint store %u $%04X\n", (unsigned)breakpoint_selected, state.current_addr);
+        refresh_popup_overlay();
+        return 0;
+    }
+    if (key == 'l' || key == 'L') {
+        edit_breakpoint_label(breakpoint_selected);
+        refresh_popup_overlay();
         return 0;
     }
     if (key == 'e' || key == 'E') {
         const MonitorBreakpointSlot *bp = breakpoints.get(breakpoint_selected);
         if (bp && bp->used) {
-            breakpoints.set_enabled(breakpoint_selected, !bp->enabled);
+            bool new_enabled = !bp->enabled;
+            breakpoints.set_enabled(breakpoint_selected, new_enabled);
+            printf("MCM breakpoint %s %u $%04X\n", new_enabled ? "enable" : "disable",
+                   (unsigned)breakpoint_selected, bp->address);
         }
-        draw();
+        refresh_popup_overlay();
         return 0;
     }
     if (key == KEY_DELETE || key == KEY_BACK) {
+        const MonitorBreakpointSlot *bp = breakpoints.get(breakpoint_selected);
+        if (bp && bp->used) {
+            printf("MCM breakpoint clear %u $%04X\n", (unsigned)breakpoint_selected, bp->address);
+        }
         breakpoints.clear_slot(breakpoint_selected);
-        draw();
+        refresh_popup_overlay();
         return 0;
     }
     return 0;
@@ -5412,8 +5912,6 @@ int MachineMonitor :: debug_breakpoint_popup_handle_key(int key)
 
 void MachineMonitor :: debug_render_breakpoint_popup()
 {
-    // Reuse the bookmark popup window geometry: visually consistent with the
-    // bookmark list and avoids re-deriving popup placement logic.
     enum {
         BRK_POPUP_INNER_WIDTH = 38,
         BRK_POPUP_INNER_HEIGHT = 14,
@@ -5433,7 +5931,7 @@ void MachineMonitor :: debug_render_breakpoint_popup()
                                              breakpoints.get(i));
     }
     strcpy(popup_lines[BRK_POPUP_HELP_ROW],
-           "U/D Sel 0-9/RET Jmp S Set DEL Rst");
+           "0-9/RET Jmp  S Set  L Label  DEL Reset");
     int screen_x, screen_y;
     window->getOffsets(screen_x, screen_y);
     int popup_x = screen_x + ((window->get_size_x() - BRK_POPUP_INNER_WIDTH) / 2);
@@ -5445,26 +5943,67 @@ void MachineMonitor :: debug_render_breakpoint_popup()
     if (popup_y < screen_y) popup_y = screen_y;
     Window popup(screen, popup_x, popup_y,
                  BRK_POPUP_INNER_WIDTH + 2, BRK_POPUP_INNER_HEIGHT + 2);
+    popup.set_color(get_ui()->color_fg);
     popup.draw_border();
     popup.set_color(get_ui()->color_fg);
-    for (int i = 0; i < BRK_POPUP_INNER_HEIGHT; i++) {
-        popup.move_cursor(0, i);
-        int len = (int)strlen(popup_lines[i]);
+    for (int row = 0; row < BRK_POPUP_INNER_HEIGHT; row++) {
+        char line[BRK_POPUP_INNER_WIDTH + 1];
+        int len = (int)strlen(popup_lines[row]);
+        int slot_row = row - BRK_POPUP_SLOT_FIRST_ROW;
+        bool selected = (slot_row >= 0 && slot_row < breakpoints.slot_count() &&
+                         slot_row == (int)breakpoint_selected);
+
         if (len > BRK_POPUP_INNER_WIDTH) len = BRK_POPUP_INNER_WIDTH;
-        if (len > 0) popup.output_length(popup_lines[i], len);
-        popup.repeat(' ', BRK_POPUP_INNER_WIDTH - len);
+        memset(line, ' ', BRK_POPUP_INNER_WIDTH);
+        if (len > 0) {
+            memcpy(line, popup_lines[row], (size_t)len);
+        }
+        line[BRK_POPUP_INNER_WIDTH] = 0;
+        if (selected) {
+            draw_with_highlight(&popup, row, line, BRK_POPUP_INNER_WIDTH,
+                                0, BRK_POPUP_INNER_WIDTH);
+        } else {
+            popup.move_cursor(0, row);
+            popup.output_length(line, BRK_POPUP_INNER_WIDTH);
+        }
     }
-    // Highlight selected row.
-    int sel_row = BRK_POPUP_SLOT_FIRST_ROW + (int)breakpoint_selected;
-    if (sel_row < BRK_POPUP_INNER_HEIGHT) {
-        popup.move_cursor(0, sel_row);
-        popup.set_color(MONITOR_UI_ACCENT_COLOR);
-        int len = (int)strlen(popup_lines[sel_row]);
-        if (len > BRK_POPUP_INNER_WIDTH) len = BRK_POPUP_INNER_WIDTH;
-        if (len > 0) popup.output_length(popup_lines[sel_row], len);
-        popup.repeat(' ', BRK_POPUP_INNER_WIDTH - len);
-        popup.set_color(get_ui()->color_fg);
+}
+
+void MachineMonitor :: ensure_debug_pc_visible(void)
+{
+    enum { DEBUG_PC_MARGIN = 3 };
+    int rows = content_height;
+    int margin = DEBUG_PC_MARGIN;
+
+    if (state.view != MONITOR_VIEW_ASM) {
+        return;
     }
+    if (rows <= 1) {
+        state.base_addr = state.current_addr;
+        return;
+    }
+    if (margin * 2 >= rows) {
+        margin = (rows - 1) / 2;
+    }
+
+    int row = disasm_visible_row(state.current_addr);
+    if (row >= 0 && row < rows) {
+        int lower_limit = rows - 1 - margin;
+        if (row < margin) {
+            state.base_addr = disasm_rewind_rows(state.base_addr, margin - row);
+            ensure_disasm_visible();
+            return;
+        }
+        if (row > lower_limit) {
+            state.base_addr = disasm_advance_rows(state.base_addr, row - lower_limit);
+            ensure_disasm_visible();
+            return;
+        }
+        return;
+    }
+
+    state.base_addr = disasm_rewind_rows(state.current_addr, margin);
+    ensure_disasm_visible();
 }
 
 int MachineMonitor :: debug_handle_key(int key)
@@ -5480,6 +6019,10 @@ int MachineMonitor :: debug_handle_key(int key)
         return 0;
     }
     if (key == KEY_CTRL_O) {
+        // Leaving the monitor. debug_leave() -> session cleanup() hands the
+        // parked CPU back to the interrupted program (overlay: resumed live;
+        // freeze: staged for when the freezer menu unfreezes). No deferred
+        // go-handoff is scheduled, so the C64 is never left spinning.
         debug_leave();
         return 1;
     }
@@ -5504,21 +6047,33 @@ int MachineMonitor :: debug_handle_key(int key)
     }
     if (key == 'd' || key == 'D') {
         debug_request_over();
+        if (reset_exit_pending) {
+            return MENU_EXIT;
+        }
         draw();
         return 0;
     }
     if (key == 't' || key == 'T') {
         debug_request_trace();
+        if (reset_exit_pending) {
+            return MENU_EXIT;
+        }
         draw();
         return 0;
     }
     if (key == 'o' || key == 'O') {
         debug_request_out();
+        if (reset_exit_pending) {
+            return MENU_EXIT;
+        }
         draw();
         return 0;
     }
     if (key == 'g' || key == 'G') {
         debug_request_go();
+        if (reset_exit_pending) {
+            return MENU_EXIT;
+        }
         if (go_pending) {
             return 1;
         }
@@ -5557,6 +6112,8 @@ void MachineMonitor :: init(Screen *scr, Keyboard *keyb)
     last_live_vic_bank = current_vic_bank;
     vic_bank_override = false;
     apply_go_local(state.current_addr);
+    debug_cursor_override = false;
+    restore_debug_mode_after_reset();
     draw();
 }
 
@@ -5611,8 +6168,7 @@ int MachineMonitor :: handle_key(int key)
     MonitorError error;
 
     if (key == KEY_CTRL_X) {
-        handle_reset_shortcut();
-        return 0;
+        return handle_reset_shortcut();
     }
 
     if (hunt_picker_active) {
@@ -5683,6 +6239,7 @@ int MachineMonitor :: handle_key(int key)
     if (bookmark_set_shortcut_allowed() && monitor_key_is_bookmark_popup(key)) {
         bookmark_popup_active = true;
         bookmark_selected = 0;
+        monitor_log("bookmark popup open");
         draw();
         return 0;
     }
@@ -6087,6 +6644,7 @@ int MachineMonitor :: handle_key(int key)
             help_visible = false;
             if (backend && backend->freeze_available()) {
                 backend->set_frozen(!backend->is_frozen());
+                printf("MCM freeze %s\n", backend->is_frozen() ? "on" : "off");
             } else {
                 get_ui()->popup((backend && backend->supports_freeze()) ?
                                 "FREEZE ONLY IN OVERLAY MODE" : "FREEZE UNAVAILABLE", BUTTON_OK);
@@ -6102,6 +6660,7 @@ int MachineMonitor :: handle_key(int key)
             }
             state.cpu_port = next_cpu_mode(state.cpu_port);
             backend->set_monitor_cpu_port(state.cpu_port);
+            printf("MCM cpu-bank $%02X\n", state.cpu_port);
             if (state.view == MONITOR_VIEW_ASM) {
                 restore_disasm_cursor_row(asm_row);
             }
@@ -6122,15 +6681,18 @@ int MachineMonitor :: handle_key(int key)
             current_vic_bank = requested_vic_bank;
             last_live_vic_bank = live_vic_bank;
             vic_bank_override = (live_vic_bank != requested_vic_bank);
+            printf("MCM vic-bank %u live %u\n", (unsigned)requested_vic_bank, (unsigned)live_vic_bank);
             break;
         }
         case 'u': case 'U':
             if (state.view == MONITOR_VIEW_ASM) {
                 state.illegal_enabled = !state.illegal_enabled;
+                printf("MCM undoc %s\n", state.illegal_enabled ? "on" : "off");
             } else if (state.view == MONITOR_VIEW_SCREEN) {
                 state.screen_charset = (state.screen_charset == MONITOR_SCREEN_CHARSET_LOWER_UPPER) ?
                     MONITOR_SCREEN_CHARSET_UPPER_GRAPHICS :
                     MONITOR_SCREEN_CHARSET_LOWER_UPPER;
+                printf("MCM screen-charset %u\n", (unsigned)state.screen_charset);
             } else {
                 get_ui()->popup("UNDOC IN ASM, CASE IN SCR", BUTTON_OK);
                 redraw_full();
@@ -6152,6 +6714,7 @@ int MachineMonitor :: handle_key(int key)
                 error = monitor_parse_address(jump_buffer, &address);
                 if (error == MONITOR_OK) {
                     apply_go_local(address);
+                    monitor_log_address("jump", address);
                 } else {
                     get_ui()->popup(monitor_error_text(error), BUTTON_OK);
                 }
@@ -6170,6 +6733,8 @@ int MachineMonitor :: handle_key(int key)
             if (prompt_command("Fill AAAA-BBBB,DD", fill_buffer, sizeof(fill_buffer), true)) {
                 error = monitor_parse_fill(fill_buffer, &start, &end, &byte_value);
                 if (error == MONITOR_OK) {
+                    monitor_log_range("fill", start, end);
+                    printf("MCM fill-value $%02X\n", byte_value);
                     monitor_fill_memory(backend, start, end, byte_value);
                 } else {
                     get_ui()->popup(monitor_error_text(error), BUTTON_OK);
@@ -6179,12 +6744,22 @@ int MachineMonitor :: handle_key(int key)
         }
         case 't': case 'T':
         {
-            char transfer_buffer[15];
+            char transfer_buffer[25];
+            bool relocate = false;
+            uint16_t reloc_start = 0;
+            uint16_t reloc_end = 0;
             strcpy(transfer_buffer, "AAAA-BBBB,CCCC");
-            if (prompt_command("Transfer AAAA-BBBB,CCCC", transfer_buffer, sizeof(transfer_buffer), true)) {
-                error = monitor_parse_transfer(transfer_buffer, &start, &end, &dest);
+            if (prompt_command("Transfer AAAA-BBBB,CCCC[,DDDD-EEEE]", transfer_buffer, sizeof(transfer_buffer), true)) {
+                error = monitor_parse_transfer_relocate(transfer_buffer, &start, &end, &dest,
+                                                        &relocate, &reloc_start, &reloc_end);
                 if (error == MONITOR_OK) {
-                    monitor_transfer_memory(backend, start, end, dest);
+                    printf("MCM transfer $%04X-$%04X->$%04X\n", start, end, dest);
+                    if (relocate) {
+                        printf("MCM transfer-relocate $%04X-$%04X\n", reloc_start, reloc_end);
+                        monitor_transfer_memory_relocate(backend, start, end, dest, reloc_start, reloc_end);
+                    } else {
+                        monitor_transfer_memory(backend, start, end, dest);
+                    }
                 } else {
                     get_ui()->popup(monitor_error_text(error), BUTTON_OK);
                 }
@@ -6200,6 +6775,7 @@ int MachineMonitor :: handle_key(int key)
                 if (error == MONITOR_OK) {
                     int found = monitor_compare_collect(backend, start, end, dest,
                                                        hunt_addrs, (int)(sizeof(hunt_addrs) / sizeof(hunt_addrs[0])));
+                    printf("MCM compare $%04X-$%04X->$%04X found %d\n", start, end, dest, found);
                     if (found <= 0) {
                         get_ui()->popup("No differences", BUTTON_OK);
                     } else {
@@ -6220,6 +6796,7 @@ int MachineMonitor :: handle_key(int key)
                 if (error == MONITOR_OK) {
                     int found = monitor_hunt_collect(backend, start, end, needle, needle_len,
                                                     hunt_addrs, (int)(sizeof(hunt_addrs) / sizeof(hunt_addrs[0])));
+                    printf("MCM hunt $%04X-$%04X len %d found %d\n", start, end, needle_len, found);
                     if (found <= 0) {
                         get_ui()->popup("No matches", BUTTON_OK);
                     } else {
@@ -6248,6 +6825,9 @@ int MachineMonitor :: poll(int)
     int key;
     bool status_changed = false;
 
+    if (reopen_after_reset && reset_exits_monitor) {
+        return MENU_EXIT;
+    }
     if (!keyboard) {
         return MENU_CLOSE;
     }
@@ -6354,6 +6934,8 @@ void MachineMonitor::handle_load_command()
     last_load_offset = offset;
     last_load_length_auto = length_auto;
     last_load_length = length;
+    printf("MCM load %s start $%04X offset $%04X len %u\n",
+           use_prg ? "PRG" : "RAW", start_addr, offset, (unsigned)length);
 
     const char *err = monitor_io::load_into_memory(path_buf, name_buf, backend,
                                                    start_addr, use_prg,
@@ -6361,10 +6943,12 @@ void MachineMonitor::handle_load_command()
                                                    &start_addr, &length);
     redraw_full();
     if (err) {
+        printf("MCM load failed %s\n", err);
         get_ui()->popup(err, BUTTON_OK);
         redraw_full();
         return;
     }
+    printf("MCM load ok $%04X len %u\n", start_addr, (unsigned)length);
     show_io_confirmation("LOAD", name_buf, start_addr, length);
     redraw_full();
 }
@@ -6389,6 +6973,7 @@ void MachineMonitor::handle_save_command()
     }
     last_save_start = start;
     last_save_end = end;
+    monitor_log_range("save range", start, end);
 
     char path_buf[256] = "";
     char name_buf[36] = "";
@@ -6420,11 +7005,13 @@ void MachineMonitor::handle_save_command()
     const char *err = monitor_io::save_from_memory(get_ui(), path_buf, name_buf, backend, start, end);
     redraw_full();
     if (err) {
+        printf("MCM save failed %s\n", err);
         get_ui()->popup(err, BUTTON_OK);
         redraw_full();
         return;
     }
     uint32_t bytes = (uint32_t)end - (uint32_t)start + 1;
+    printf("MCM save ok $%04X-$%04X len %u\n", start, end, (unsigned)bytes);
     show_io_confirmation("SAVE", name_buf, start, bytes);
     redraw_full();
 }
@@ -6449,6 +7036,7 @@ void MachineMonitor::handle_width_command()
     if (state.view == MONITOR_VIEW_HEX) {
         memory_bytes_per_row = (memory_byte_stride() == MONITOR_MEMORY_MIN_BYTES_PER_ROW) ?
             MONITOR_MEMORY_MAX_BYTES_PER_ROW : MONITOR_MEMORY_MIN_BYTES_PER_ROW;
+        printf("MCM width memory %u\n", (unsigned)memory_bytes_per_row);
         ensure_current_visible();
         draw();
         return;
@@ -6478,11 +7066,13 @@ void MachineMonitor::handle_width_command()
     }
 
     binary_bit_index = 7;
+    printf("MCM width binary %u\n", (unsigned)binary_bytes_per_row);
     ensure_current_visible();
     draw();
 }
 
-bool MachineMonitor :: consume_pending_go(uint16_t *address)
+bool MachineMonitor :: consume_pending_go(uint16_t *address, DebugContext *context,
+                                          bool *has_context)
 {
     if (!go_pending) {
         return false;
@@ -6490,8 +7080,22 @@ bool MachineMonitor :: consume_pending_go(uint16_t *address)
     if (address) {
         *address = go_pending_addr;
     }
-    go_pending = false;
+    if (context) {
+        *context = go_pending_context;
+    }
+    if (has_context) {
+        *has_context = go_pending_has_context;
+    }
+    clear_pending_go();
     return true;
+}
+
+void MachineMonitor :: clear_pending_go(void)
+{
+    go_pending = false;
+    go_pending_addr = 0;
+    go_pending_has_context = false;
+    debug_context_reset(&go_pending_context);
 }
 
 bool MachineMonitor::handle_go_command()
@@ -6520,5 +7124,6 @@ bool MachineMonitor::handle_go_command()
     apply_go_local(address);
     go_pending = true;
     go_pending_addr = address;
+    monitor_log_address("go", address);
     return true;
 }

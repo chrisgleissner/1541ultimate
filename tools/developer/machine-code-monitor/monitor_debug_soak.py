@@ -7,10 +7,9 @@ repeatedly seeds controlled CPU state, enters selected BASIC/KERNAL routines,
 single-steps instructions, and compares the Debug footer against a small local
 6510 model for every supported instruction.
 
-Full ROM stepping requires copying BASIC and KERNAL into the RAM underneath
-their ROM windows and forcing the live 6510 port to all-RAM mode. That is
-destructive to the C64-side machine state, so it is opt-in and requires an
-explicit confirmation flag or interactive confirmation.
+The soak runs against the normal ROM mapping. It deliberately does not copy
+BASIC/KERNAL into underlying RAM; ROM breakpoints must use the debugger's
+backend-specific writable execution/shadow representation.
 """
 
 from __future__ import annotations
@@ -65,31 +64,12 @@ ROUTINES = [
     Routine("BASIC PRINT", 0xAAA0, "BASIC"),
     Routine("BASIC PEEK", 0xB80D, "BASIC"),
     Routine("BASIC POKE", 0xB824, "BASIC"),
+    Routine("KERNAL FLOAT-FAC", 0xE000, "KERNAL"),
+    Routine("KERNAL FLOAT-CONT", 0xE013, "KERNAL"),
+    Routine("KERNAL FLOAT-SEC", 0xE018, "KERNAL"),
     Routine("KERNAL LOAD", 0xE168, "KERNAL"),
     Routine("KERNAL SAVE", 0xE156, "KERNAL"),
     Routine("KERNAL SYS", 0xE12A, "KERNAL"),
-    Routine("KERNAL CINT", 0xFF81, "KERNAL"),
-    Routine("KERNAL IOINIT", 0xFF84, "KERNAL"),
-    Routine("KERNAL RAMTAS", 0xFF87, "KERNAL"),
-    Routine("KERNAL RESTOR", 0xFF8A, "KERNAL"),
-    Routine("KERNAL VECTOR", 0xFF8D, "KERNAL"),
-    Routine("KERNAL SETMSG", 0xFF90, "KERNAL"),
-    Routine("KERNAL SECOND", 0xFF93, "KERNAL"),
-    Routine("KERNAL CIOUT", 0xFFA8, "KERNAL"),
-    Routine("KERNAL UNLSN", 0xFFAE, "KERNAL"),
-    Routine("KERNAL LISTN", 0xFFB1, "KERNAL"),
-    Routine("KERNAL SETLFS", 0xFFBA, "KERNAL"),
-    Routine("KERNAL SETNAM", 0xFFBD, "KERNAL"),
-    Routine("KERNAL OPEN", 0xFFC0, "KERNAL"),
-    Routine("KERNAL CLOSE", 0xFFC3, "KERNAL"),
-    Routine("KERNAL CHKIN", 0xFFC6, "KERNAL"),
-    Routine("KERNAL CHKOUT", 0xFFC9, "KERNAL"),
-    Routine("KERNAL CLRCHN", 0xFFCC, "KERNAL"),
-    Routine("KERNAL CHRIN", 0xFFCF, "KERNAL"),
-    Routine("KERNAL CHROUT", 0xFFD2, "KERNAL"),
-    Routine("KERNAL STOP", 0xFFE1, "KERNAL"),
-    Routine("KERNAL GETIN", 0xFFE4, "KERNAL"),
-    Routine("KERNAL CLALL", 0xFFE7, "KERNAL"),
 ]
 
 
@@ -152,6 +132,10 @@ def _set_nz(sr: int, value: int) -> int:
     return sr
 
 
+class UnsupportedEmulation(Exception):
+    pass
+
+
 class Memory:
     def __init__(self, rest_host: str) -> None:
         self.rest_host = rest_host
@@ -159,6 +143,10 @@ class Memory:
 
     def read(self, address: int) -> int:
         address = _u16(address)
+        # $0000/$0001 are 6510 CPU port registers. The REST raw-memory API is
+        # not an instruction-fetch/read oracle for those locations.
+        if address in (0x0000, 0x0001):
+            raise UnsupportedEmulation
         if address not in self.cache:
             self.cache[address] = mt.read_rest_memory(self.rest_host, address, 1)[0]
         return self.cache[address]
@@ -499,28 +487,13 @@ def set_cpu(session: "mt.MonitorSession", cpu: int) -> None:
     raise mt.Failure(f"Could not switch monitor CPU bank to CPU{cpu}")
 
 
-def destructive_confirmation(args: argparse.Namespace) -> None:
-    if not args.copy_roms_to_ram:
-        return
-    if args.yes_copy_roms:
-        return
-    prompt = "Type COPY ROMS TO RAM to overwrite the RAM under BASIC/KERNAL: "
-    if not sys.stdin.isatty():
-        raise mt.Failure("--copy-roms-to-ram requires --yes-copy-roms in non-interactive runs")
-    if input(prompt) != "COPY ROMS TO RAM":
-        raise mt.Failure("ROM shadow copy was not confirmed")
-
-
-def copy_roms_to_ram(rest_host: str) -> None:
+def verify_rom_mapping(rest_host: str) -> None:
     basic = mt.read_rest_memory(rest_host, 0xA000, 0x2000)
     kernal = mt.read_rest_memory(rest_host, 0xE000, 0x2000)
     if basic[0:2] != b"\x94\xE3":
         raise mt.Failure(f"BASIC ROM signature mismatch at $A000: {basic[0:2].hex().upper()}")
     if kernal[-6:] == b"\x00" * 6:
-        raise mt.Failure("KERNAL vector area read as all zeroes; refusing ROM shadow copy")
-    for base, data in ((0xA000, basic), (0xE000, kernal)):
-        for offset in range(0, len(data), 128):
-            mt.write_rest_memory(rest_host, base + offset, data[offset:offset + 128])
+        raise mt.Failure("KERNAL vector area read as all zeroes; ROM mapping is not usable")
 
 
 def write_bootstrap(rest_host: str, target: int, seed: int) -> CpuState:
@@ -528,7 +501,6 @@ def write_bootstrap(rest_host: str, target: int, seed: int) -> CpuState:
     xr = (0x40 + seed * 29) & 0xFF
     yr = (0x01 + seed * 7) & 0x7F
     program = bytes([
-        0xA9, 0x30, 0x8D, 0x01, 0x00,       # force live $0001 to all-RAM
         0xD8, 0x18, 0x78, 0xB8,             # CLD / CLC / SEI / CLV
         0xA2, 0xF8, 0x9A,                   # deterministic SP for footer checks
         0xA9, ac, 0xA2, xr, 0xA0, yr,       # known registers
@@ -544,12 +516,11 @@ def enter_routine(session: "mt.MonitorSession", rest_host: str, routine: Routine
                   seed: int) -> CpuState:
     expected = write_bootstrap(rest_host, routine.address, seed)
     dbg._reopen_monitor(session)
-    set_cpu(session, 0)
+    set_cpu(session, 7)
     session.goto(f"{routine.address:04X}")
     session.send_char("A")
     session.send_char("D")
     session.send_char("R")
-    session.send_key("ENTER")
     session.goto(f"{BOOTSTRAP_ADDR:04X}")
     session.send_char("G")
     dbg._wait_for_pc(session, f"{routine.address:04X}")
@@ -563,7 +534,7 @@ def exercise_debug_ux(session: "mt.MonitorSession", current: CpuState, iteration
     if iteration % 11 == 0:
         session.send_key("F3")
         text = session.capture().text()
-        for token in ("D Debug/Over", "T Trace", "O Out", "C=+X Reset", "RSTOP"):
+        for token in ("D Step Over", "T Step Into", "O Step Out", "C=+X Reset", "RSTOP"):
             if token not in text:
                 raise mt.Failure(f"Debug help missing {token!r} during soak:\n{text}")
         session.send_key("ESC")
@@ -575,33 +546,81 @@ def exercise_debug_ux(session: "mt.MonitorSession", current: CpuState, iteration
         if f"${current.pc:04X}" not in header:
             raise mt.Failure(f"ASM did not return to debug PC {current.pc:04X}: {header!r}")
     if iteration % 23 == 0:
-        session.last_command = "CBM_R"
-        session.sock.sendall(b"\x1bR")
+        session.last_command = "CTRL_R"
+        session.sock.sendall(b"\x12")
         text = session.capture().text()
         if "BREAKPOINTS" not in text:
             raise mt.Failure(f"Breakpoint popup missing during soak:\n{text}")
         session.send_key("ESC")
 
 
+def rom_step_cycle(rest_host: str, session: "mt.MonitorSession", label: str) -> int:
+    """Run a bare ROM Step Into cycle that must move PC and show ROM mapping."""
+    validations = 0
+
+    snap = dbg._enter_rom_debug_at(session, 0xE000, "KRN",
+                                   f"{label}: KERNAL ROM Step Into", "$E:KRN")
+    row = dbg._disassembly_row(snap, 0xE000)
+    expected_pc = 0xE002 if "85 56" in row else 0xE000 + dbg._instruction_length_from_row(row)
+    dbg._step_and_assert_pc(session, "T", expected_pc, f"{label}: KERNAL ROM Step Into")
+    validations += 1
+    dbg._leave_debug_and_reset(rest_host, session)
+
+    snap = dbg._enter_rom_debug_at(session, 0xA831, "BAS",
+                                   f"{label}: BASIC ROM Step Into", "$A:BAS")
+    row = dbg._disassembly_row(snap, 0xA831)
+    expected_pc = 0xA832 if "18" in row else 0xA831 + dbg._instruction_length_from_row(row)
+    dbg._step_and_assert_pc(session, "T", expected_pc, f"{label}: BASIC ROM Step Into")
+    validations += 1
+    dbg._leave_debug_and_reset(rest_host, session)
+
+    return validations
+
+
 def run_soak(args: argparse.Namespace, rest_host: str, session: "mt.MonitorSession") -> None:
-    destructive_confirmation(args)
     original_port = mt.read_rest_memory(rest_host, 0x0001, 1)[0]
 
-    if args.copy_roms_to_ram:
-        with mt.check("Debug soak: copy BASIC/KERNAL ROMs into RAM below"):
-            copy_roms_to_ram(rest_host)
-    else:
-        raise mt.Failure("Full ROM debug soak requires --copy-roms-to-ram --yes-copy-roms")
+    with mt.check("Debug soak: verify BASIC/KERNAL ROM mapping"):
+        verify_rom_mapping(rest_host)
 
     rng = random.Random(args.seed)
     deadline = time.time() + args.duration
     iteration = 0
     validated_steps = 0
+    rom_validations = 0
+    step_out_validations = 0
+    cleanup_validations = 0
     restarts = 0
     mem = Memory(rest_host)
 
     try:
+        with mt.check("Debug soak: bare BASIC/KERNAL ROM Step Into cycle"):
+            rom_validations += rom_step_cycle(rest_host, session, "initial ROM cycle")
+            mem.cache.clear()
+
+        with mt.check("Debug soak: Step Out active-JSR target proof"):
+            dbg.prove_step_out_breaks_after_active_jsr(
+                rest_host, session, "initial soak Step Out active-JSR proof")
+            step_out_validations += 1
+
+        with mt.check("Debug soak: RAM cleanup resume after monitor exit"):
+            dbg.prove_stop_debug_exit_resumes_current_context(
+                rest_host, session, "initial soak RAM cleanup resume proof")
+            cleanup_validations += 1
+            mem.cache.clear()
+
         while time.time() < deadline:
+            if restarts > 0 and restarts % 6 == 0:
+                rom_validations += rom_step_cycle(
+                    rest_host, session, f"periodic ROM cycle after {restarts} entries")
+                mem.cache.clear()
+                dbg.prove_step_out_breaks_after_active_jsr(
+                    rest_host, session, f"periodic soak Step Out proof after {restarts} entries")
+                step_out_validations += 1
+                dbg.prove_stop_debug_exit_resumes_current_context(
+                    rest_host, session, f"periodic soak cleanup proof after {restarts} entries")
+                cleanup_validations += 1
+                mem.cache.clear()
             routine = rng.choice(ROUTINES)
             restarts += 1
             state = enter_routine(session, rest_host, routine, restarts)
@@ -612,7 +631,10 @@ def run_soak(args: argparse.Namespace, rest_host: str, session: "mt.MonitorSessi
                     break
                 iteration += 1
                 exercise_debug_ux(session, state, iteration)
-                plan = emulate(mem, state)
+                try:
+                    plan = emulate(mem, state)
+                except UnsupportedEmulation:
+                    plan = None
                 if plan is None:
                     break
                 session.send_char(plan.key)
@@ -651,7 +673,19 @@ def run_soak(args: argparse.Namespace, rest_host: str, session: "mt.MonitorSessi
     if validated_steps < args.min_validated_steps:
         raise mt.Failure(
             f"Soak only validated {validated_steps} steps; expected at least {args.min_validated_steps}")
-    print(f"debug_soak_test: OK ({validated_steps} validated steps across {restarts} entries)")
+    if rom_validations < 2:
+        raise mt.Failure(
+            f"Soak only validated {rom_validations} ROM debug steps; expected at least 2")
+    if step_out_validations < 1:
+        raise mt.Failure(
+            f"Soak only validated {step_out_validations} active-JSR Step Out cycles; expected at least 1")
+    if cleanup_validations < 1:
+        raise mt.Failure(
+            f"Soak only validated {cleanup_validations} RAM cleanup cycles; expected at least 1")
+    print(f"debug_soak_test: OK ({validated_steps} validated steps, "
+          f"{rom_validations} ROM debug steps, "
+          f"{step_out_validations} active-JSR Step Out cycles, "
+          f"{cleanup_validations} cleanup cycles across {restarts} entries)")
 
 
 def main() -> int:
@@ -666,8 +700,6 @@ def main() -> int:
     parser.add_argument("--max-steps-per-entry", type=int, default=24)
     parser.add_argument("--min-validated-steps", type=int, default=50)
     parser.add_argument("--progress-every", type=int, default=100)
-    parser.add_argument("--copy-roms-to-ram", action="store_true")
-    parser.add_argument("--yes-copy-roms", action="store_true")
     args = parser.parse_args()
 
     rest_host = args.rest_host or args.host

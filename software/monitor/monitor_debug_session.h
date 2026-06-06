@@ -20,6 +20,9 @@ public:
         DBG_OK = 0,             // Stopped cleanly, *ctx populated.
         DBG_NOT_SUPPORTED,      // Backend cannot perform this operation.
         DBG_REFUSED,            // Unsafe target (BRK, unsupported insn, ...).
+        DBG_UNSUPPORTED_OPCODE, // Opcode can be decoded but not debug-stepped.
+        DBG_NOT_IN_SUBROUTINE,  // Step Out requested without a traced JSR frame.
+        DBG_RETURN_NOT_REACHED, // Step Out ran but did not trap at its return target.
         DBG_TIMEOUT,            // Trap did not fire within the wait window.
         DBG_CANCELLED,          // User pressed RUN/STOP / Telnet ESC during wait.
         DBG_RESET,              // User forced a machine reset; context is no longer truthful.
@@ -32,6 +35,11 @@ public:
     // waiting for a trap. Default keeps host tests and unsupported backends
     // independent of UI/input plumbing.
     virtual void set_cancel_keyboard(class Keyboard *) { }
+
+    // True only when the active monitor UI renders through the C64 freezer
+    // screen. Overlay and remote monitor sessions must leave this disabled so
+    // stepping cannot enter the C64 freeze/refreeze ownership path.
+    virtual void set_run_window_refreeze_enabled(bool) { }
 
     // Best-effort initial context. May return DBG_NOT_SUPPORTED on backends
     // that cannot snapshot CPU state without first performing a step. The
@@ -82,6 +90,48 @@ public:
     // to call at any time (success, failure, mode change, destructor) and
     // must be idempotent.
     virtual void cleanup(void) = 0;
+
+    // Stop Debugging without continuing the debug target. Backends with a
+    // parked CPU may use the supplied pre-debug context as the live resume
+    // context instead of resuming the most recent target debug PC.
+    virtual void cleanup_to_context(const DebugContext *ctx)
+    {
+        (void)ctx;
+        cleanup();
+    }
+
+    // True only when the backend can patch bytes in currently visible ROM
+    // windows (e.g. U64 volatile BASIC/KERNAL/CHAR images). Backends that
+    // cannot must leave this false so the shared BRK engine refuses visible
+    // ROM breakpoints before scribbling into the RAM underneath the ROM.
+    virtual bool supports_visible_rom_patching(void) const { return false; }
+
+    // Fetch instruction bytes for step prediction from the live execution
+    // domain the debug session controls. This lets ROM-capable backends decode
+    // BASIC/KERNAL/CHAR instructions without changing the monitor's normal
+    // memory-view semantics. Returns false when the backend has no special
+    // source and the caller should fall back to regular backend reads.
+    virtual bool read_step_bytes(uint16_t address, uint8_t *dst, uint8_t len)
+    {
+        (void)address; (void)dst; (void)len;
+        return false;
+    }
+
+    // Forget any cached CPU context so the next snapshot() reports "no context".
+    // Called when the user leaves Debug mode so re-entering starts the debugger
+    // from the current cursor position instead of the previous session's PC.
+    // Does not patch or run the machine; cleanup() still owns patch teardown.
+    virtual void forget_context(void) { }
+
+    // Returns true when the most recent CPU-run window temporarily unfroze a
+    // frozen machine and subsequently refroze it. The firmware chrome rows (UI
+    // title and border lines) are overwritten by the live BASIC screen during
+    // the temporary unfreeze; callers that need a correct display must restore
+    // the chrome (e.g. via UserInterface::set_screen_title()) and redraw the
+    // monitor window before the user sees the result.
+    // Cleared at the start of the next CPU-run window. Always false in overlay
+    // mode because overlay sessions disable freeze/refreeze run windows.
+    virtual bool screen_render_target_invalidated(void) const { return false; }
 };
 
 #endif

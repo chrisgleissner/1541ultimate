@@ -11,10 +11,10 @@ namespace {
 // to keep the layout obvious and to avoid creeping field reorderings.
 enum {
     FOOTER_POS_PC = 0,
-    FOOTER_POS_SP = 5,
-    FOOTER_POS_AC = 8,
-    FOOTER_POS_XR = 11,
-    FOOTER_POS_YR = 14,
+    FOOTER_POS_AC = 5,
+    FOOTER_POS_XR = 8,
+    FOOTER_POS_YR = 11,
+    FOOTER_POS_SP = 14,
     FOOTER_POS_FLAGS = 17,
     FOOTER_POS_IRQ = 26,
     FOOTER_POS_NMI = 31,
@@ -116,10 +116,10 @@ void MonitorDebug :: format_footer_header(char *out, int out_len)
     }
     blank_buffer(out, FOOTER_WIDTH);
     copy_at(out, FOOTER_POS_PC, "PC");
-    copy_at(out, FOOTER_POS_SP, "SP");
     copy_at(out, FOOTER_POS_AC, "AC");
     copy_at(out, FOOTER_POS_XR, "XR");
     copy_at(out, FOOTER_POS_YR, "YR");
+    copy_at(out, FOOTER_POS_SP, "SP");
     copy_at(out, FOOTER_POS_FLAGS, "NV-BDIZC");
     copy_at(out, FOOTER_POS_IRQ, "IRQ");
     copy_at(out, FOOTER_POS_NMI, "NMI");
@@ -139,10 +139,10 @@ void MonitorDebug :: format_footer_values(const DebugContext &ctx,
         return;
     }
     hex4_at(out, FOOTER_POS_PC, ctx.pc);
-    hex2_at(out, FOOTER_POS_SP, ctx.sp);
     hex2_at(out, FOOTER_POS_AC, ctx.a);
     hex2_at(out, FOOTER_POS_XR, ctx.x);
     hex2_at(out, FOOTER_POS_YR, ctx.y);
+    hex2_at(out, FOOTER_POS_SP, ctx.sp);
     bin8_at(out, FOOTER_POS_FLAGS, ctx.sr);
     if (ctx.irq_valid) {
         hex4_at(out, FOOTER_POS_IRQ, ctx.irq_vec);
@@ -155,23 +155,23 @@ void MonitorDebug :: format_footer_values(const DebugContext &ctx,
 int MonitorDebug :: format_help_lines(const char *lines[], int max_lines)
 {
     static const char *const text[] = {
-        "M Memory    I ASCII     V Screen",
-        "A Assembly  B Binary    U Undoc/Case",
-        "J Jump      D Debug/Over  G Go",
         "",
-        "E Edit      F Fill      T Trace",
-        "C Compare   H Hunt      N Number",
-        "W Width     R Breakpt   P Poll",
-        "Z Freeze    O Out       SH+O Out",
-        "L Load      S Save",
+        "D Step Over  T Step Into  O Step Out",
+        "G Continue   R Breakpt    C=+R Brkpts",
+        "C=+X Reset   RETURN Follow",
         "",
-        "Bookmarks:  C=+B List   C=+0-9 Jump",
-        "Debug: C=+R Brkpts C=+D Exit",
-        "Open monitor:  C=+O",
-        "Debug exit:    C=+D/RSTOP",
+        "M Memory     I ASCII      V Screen",
+        "A Assembly   B Binary     U Undoc/Case",
+        "J Jump       P Poll       N Number",
+        "E Edit       F Fill       W Width",
+        "C Compare    H Hunt       Z Freeze",
+        "L Load       S Save",
+        "",
+        "Bookmarks:     C=+B List  C=+0-9 Jump",
+        "Monitor:       C=+O Open/Close",
+        "Leave debug:   C=+D/RSTOP",
         "Leave edit:    C=+E/RSTOP",
-        "Copy/Paste:    C=+C / C=+V",
-        "Reset/Follow:  C=+X Reset / RETURN"
+        "Copy/Paste:    C=+C / C=+V"
     };
     int n = (int)(sizeof(text) / sizeof(text[0]));
     if (n > max_lines) {

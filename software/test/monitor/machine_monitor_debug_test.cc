@@ -15,6 +15,8 @@
 #include "monitor_breakpoints.h"
 #include "monitor_debug.h"
 #include "monitor_debug_session.h"
+#include "monitor_debug_brk_session.h"
+#include "monitor_debug_u64.h"
 #include "monitor_file_io.h"
 #include "monitor_debug_predictor.h"
 #include "machine_monitor_test_support.h"
@@ -35,6 +37,7 @@ const char *save_from_memory(UserInterface *, const char *, const char *,
     return "NOT SUPPORTED";
 }
 void jump_to(uint16_t) { }
+void resume_to_context(const DebugContext &) { }
 }
 
 namespace {
@@ -48,9 +51,13 @@ struct StubDebugSession : public DebugSession
     int out_calls;
     int go_calls;
     int cleanup_calls;
+    int cleanup_to_context_calls;
     int snapshot_calls;
     uint16_t last_start_pc;
+    DebugContext cleanup_target_ctx;
     DebugContext next_ctx;
+    bool predict_bytes_valid;
+    uint8_t predict_bytes[3];
     Result over_result;
     Result trace_result;
     Result out_result;
@@ -59,11 +66,15 @@ struct StubDebugSession : public DebugSession
 
     StubDebugSession()
         : over_calls(0), over_at_calls(0), trace_calls(0), trace_at_calls(0),
-          out_calls(0), go_calls(0), cleanup_calls(0), snapshot_calls(0),
+          out_calls(0), go_calls(0), cleanup_calls(0),
+          cleanup_to_context_calls(0),
+          snapshot_calls(0),
           last_start_pc(0),
+          predict_bytes_valid(false),
           over_result(DBG_OK), trace_result(DBG_OK),
           out_result(DBG_OK), go_result(DBG_OK), snapshot_result(DBG_OK)
     {
+        debug_context_reset(&cleanup_target_ctx);
         debug_context_reset(&next_ctx);
         next_ctx.valid = true;
         next_ctx.pc = 0xC003;
@@ -76,6 +87,9 @@ struct StubDebugSession : public DebugSession
         next_ctx.irq_vec = 0xC123;
         next_ctx.nmi_valid = true;
         next_ctx.nmi_vec = 0xEA31;
+        predict_bytes[0] = 0;
+        predict_bytes[1] = 0;
+        predict_bytes[2] = 0;
     }
 
     virtual Result snapshot(DebugContext *ctx) {
@@ -137,6 +151,24 @@ struct StubDebugSession : public DebugSession
     virtual void cleanup(void) {
         cleanup_calls++;
     }
+    virtual void cleanup_to_context(const DebugContext *ctx) {
+        cleanup_calls++;
+        cleanup_to_context_calls++;
+        if (ctx) {
+            cleanup_target_ctx = *ctx;
+        } else {
+            debug_context_reset(&cleanup_target_ctx);
+        }
+    }
+    virtual bool read_step_bytes(uint16_t, uint8_t *dst, uint8_t len) {
+        if (!predict_bytes_valid || !dst || len == 0) {
+            return false;
+        }
+        for (uint8_t i = 0; i < len && i < 3; i++) {
+            dst[i] = predict_bytes[i];
+        }
+        return true;
+    }
 };
 
 // Singleton stub session shared with FakeDebugBackend so tests can both
@@ -180,6 +212,7 @@ struct TrackingDebugBackend : public FakeMemoryBackend
     int session_creations;
     bool refuse_session;
     int reset_calls;
+    int nmi_pulses;
     bool allow_reset;
     DebugContext canned_snapshot;
     bool canned_snapshot_set;
@@ -231,6 +264,322 @@ struct SourceLabelDebugBackend : public TrackingDebugBackend
     }
 };
 
+// Direct render-target regression harness for the BRK debug engine.
+//
+// FakeFreezeMachine implements the BrkDebugSession hardware hooks over a flat
+// 64K RAM array plus a `frozen` flag that mirrors C64::isFrozen. It models the
+// freeze-mode invariant the production fix enforces: a debug step temporarily
+// unfreezes the machine to run the live CPU, then MUST re-freeze before control
+// returns so the monitor keeps rendering into the firmware/menu screen instead
+// of the live C64 screen RAM. The reserved sentinel byte is set on the first
+// delay() call to simulate the BRK trampoline firing.
+namespace {
+
+static const uint16_t FAKE_SENTINEL_ADDR = 0x03F7; // mirrors SENTINEL_ADDR
+static const uint16_t FAKE_SCREEN_BASE   = 0x0400; // C64 screen RAM aperture
+static const uint16_t FAKE_STORE_Y       = 0x03F0;
+static const uint16_t FAKE_STORE_X       = 0x03F1;
+static const uint16_t FAKE_STORE_A       = 0x03F2;
+static const uint16_t FAKE_STORE_SR      = 0x03F3;
+static const uint16_t FAKE_STORE_PCLO    = 0x03F4;
+static const uint16_t FAKE_STORE_PCHI    = 0x03F5;
+static const uint16_t FAKE_STORE_SP      = 0x03F6;
+static const uint16_t FAKE_SPIN_LO       = 0x0378;
+static const uint16_t FAKE_SPIN_HI       = 0x0379;
+static const uint16_t FAKE_RESUME_TRAMP  = 0x033C;
+
+class FakeFreezeMachine : public BrkDebugSession
+{
+public:
+    uint8_t ram[65536];
+    bool frozen;
+    bool accessible_when_unfrozen;
+    bool break_on_unfrozen_unfreeze_attempt;
+    int unfreeze_attempts;
+    int unfreeze_calls;
+    int refreeze_calls;
+    int reset_calls;
+    int nmi_pulses;
+    int brk_patch_writes;
+    uint16_t last_brk_patch_addr;
+    // When false, delay_ms() does NOT raise the sentinel, so wait_for_sentinel
+    // runs to its full timeout. Lets a test force the DBG_TIMEOUT path and then
+    // re-arm to prove the run-window state (depth, freeze bracketing) recovered.
+    bool sentinel_armed;
+    bool nmi_from_spin_times_out;
+    bool capture_override_armed;
+    uint16_t capture_override_pc;
+    uint8_t capture_override_sp;
+    uint8_t capture_override_a;
+    uint8_t capture_override_x;
+    uint8_t capture_override_y;
+    uint8_t capture_override_sr;
+
+    FakeFreezeMachine(bool start_frozen)
+        : frozen(start_frozen), accessible_when_unfrozen(false),
+          break_on_unfrozen_unfreeze_attempt(false), unfreeze_attempts(0),
+          unfreeze_calls(0), refreeze_calls(0), reset_calls(0), nmi_pulses(0),
+          brk_patch_writes(0), last_brk_patch_addr(0),
+          sentinel_armed(true), nmi_from_spin_times_out(false),
+          capture_override_armed(false),
+          capture_override_pc(0), capture_override_sp(0),
+          capture_override_a(0), capture_override_x(0), capture_override_y(0),
+          capture_override_sr(0)
+    {
+        memset(ram, 0, sizeof(ram));
+    }
+
+    // Leaf cleanup while the fake hooks are still live (the abstract base
+    // destructor intentionally does not call cleanup()).
+    virtual ~FakeFreezeMachine() { cleanup(); }
+
+    // Stamp a recognizable BASIC-like pattern into the C64 screen RAM so a test
+    // can prove monitor redraws never reach it.
+    void stamp_screen_sentinel(uint8_t value, int len)
+    {
+        for (int i = 0; i < len; i++) {
+            ram[FAKE_SCREEN_BASE + i] = value;
+        }
+    }
+    bool screen_sentinel_intact(uint8_t value, int len) const
+    {
+        for (int i = 0; i < len; i++) {
+            if (ram[FAKE_SCREEN_BASE + i] != value) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void arm_capture_context(uint16_t pc, uint8_t sp, uint8_t a,
+                             uint8_t x, uint8_t y, uint8_t sr)
+    {
+        capture_override_armed = true;
+        capture_override_pc = pc;
+        capture_override_sp = sp;
+        capture_override_a = a;
+        capture_override_x = x;
+        capture_override_y = y;
+        capture_override_sr = sr;
+    }
+
+protected:
+    virtual bool backend_ready(void) const { return true; }
+    virtual uint8_t current_cpu_port(void) const { return 0x07; }
+    virtual bool begin_stopped_session(void) { return false; }
+    virtual void end_stopped_session(bool) { }
+    virtual uint8_t peek_cpu(uint16_t a, uint8_t) { return ram[a]; }
+    virtual void poke_cpu(uint16_t a, uint8_t b, uint8_t)
+    {
+        if (b == 0x00) {
+            brk_patch_writes++;
+            last_brk_patch_addr = a;
+        }
+        ram[a] = b;
+    }
+    virtual uint8_t peek_visible(uint16_t a) { return ram[a]; }
+    virtual void poke_visible(uint16_t a, uint8_t b) { ram[a] = b; }
+    virtual void unfreeze_if_accessible(void)
+    {
+        bool accessible = frozen || accessible_when_unfrozen;
+        if (!accessible) {
+            return;
+        }
+        unfreeze_attempts++;
+        if (frozen) {
+            frozen = false;
+            unfreeze_calls++;
+        } else if (break_on_unfrozen_unfreeze_attempt) {
+            sentinel_armed = false;
+        }
+    }
+    virtual bool machine_is_frozen(void) const { return frozen; }
+    virtual void refreeze_machine(void)
+    {
+        if (!frozen) {
+            frozen = true;
+            refreeze_calls++;
+        }
+    }
+    virtual bool reset_machine(void) { reset_calls++; return true; }
+    virtual void pulse_nmi_and_release(bool)
+    {
+        nmi_pulses++;
+        if (nmi_from_spin_times_out &&
+            nmi_pulses > 1 &&
+            ram[FAKE_SPIN_LO] == 0x77 && ram[FAKE_SPIN_HI] == 0x03) {
+            sentinel_armed = false;
+        }
+    }
+    virtual void delay_ms(int)
+    {
+        // Model the BRK trampoline reaching the spin loop: the sentinel becomes
+        // non-zero so the next wait_for_sentinel poll returns DBG_OK. When the
+        // test disarms the sentinel, leave it clear so the engine runs to its
+        // DBG_TIMEOUT.
+        if (sentinel_armed) {
+            if (capture_override_armed) {
+                ram[FAKE_STORE_Y] = capture_override_y;
+                ram[FAKE_STORE_X] = capture_override_x;
+                ram[FAKE_STORE_A] = capture_override_a;
+                ram[FAKE_STORE_SR] = capture_override_sr;
+                ram[FAKE_STORE_PCLO] = (uint8_t)((capture_override_pc + 2) & 0xFF);
+                ram[FAKE_STORE_PCHI] = (uint8_t)((capture_override_pc + 2) >> 8);
+                ram[FAKE_STORE_SP] = capture_override_sp;
+                capture_override_armed = false;
+            }
+            ram[FAKE_SENTINEL_ADDR] = 0xFF;
+        }
+    }
+};
+
+class FakeVisibleRomMachine : public FakeFreezeMachine
+{
+public:
+    uint8_t basic_rom[8192];
+    uint8_t kernal_rom[8192];
+    uint8_t char_rom[4096];
+    uint8_t cpu_port;
+    bool allow_visible_rom_patching;
+    int rom_patch_writes;
+    uint16_t last_rom_patch_addr;
+
+    FakeVisibleRomMachine(bool start_frozen)
+        : FakeFreezeMachine(start_frozen), cpu_port(0x07),
+          allow_visible_rom_patching(false), rom_patch_writes(0),
+          last_rom_patch_addr(0)
+    {
+        memset(basic_rom, 0, sizeof(basic_rom));
+        memset(kernal_rom, 0, sizeof(kernal_rom));
+        memset(char_rom, 0, sizeof(char_rom));
+    }
+
+protected:
+    volatile uint8_t *rom_patch_ptr(uint16_t addr, uint8_t patch_cpu_port)
+    {
+        patch_cpu_port &= 0x07;
+        if (addr >= 0xA000 && addr <= 0xBFFF &&
+                ((patch_cpu_port & 0x03) == 0x03)) {
+            return &basic_rom[addr - 0xA000];
+        }
+        if (addr >= 0xD000 && addr <= 0xDFFF &&
+                ((patch_cpu_port & 0x03) != 0x00) &&
+                ((patch_cpu_port & 0x04) == 0x00)) {
+            return &char_rom[addr - 0xD000];
+        }
+        if (addr >= 0xE000 && (patch_cpu_port & 0x02)) {
+            return &kernal_rom[addr - 0xE000];
+        }
+        return 0;
+    }
+
+    virtual uint8_t current_cpu_port(void) const { return cpu_port; }
+    virtual bool supports_visible_rom_patching(void) const
+    {
+        return allow_visible_rom_patching;
+    }
+    virtual uint8_t peek_cpu(uint16_t a, uint8_t patch_cpu_port)
+    {
+        patch_cpu_port &= 0x07;
+        if (a >= 0xA000 && a <= 0xBFFF && ((patch_cpu_port & 0x03) == 0x03)) {
+            return basic_rom[a - 0xA000];
+        }
+        if (a >= 0xD000 && a <= 0xDFFF &&
+                ((patch_cpu_port & 0x03) != 0x00) &&
+                ((patch_cpu_port & 0x04) == 0x00)) {
+            return char_rom[a - 0xD000];
+        }
+        if (a >= 0xE000 && (patch_cpu_port & 0x02)) {
+            return kernal_rom[a - 0xE000];
+        }
+        return ram[a];
+    }
+    virtual void poke_cpu(uint16_t a, uint8_t b, uint8_t)
+    {
+        ram[a] = b;
+    }
+    virtual uint8_t read_patch_byte(uint16_t a, uint8_t patch_cpu_port)
+    {
+        volatile uint8_t *rom = rom_patch_ptr(a, patch_cpu_port);
+        if (rom && allow_visible_rom_patching) {
+            return *rom;
+        }
+        return peek_cpu(a, patch_cpu_port);
+    }
+    virtual void write_patch_byte(uint16_t a, uint8_t b, uint8_t patch_cpu_port)
+    {
+        volatile uint8_t *rom = rom_patch_ptr(a, patch_cpu_port);
+        if (rom && allow_visible_rom_patching) {
+            *rom = b;
+            rom_patch_writes++;
+            last_rom_patch_addr = a;
+            return;
+        }
+        poke_cpu(a, b, patch_cpu_port);
+    }
+};
+
+class FakeCpuPortBackend : public MemoryBackend
+{
+public:
+    uint8_t live_cpu_port;
+    int live_reads;
+
+    FakeCpuPortBackend()
+        : live_cpu_port(0x05), live_reads(0)
+    {
+    }
+
+    virtual uint8_t read(uint16_t address)
+    {
+        if (address == 0x0001) {
+            live_reads++;
+            return live_cpu_port;
+        }
+        return 0;
+    }
+    virtual void write(uint16_t, uint8_t) { }
+};
+
+// Build a one-byte NOP "program" at addr so the predictor classifies it as a
+// linear step and install_brk_at has a non-zero byte to overwrite.
+static void fake_seed_nop_run(FakeFreezeMachine &m, uint16_t addr)
+{
+    m.ram[addr] = 0xEA;     // NOP at PC
+    m.ram[addr + 1] = 0xEA; // fall-through target (BRK lands here; must be != 0)
+    m.ram[addr + 2] = 0xEA;
+}
+
+static void fake_seed_rom_nop_run(FakeVisibleRomMachine &m, uint16_t addr)
+{
+    if (addr >= 0xA000 && addr <= 0xBFFF) {
+        m.basic_rom[addr - 0xA000] = 0xEA;
+        m.basic_rom[addr - 0xA000 + 1] = 0xEA;
+        m.basic_rom[addr - 0xA000 + 2] = 0xEA;
+        return;
+    }
+    if (addr >= 0xE000) {
+        m.kernal_rom[addr - 0xE000] = 0xEA;
+        m.kernal_rom[addr - 0xE000 + 1] = 0xEA;
+        m.kernal_rom[addr - 0xE000 + 2] = 0xEA;
+    }
+}
+
+static void fake_seed_captured_context(FakeFreezeMachine &m, uint16_t pc,
+                                       uint8_t sp, uint8_t a,
+                                       uint8_t x, uint8_t y, uint8_t sr)
+{
+    m.ram[FAKE_STORE_Y] = y;
+    m.ram[FAKE_STORE_X] = x;
+    m.ram[FAKE_STORE_A] = a;
+    m.ram[FAKE_STORE_SR] = sr;
+    m.ram[FAKE_STORE_PCLO] = (uint8_t)((pc + 2) & 0xFF);
+    m.ram[FAKE_STORE_PCHI] = (uint8_t)((pc + 2) >> 8);
+    m.ram[FAKE_STORE_SP] = sp;
+}
+
+} // namespace
+
 static int trim_end(const char *s)
 {
     int n = (int)strlen(s);
@@ -238,18 +587,38 @@ static int trim_end(const char *s)
     return n;
 }
 
-static int expect_help_token_accented(CaptureScreen &screen, const char *needle,
-                                      const char *message)
+static int expect_help_token_not_accented(CaptureScreen &screen, const char *needle,
+                                          const char *message)
 {
     char row[40];
     for (int y = 0; y < 25; y++) {
         screen.get_slice(1, y, 38, row);
         const char *at = strstr(row, needle);
-        if (at && screen.colors[y][1 + (at - row)] == 1) {
+        if (at) {
+            int x = 1 + (int)(at - row);
+            int n = (int)strlen(needle);
+            for (int i = 0; i < n; i++) {
+                if (screen.colors[y][x + i] == 1) {
+                    return expect(false, message);
+                }
+            }
             return 0;
         }
     }
     return expect(false, message);
+}
+
+static int find_row_with_address(CaptureScreen &screen, const char *address)
+{
+    char row[40];
+
+    for (int y = 0; y < 25; y++) {
+        screen.get_slice(1, y, 38, row);
+        if (strncmp(row, address, 4) == 0) {
+            return y;
+        }
+    }
+    return -1;
 }
 
 static int test_predictor_classifies_control_flow()
@@ -308,6 +677,12 @@ static int test_breakpoint_slots_allocate_clear_and_format()
     bps.set_enabled(0, false);
     MonitorBreakpoints::format_popup_row(row, sizeof(row), 0, bps.get(0));
     if (expect(strstr(row, "0 OFF $C000") == row, "Disabled slot should show OFF")) return 1;
+    bps.set_label(0, "readc");
+    if (expect(strcmp(bps.get(0)->label, "READ") == 0,
+               "Breakpoint labels must normalize to four uppercase chars")) return 1;
+    MonitorBreakpoints::format_popup_row(row, sizeof(row), 0, bps.get(0));
+    if (expect(strstr(row, "0 OFF READ $C000") == row,
+               "Breakpoint popup row should include an assigned label")) return 1;
 
     bps.clear_slot(0);
     MonitorBreakpoints::format_popup_row(row, sizeof(row), 0, bps.get(0));
@@ -325,10 +700,10 @@ static int test_footer_layout_blanks_unknown_fields()
     MonitorDebug::format_footer_values(ctx, values, sizeof(values));
 
     if (expect(strncmp(header + 0, "PC", 2) == 0, "PC label position")) return 1;
-    if (expect(strncmp(header + 5, "SP", 2) == 0, "SP label position")) return 1;
-    if (expect(strncmp(header + 8, "AC", 2) == 0, "AC label position")) return 1;
-    if (expect(strncmp(header + 11, "XR", 2) == 0, "XR label position")) return 1;
-    if (expect(strncmp(header + 14, "YR", 2) == 0, "YR label position")) return 1;
+    if (expect(strncmp(header + 5, "AC", 2) == 0, "AC label position")) return 1;
+    if (expect(strncmp(header + 8, "XR", 2) == 0, "XR label position")) return 1;
+    if (expect(strncmp(header + 11, "YR", 2) == 0, "YR label position")) return 1;
+    if (expect(strncmp(header + 14, "SP", 2) == 0, "SP label position")) return 1;
     if (expect(strncmp(header + 17, "NV-BDIZC", 8) == 0, "Flags label position")) return 1;
     if (expect(strncmp(header + 26, "IRQ", 3) == 0, "IRQ label position")) return 1;
     if (expect(strncmp(header + 31, "NMI", 3) == 0, "NMI label position")) return 1;
@@ -354,10 +729,10 @@ static int test_footer_layout_blanks_unknown_fields()
     ctx.nmi_vec = 0xEA31;
     MonitorDebug::format_footer_values(ctx, values, sizeof(values));
     if (expect(strncmp(values + 0, "C003", 4) == 0, "PC hex must align under label")) return 1;
-    if (expect(strncmp(values + 5, "F7", 2) == 0, "SP hex must align under label")) return 1;
-    if (expect(strncmp(values + 8, "01", 2) == 0, "AC hex must align under label")) return 1;
-    if (expect(strncmp(values + 11, "00", 2) == 0, "XR hex must align under label")) return 1;
-    if (expect(strncmp(values + 14, "FF", 2) == 0, "YR hex must align under label")) return 1;
+    if (expect(strncmp(values + 5, "01", 2) == 0, "AC hex must align under label")) return 1;
+    if (expect(strncmp(values + 8, "00", 2) == 0, "XR hex must align under label")) return 1;
+    if (expect(strncmp(values + 11, "FF", 2) == 0, "YR hex must align under label")) return 1;
+    if (expect(strncmp(values + 14, "F7", 2) == 0, "SP hex must align under label")) return 1;
     if (expect(strncmp(values + 17, "00100100", 8) == 0, "Flags must render as NV-BDIZC binary string")) return 1;
     if (expect(strncmp(values + 26, "C123", 4) == 0, "IRQ vector hex position")) return 1;
     if (expect(strncmp(values + 31, "EA31", 4) == 0, "NMI vector hex position")) return 1;
@@ -536,6 +911,124 @@ static int test_d_inside_debug_without_context_overs_from_cursor()
     return 0;
 }
 
+static int test_d_inside_debug_without_context_goto_keeps_cursor_authoritative()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+    backend.write(0x1000, 0xA9);
+    backend.write(0x1001, 0x11);
+    backend.write(0x1002, 0xEA);
+    backend.write(0x2000, 0xA9);
+    backend.write(0x2001, 0x22);
+    backend.write(0x2002, 0xEA);
+
+    const int keys[] = { 'J', 'A', 'D', 'J', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 7);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("1000", 1);
+    ui.set_prompt("2000", 3);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    for (int i = 0; i < 7; i++) {
+        int r = monitor.poll(0);
+        if (i < 6) {
+            if (expect(r == 0, "No-context Debug goto polls should return 0")) return 1;
+        } else {
+            if (expect(r == 1, "Final RUN/STOP exits")) return 1;
+        }
+    }
+    if (expect(backend.last_session != NULL, "Backend should have created a debug session")) return 1;
+    if (expect(backend.last_session->over_calls == 0,
+               "No-context Debug goto must not fall back to captured context")) return 1;
+    if (expect(backend.last_session->over_at_calls == 1,
+               "No-context Debug goto must execute Over from cursor")) return 1;
+    if (expect(backend.last_session->last_start_pc == 0x2000,
+               "No-context Debug goto must keep the new cursor address authoritative")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_d_refuses_undocumented_opcode_with_specific_warning()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+    backend.write(0x1000, 0x1A);
+    backend.write(0x1001, 0xEA);
+
+    const int keys[] = { 'J', 'A', 'U', 'D', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 7);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("1000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    for (int i = 0; i < 7; i++) {
+        int r = monitor.poll(0);
+        if (i < 6) {
+            if (expect(r == 0, "Undocumented opcode refusal polls should return 0")) return 1;
+        } else {
+            if (expect(r == 1, "Final RUN/STOP exits")) return 1;
+        }
+    }
+    if (expect(ui.popup_count > 0 && strcmp(ui.last_popup, "UNSUPPORTED OPCODE") == 0,
+               "Undocumented opcode refusal must use UNSUPPORTED OPCODE")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_debug_predictor_uses_session_bytes_over_backend_reads()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.write(0xA000, 0x00);
+    backend.write(0xA001, 0x00);
+    backend.write(0xA002, 0x00);
+
+    const int keys[] = { 'J', 'A', 'D', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 6);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("A000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Goto A000 should stay in monitor")) return 1;
+    if (expect(monitor.poll(0) == 0, "Switch to ASM should stay in monitor")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug should stay in monitor")) return 1;
+
+    if (expect(backend.last_session != NULL, "Debug session must exist before stepping")) return 1;
+    backend.last_session->predict_bytes_valid = true;
+    backend.last_session->predict_bytes[0] = 0xEA;
+    backend.last_session->predict_bytes[1] = 0xEA;
+    backend.last_session->predict_bytes[2] = 0xEA;
+
+    if (expect(monitor.poll(0) == 0,
+               "Debug over at A000 should use session bytes instead of unsafe backend BRK bytes")) return 1;
+    if (expect((backend.last_session->over_calls + backend.last_session->over_at_calls) == 1,
+               "Debug over should dispatch through the session when session bytes decode safely")) return 1;
+    if (expect(ui.popup_count == 0 || strstr(ui.last_popup, "UNSAFE TARGET") == NULL,
+               "Valid ROM step bytes must not surface UNSAFE TARGET")) return 1;
+
+    if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug")) return 1;
+    if (expect(monitor.poll(0) == 1, "Second RUN/STOP exits")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
 static int test_t_traces_and_o_outs_inside_debug()
 {
     TestUserInterface ui;
@@ -565,6 +1058,72 @@ static int test_t_traces_and_o_outs_inside_debug()
     if (expect(backend.last_session->trace_calls == 1, "T should call trace exactly once")) return 1;
     if (expect(backend.last_session->out_calls == 1, "O should call step-out exactly once")) return 1;
     if (expect(backend.last_session->over_calls == 0, "Neither T nor O should call Over")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_o_without_traced_jsr_reports_not_in_subroutine()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.snapshot_result = DebugSession::DBG_OK;
+    backend.canned_snapshot_set = true;
+    debug_context_reset(&backend.canned_snapshot);
+    backend.canned_snapshot.valid = true;
+    backend.canned_snapshot.pc = 0x2003;
+    backend.canned_snapshot.sp = 0xFA;
+    backend.canned_snapshot.sr = 0x24;
+
+    const int keys[] = { 'A', 'D', 'O', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 5);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM view ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug ok")) return 1;
+    if (expect(backend.last_session != NULL, "Debug session must exist")) return 1;
+    backend.last_session->out_result = DebugSession::DBG_NOT_IN_SUBROUTINE;
+    if (expect(monitor.poll(0) == 0, "Step Out refusal stays in monitor")) return 1;
+    if (expect(strstr(ui.last_popup, "NOT IN SUBROUTINE") != NULL,
+               "Step Out without a traced JSR must say NOT IN SUBROUTINE")) return 1;
+    if (expect(strstr(ui.last_popup, "UNSAFE TARGET") == NULL,
+               "Step Out without a traced JSR must not say UNSAFE TARGET")) return 1;
+    if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug")) return 1;
+    if (expect(monitor.poll(0) == 1, "Second RUN/STOP exits")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_o_without_context_reports_not_in_subroutine()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+
+    const int keys[] = { 'A', 'D', 'O', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 5);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM view ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Step Out without context stays in monitor")) return 1;
+    if (expect(strstr(ui.last_popup, "NOT IN SUBROUTINE") != NULL,
+               "Step Out without context must say NOT IN SUBROUTINE")) return 1;
+    if (expect(strstr(ui.last_popup, "NO CONTEXT") == NULL,
+               "Step Out without context must not say NO CONTEXT")) return 1;
+    if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug")) return 1;
+    if (expect(monitor.poll(0) == 1, "Second RUN/STOP exits")) return 1;
     monitor.deinit();
     return 0;
 }
@@ -725,6 +1284,7 @@ static int test_ctrl_d_leaves_debug_but_keeps_edit()
     FakeKeyboard keyboard(keys, 6);
     ui.screen = &screen;
     ui.keyboard = &keyboard;
+    ui.color_fg = 12;
 
     BackendMachineMonitor monitor(&ui, &backend);
     monitor.init(&screen, &keyboard);
@@ -904,6 +1464,91 @@ static int test_ctrl_x_resets_and_keeps_debug_open()
     return 0;
 }
 
+static int test_ctrl_x_local_reset_exits_monitor()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+    backend.write(0x0801, 0xEA);
+
+    const int keys[] = { 'A', 'D', KEY_CTRL_X };
+    FakeKeyboard keyboard(keys, 3);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_reset_exits_monitor(true);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM view ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug ok")) return 1;
+    if (expect(monitor.poll(0) == MENU_EXIT,
+               "Local UI CTRL+X reset must exit the monitor so host ownership is released")) return 1;
+    if (expect(backend.reset_calls == 1,
+               "Local UI CTRL+X reset must issue one backend reset")) return 1;
+    if (expect(monitor.consume_reopen_after_reset(),
+               "Local UI CTRL+X reset while monitor is open must request monitor re-entry")) return 1;
+    monitor.deinit();
+
+    const int reentry_keys[] = { KEY_BREAK, KEY_BREAK };
+    FakeKeyboard reentry_keyboard(reentry_keys, 2);
+    ui.keyboard = &reentry_keyboard;
+    BackendMachineMonitor reentered(&ui, &backend);
+    reentered.set_reset_exits_monitor(true);
+    reentered.init(&screen, &reentry_keyboard);
+    char header[40];
+    screen.get_slice(1, 3, 38, header);
+    if (expect(strstr(header, "MONITOR ASM $0000") != NULL,
+               "Reset re-entry must restore the monitor view and address")) return 1;
+    if (expect(strstr(header, "Dbg") != NULL,
+               "Reset re-entry must restore Debug mode when reset happened in Debug")) return 1;
+    if (expect(reentered.poll(0) == 0, "RUN/STOP leaves restored Debug")) return 1;
+    if (expect(reentered.poll(0) == 1, "Second RUN/STOP exits restored monitor")) return 1;
+    reentered.deinit();
+    return 0;
+}
+
+static int test_ctrl_x_reenters_monitor_without_debug_when_not_debugging()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    const int keys[] = { 'A', KEY_CTRL_X };
+    FakeKeyboard keyboard(keys, 2);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_reset_exits_monitor(true);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM view ok")) return 1;
+    if (expect(monitor.poll(0) == MENU_EXIT,
+               "Local UI CTRL+X reset must exit the current monitor instance")) return 1;
+    if (expect(monitor.consume_reopen_after_reset(),
+               "Local UI CTRL+X reset outside Debug must request monitor re-entry")) return 1;
+    monitor.deinit();
+
+    const int reentry_keys[] = { KEY_BREAK };
+    FakeKeyboard reentry_keyboard(reentry_keys, 1);
+    ui.keyboard = &reentry_keyboard;
+    BackendMachineMonitor reentered(&ui, &backend);
+    reentered.set_reset_exits_monitor(true);
+    reentered.init(&screen, &reentry_keyboard);
+    char header[40];
+    screen.get_slice(1, 3, 38, header);
+    if (expect(strstr(header, "MONITOR ASM $0000") != NULL,
+               "Reset re-entry outside Debug must restore the monitor view and address")) return 1;
+    if (expect(strstr(header, "Dbg") == NULL,
+               "Reset re-entry outside Debug must not enter Debug mode")) return 1;
+    if (expect(reentered.poll(0) == 1, "RUN/STOP exits restored non-Debug monitor")) return 1;
+    reentered.deinit();
+    return 0;
+}
+
 static int test_breakpoint_toggle_via_r()
 {
     TestUserInterface ui;
@@ -923,12 +1568,9 @@ static int test_breakpoint_toggle_via_r()
     if (expect(monitor.poll(0) == 0, "Enter Debug ok")) return 1;
     int popups_before = ui.popup_count;
     if (expect(monitor.poll(0) == 0, "R toggles breakpoint and stays in monitor")) return 1;
-    if (expect(ui.popup_count > popups_before, "Toggle-on must surface BRK status")) return 1;
-    if (expect(strstr(ui.last_popup, "BRK") != NULL && strstr(ui.last_popup, "SET") != NULL,
-               "First R should emit a SET status")) return 1;
+    if (expect(ui.popup_count == popups_before, "Toggle-on must not show a success popup")) return 1;
     if (expect(monitor.poll(0) == 0, "Second R clears the same address")) return 1;
-    if (expect(strstr(ui.last_popup, "CLR") != NULL,
-               "Second R must emit a CLR status")) return 1;
+    if (expect(ui.popup_count == popups_before, "Toggle-off must not show a success popup")) return 1;
     if (expect(monitor.poll(0) == 0, "First RUN/STOP leaves Debug")) return 1;
     if (expect(monitor.poll(0) == 1, "Second RUN/STOP exits the monitor")) return 1;
     monitor.deinit();
@@ -1049,15 +1691,54 @@ static int test_breakpoint_row_indicator_and_color()
     if (expect(strstr(row, "BASIC") == NULL,
                "Assembly source indicator must use the 3-character BAS label")) return 1;
 
-    char header[40];
-    screen.get_slice(1, 3, 38, header);
-    const char *dbg = strstr(header, "Dbg");
-    if (expect(dbg != NULL, "Header must still show Dbg")) return 1;
-    uint8_t accent = screen.colors[3][1 + (dbg - header)];
     for (int x = 1; x <= 38; x++) {
-        if (expect(screen.colors[4][x] == accent,
-                   "Every character on a breakpoint opcode line must use the Dbg/Edit accent color")) return 1;
+        if (expect(screen.colors[4][x] == ui.color_fg,
+                   "Every character on a breakpoint opcode line must use color_fg")) return 1;
     }
+
+    if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug")) return 1;
+    if (expect(monitor.poll(0) == 1, "Second RUN/STOP exits")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_breakpoint_label_replaces_row_indicator()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+    backend.write(0xA000, 0xEA);
+
+    const int keys[] = {
+        'J', 'A', 'D', 'R', KEY_CTRL_R, 'L', KEY_ESCAPE, KEY_BREAK, KEY_BREAK
+    };
+    FakeKeyboard keyboard(keys, 9);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.push_prompt("A000", 1);
+    ui.push_prompt("readc", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    for (int i = 0; i < 6; i++) {
+        if (expect(monitor.poll(0) == 0, "Breakpoint label setup should stay in monitor")) return 1;
+    }
+
+    char popup_row[42];
+    get_popup_line(screen, 2, popup_row, sizeof(popup_row));
+    if (expect(strstr(popup_row, "0 SET READ $A000") == popup_row,
+               "Breakpoint popup row must show the assigned label")) return 1;
+
+    if (expect(monitor.poll(0) == 0, "ESC closes labelled breakpoint popup")) return 1;
+    char row[40];
+    screen.get_slice(1, 4, 38, row);
+    if (expect(strstr(row, "[READ][BAS]") != NULL,
+               "Assembly row must show the breakpoint label instead of [BRKx]")) return 1;
+    if (expect(strstr(row, "[BRK0]") == NULL,
+               "Labelled breakpoint row must not also show [BRK0]")) return 1;
 
     if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug")) return 1;
     if (expect(monitor.poll(0) == 1, "Second RUN/STOP exits")) return 1;
@@ -1129,9 +1810,133 @@ static int test_ctrl_r_opens_breakpoint_popup()
         if (strstr(row, "BREAKPOINTS") != NULL) { found = true; }
     }
     if (expect(found, "C=+R must open the breakpoint list popup")) return 1;
+    int left = 0, top = 0, right = 0, bottom = 0;
+    if (expect(find_popup_rect(screen, &left, &top, &right, &bottom),
+               "Breakpoint popup must draw a complete border")) return 1;
+    if (expect(right - left - 1 == 38,
+               "Breakpoint popup must have 38 inner columns")) return 1;
+    if (expect(bottom == top + 15,
+               "Breakpoint popup must match the Bookmark popup height")) return 1;
+    if (expect(screen.colors[top + 1][left + 1] == ui.color_fg,
+               "Breakpoint popup title must use the normal popup foreground color")) return 1;
+    get_popup_line(screen, 2, row, sizeof(row));
+    if (expect(strncmp(row, "0 EMPTY", strlen("0 EMPTY")) == 0,
+               "Breakpoint popup must show slot 0")) return 1;
+    get_popup_line(screen, 11, row, sizeof(row));
+    if (expect(strncmp(row, "9 EMPTY", strlen("9 EMPTY")) == 0,
+               "Breakpoint popup must show slot 9 without scrolling")) return 1;
+    get_popup_line(screen, 12, row, sizeof(row));
+    if (expect(strspn(row, " ") == strlen(row),
+               "Breakpoint popup must separate slots from the help row")) return 1;
+    get_popup_line(screen, 13, row, sizeof(row));
+    if (expect(strncmp(row, "0-9/RET Jmp  S Set  L Label  DEL Reset",
+                       strlen("0-9/RET Jmp  S Set  L Label  DEL Reset")) == 0,
+               "Breakpoint popup help row must match the bookmark command summary")) return 1;
+    int slot_y = top + 1 + 2;
+    for (int x = left + 1; x < right; x++) {
+        if (expect(screen.colors[slot_y][x] == ui.color_fg,
+                   "Breakpoint popup selected row must use normal popup foreground color")) return 1;
+        if (expect(screen.colors[slot_y][x] != 1,
+                   "Breakpoint popup selected row must not use white accent color")) return 1;
+        if (expect(screen.reverse_chars[slot_y][x],
+                   "Breakpoint popup selected row must use reverse highlight")) return 1;
+    }
     if (expect(monitor.poll(0) == 0, "ESC closes the popup")) return 1;
     if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug first")) return 1;
     if (expect(monitor.poll(0) == 1, "RUN/STOP exits the monitor")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_breakpoint_popup_navigation_redraws_only_popup()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    const int keys[] = {
+        'A', 'D', KEY_CTRL_R, KEY_DOWN, KEY_ESCAPE, KEY_BREAK, KEY_BREAK
+    };
+    FakeKeyboard keyboard(keys, 7);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    for (int i = 0; i < 3; i++) {
+        if (expect(monitor.poll(0) == 0, "Setup should open breakpoint popup")) return 1;
+    }
+
+    int left = 0, top = 0, right = 0, bottom = 0;
+    if (expect(find_popup_rect(screen, &left, &top, &right, &bottom),
+               "Breakpoint popup rect should be discoverable")) return 1;
+
+    screen.reset_write_counts();
+    if (expect(monitor.poll(0) == 0, "DOWN should navigate inside breakpoint popup")) return 1;
+    if (expect(screen.count_writes_outside_rect(left, top, right, bottom) == 0,
+               "Breakpoint popup navigation must not redraw monitor content or frame")) return 1;
+
+    screen.reset_write_counts();
+    if (expect(monitor.poll(0) == 0, "ESC should close breakpoint popup")) return 1;
+    char row[42];
+    bool title_found = false;
+    for (int y = 0; y < 25 && !title_found; y++) {
+        screen.get_slice(0, y, 40, row);
+        if (strstr(row, "BREAKPOINTS") != NULL) title_found = true;
+    }
+    if (expect(!title_found, "Closing breakpoint popup must remove its title")) return 1;
+    if (expect(!find_popup_rect(screen, NULL, NULL, NULL, NULL),
+               "Closing breakpoint popup must not leave stale popup border corners")) return 1;
+    if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug first")) return 1;
+    if (expect(monitor.poll(0) == 1, "RUN/STOP exits the monitor")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_debug_pc_viewport_keeps_context_margin()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    for (int i = 0; i < 32; i++) {
+        backend.write((uint16_t)(0xC000 + i), 0xEA);
+    }
+    backend.canned_snapshot_set = true;
+    backend.canned_snapshot.valid = true;
+    backend.canned_snapshot.pc = 0xC003;
+    backend.canned_snapshot.sp = 0xF7;
+    backend.canned_snapshot.sr = 0x24;
+
+    const int keys[] = { 'J', 'A', 'D', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 6);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("C000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Goto viewport program")) return 1;
+    if (expect(monitor.poll(0) == 0, "Switch to ASM")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug and sync to PC")) return 1;
+
+    int row_c003 = find_row_with_address(screen, "C003");
+    int row_c000 = find_row_with_address(screen, "C000");
+    if (expect(row_c003 > row_c000, "Current PC must not be pinned to the first ASM row")) return 1;
+    if (expect(row_c003 - row_c000 >= 3,
+               "Current PC should preserve three instruction rows above where possible")) return 1;
+
+    if (expect(backend.last_session != NULL, "Debug session should exist before stepping")) return 1;
+    backend.last_session->next_ctx.pc = 0xC004;
+    if (expect(monitor.poll(0) == 0, "Over should step to next current PC")) return 1;
+    int row_c004 = find_row_with_address(screen, "C004");
+    if (expect(row_c004 == row_c003 + 1,
+               "Linear stepping should move the highlighted PC down naturally")) return 1;
+
+    if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug")) return 1;
+    if (expect(monitor.poll(0) == 1, "Second RUN/STOP exits")) return 1;
     monitor.deinit();
     return 0;
 }
@@ -1257,6 +2062,11 @@ static int test_ctrl_b_keeps_bookmark_popup_in_debug()
         if (strstr(row, "BOOKMARKS") != NULL) { found = true; }
     }
     if (expect(found, "C=+B must open the bookmark popup while Debug is active")) return 1;
+    int left = 0, top = 0, right = 0, bottom = 0;
+    if (expect(find_popup_rect(screen, &left, &top, &right, &bottom),
+               "Bookmark popup border must remain intact above the Debug footer")) return 1;
+    if (expect(right - left - 1 == 38,
+               "Bookmark popup must keep its 38-column body in Debug mode")) return 1;
     if (expect(backend.last_session == NULL ||
                (backend.last_session->over_calls == 0 &&
                 backend.last_session->trace_calls == 0 &&
@@ -1308,6 +2118,165 @@ static int test_cleanup_runs_on_deinit()
     return 0;
 }
 
+static int test_ctrl_o_after_debug_step_closes_without_go_handoff()
+{
+    // CTRL+O closing the monitor after a debug step must NOT schedule a deferred
+    // go-handoff. The session's cleanup() (driven by debug_leave) hands the
+    // parked CPU back to the interrupted program directly, so run_machine_monitor
+    // must not also release ownership and NMI-redirect into a torn-down spin
+    // loop - that double path is what left the C64 frozen on hardware.
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.write(0xC003, 0xA9);
+    backend.write(0xC004, 0x00);
+    backend.write(0xC005, 0xEA);
+    const int keys[] = { 'A', 'D', 'D', KEY_CTRL_O };
+    FakeKeyboard keyboard(keys, 4);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch should return 0")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug should return 0")) return 1;
+    if (expect(monitor.poll(0) == 0, "Debug step should return 0")) return 1;
+
+    StubDebugSession *sess = backend.last_session;
+    if (expect(sess != NULL, "Session must have been created")) return 1;
+
+    if (expect(monitor.poll(0) == 1,
+               "CTRL+O after a debug step should close the monitor")) return 1;
+    if (expect(sess->cleanup_calls >= 1,
+               "CTRL+O close must run session cleanup to resume the parked CPU")) return 1;
+
+    DebugContext go_ctx;
+    bool has_ctx = true;
+    uint16_t go_addr = 0;
+    if (expect(!monitor.consume_pending_go(&go_addr, &go_ctx, &has_ctx),
+               "CTRL+O close must NOT schedule a deferred go-handoff")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_stop_debugging_clears_stale_go_handoff()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.canned_snapshot_set = true;
+    debug_context_reset(&backend.canned_snapshot);
+    backend.canned_snapshot.valid = true;
+    backend.canned_snapshot.pc = 0x2000;
+    backend.canned_snapshot.sp = 0xF2;
+    backend.canned_snapshot.a = 0x11;
+    backend.canned_snapshot.x = 0x22;
+    backend.canned_snapshot.y = 0x33;
+    backend.canned_snapshot.sr = 0x24;
+    backend.write(0x2000, 0xEE);
+    backend.write(0x2001, 0x21);
+    backend.write(0x2002, 0xD0);
+    backend.write(0x2003, 0x4C);
+    backend.write(0x2004, 0x00);
+    backend.write(0x2005, 0x20);
+
+    const int keys[] = { 'A', 'D', 'G', KEY_BREAK };
+    FakeKeyboard keyboard(keys, 4);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_debug_run_window_refreeze_enabled(true);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch should return 0")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug should return 0")) return 1;
+    if (expect(monitor.poll(0) == 1,
+               "Freeze-mode G without breakpoints should schedule a handoff")) return 1;
+
+    if (expect(monitor.poll(0) == 0,
+               "Stop Debugging after a pending handoff should stay in monitor")) return 1;
+
+    DebugContext go_ctx;
+    bool has_ctx = true;
+    uint16_t go_addr = 0;
+    if (expect(!monitor.consume_pending_go(&go_addr, &go_ctx, &has_ctx),
+               "Stop Debugging must clear any stale pending Go handoff")) return 1;
+    if (expect(backend.read(0x2000) == 0xEE && backend.read(0x2001) == 0x21 &&
+               backend.read(0x2002) == 0xD0 && backend.read(0x2003) == 0x4C &&
+               backend.read(0x2004) == 0x00 && backend.read(0x2005) == 0x20,
+               "Stop Debugging must not leave a stale BRK patch in the $2000 loop")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_stop_debugging_resumes_current_debug_context()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.canned_snapshot_set = true;
+    debug_context_reset(&backend.canned_snapshot);
+    backend.canned_snapshot.valid = true;
+    backend.canned_snapshot.pc = 0xC123;
+    backend.canned_snapshot.sp = 0xEF;
+    backend.canned_snapshot.a = 0x44;
+    backend.canned_snapshot.x = 0x55;
+    backend.canned_snapshot.y = 0x66;
+    backend.canned_snapshot.sr = 0x24;
+    backend.write(0x2000, 0xEE);
+    backend.write(0x2001, 0x21);
+    backend.write(0x2002, 0xD0);
+    backend.write(0x2003, 0x4C);
+    backend.write(0x2004, 0x00);
+    backend.write(0x2005, 0x20);
+
+    const int keys[] = { 'J', 'A', 'D', 'D', KEY_BREAK };
+    FakeKeyboard keyboard(keys, 5);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("2000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Goto $2000 should stay in monitor")) return 1;
+    if (expect(monitor.poll(0) == 0, "ASM switch should return 0")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug should return 0")) return 1;
+    StubDebugSession *sess = backend.last_session;
+    if (expect(sess != NULL, "Session must have been created")) return 1;
+    sess->next_ctx.valid = true;
+    sess->next_ctx.pc = 0x2003;
+    sess->next_ctx.sp = 0xEC;
+    sess->next_ctx.a = 0x45;
+    sess->next_ctx.x = 0x56;
+    sess->next_ctx.y = 0x67;
+    sess->next_ctx.sr = 0x25;
+    if (expect(monitor.poll(0) == 0, "Step from target cursor should return 0")) return 1;
+
+    if (expect(sess->over_at_calls == 1 && sess->last_start_pc == 0x2000,
+               "Step must execute from the displayed $2000 target")) return 1;
+
+    if (expect(monitor.poll(0) == 0, "RUN/STOP should stop Debug")) return 1;
+    if (expect(sess->cleanup_to_context_calls >= 1,
+               "Stop Debugging must clean up toward a CPU context")) return 1;
+    if (expect(sess->cleanup_target_ctx.valid && sess->cleanup_target_ctx.pc == 0x2003 &&
+               sess->cleanup_target_ctx.sp == 0xEC && sess->cleanup_target_ctx.a == 0x45 &&
+               sess->cleanup_target_ctx.x == 0x56 && sess->cleanup_target_ctx.y == 0x67 &&
+               sess->cleanup_target_ctx.sr == 0x25,
+               "Stop Debugging cleanup target must be the current post-step context")) return 1;
+    if (expect(sess->cleanup_target_ctx.pc != 0xC123,
+               "Stop Debugging must not discard post-step state by restoring entry PC")) return 1;
+    if (expect(backend.reset_calls == 0,
+               "Stop Debugging must never reset the machine")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
 static int test_help_screen_shows_debug_commands()
 {
     TestUserInterface ui;
@@ -1328,58 +2297,67 @@ static int test_help_screen_shows_debug_commands()
 
     const char *lines[20];
     int n = MonitorDebug::format_help_lines(lines, 20);
-    bool has_over = false;
-    bool has_trace = false;
-    bool has_out = false;
-    bool has_go = false;
-    bool has_brk = false;
-    bool has_memory = false;
-    bool has_load_save = false;
-    bool has_bookmarks = false;
-    bool has_rstop = false;
-    bool has_reset = false;
-    bool has_esc = false;
+    static const char *expected_lines[] = {
+        "",
+        "D Step Over  T Step Into  O Step Out",
+        "G Continue   R Breakpt    C=+R Brkpts",
+        "C=+X Reset   RETURN Follow",
+        "",
+        "M Memory     I ASCII      V Screen",
+        "A Assembly   B Binary     U Undoc/Case",
+        "J Jump       P Poll       N Number",
+        "E Edit       F Fill       W Width",
+        "C Compare    H Hunt       Z Freeze",
+        "L Load       S Save",
+        "",
+        "Bookmarks:     C=+B List  C=+0-9 Jump",
+        "Monitor:       C=+O Open/Close",
+        "Leave debug:   C=+D/RSTOP",
+        "Leave edit:    C=+E/RSTOP",
+        "Copy/Paste:    C=+C / C=+V",
+    };
+    if (expect(n == (int)(sizeof(expected_lines) / sizeof(expected_lines[0])),
+               "Debug help line count must match the requested layout")) return 1;
     for (int i = 0; i < n; i++) {
-        if (strstr(lines[i], "Over")) has_over = true;
-        if (strstr(lines[i], "Trace")) has_trace = true;
-        if (strstr(lines[i], "Out")) has_out = true;
-        if (strstr(lines[i], "Go")) has_go = true;
-        if (strstr(lines[i], "Breakpt") || strstr(lines[i], "Brkpts")) has_brk = true;
-        if (strstr(lines[i], "M Memory")) has_memory = true;
-        if (strstr(lines[i], "L Load") && strstr(lines[i], "S Save")) has_load_save = true;
-        if (strstr(lines[i], "C=+B")) has_bookmarks = true;
-        if (strstr(lines[i], "RSTOP")) has_rstop = true;
-        if (strstr(lines[i], "C=+X")) has_reset = true;
-        if (strstr(lines[i], "ESC")) has_esc = true;
+        if (expect(strcmp(lines[i], expected_lines[i]) == 0,
+                   "Debug help text did not match the requested layout")) return 1;
+        if (expect((int)strlen(lines[i]) <= 38,
+                   "Debug help line must fit within 38 columns")) return 1;
+        if (expect(strstr(lines[i], "SH+O") == NULL,
+                   "Debug help must not show SH+O")) return 1;
+        if (expect(strstr(lines[i], "ESC") == NULL,
+                   "Debug help must show RSTOP rather than ESC")) return 1;
     }
-    if (expect(has_over && has_trace && has_out && has_go && has_brk,
-               "Debug help must mention Over, Trace, Out, Go, Breakpoint")) return 1;
-    if (expect(has_memory && has_load_save && has_bookmarks,
-               "Debug help must preserve the normal monitor help entries")) return 1;
-    if (expect(has_rstop && has_reset && !has_esc,
-               "Help must show RSTOP and C=+X rather than ESC")) return 1;
-    if (expect_help_token_accented(screen, "D Debug/Over",
-        "D Debug/Over must use the shared UI accent colour in debug help")) return 1;
-    if (expect_help_token_accented(screen, "G Go",
-        "G Go must use the shared UI accent colour in debug help")) return 1;
-    if (expect_help_token_accented(screen, "T Trace",
-        "T Trace must use the shared UI accent colour in debug help")) return 1;
-    if (expect_help_token_accented(screen, "R Breakpt",
-        "R Breakpt must use the shared UI accent colour in debug help")) return 1;
-    if (expect_help_token_accented(screen, "O Out",
-        "O Out must use the shared UI accent colour in debug help")) return 1;
-    if (expect_help_token_accented(screen, "SH+O Out",
-        "SH+O Out must use the shared UI accent colour in debug help")) return 1;
-    if (expect_help_token_accented(screen, "C=+R Brkpts",
-        "C=+R Brkpts must use the shared UI accent colour in debug help")) return 1;
-    if (expect_help_token_accented(screen, "C=+D Exit",
-        "C=+D Exit must use the shared UI accent colour in debug help")) return 1;
-    if (expect_help_token_accented(screen, "C=+D/RSTOP",
-        "C=+D/RSTOP must use the shared UI accent colour in debug help")) return 1;
-    if (expect_help_token_accented(screen, "C=+X Reset",
-        "C=+X Reset must use the shared UI accent colour in debug help")) return 1;
-    if (expect_help_token_accented(screen, "RETURN",
-        "RETURN must use the shared UI accent colour in debug help")) return 1;
+    char row[40];
+    screen.get_slice(1, 3, 38, row);
+    if (expect(strstr(row, "HELP ASM DEBUG") == row,
+               "Debug help header must identify the ASM debug help screen")) return 1;
+    for (int i = 0; i < n; i++) {
+        screen.get_slice(1, 4 + i, 38, row);
+        if (expect(strncmp(row, expected_lines[i], strlen(expected_lines[i])) == 0,
+                   "Rendered debug help text did not match the requested layout")) return 1;
+    }
+    screen.get_slice(1, 22, 38, row);
+    if (expect(strstr(row, "Page Up/Down:  F1/SH+SPACE / F7/SPACE") == row,
+               "Debug help must show the requested paging footer")) return 1;
+    if (expect_help_token_not_accented(screen, "D Step Over",
+        "D Step Over must not use a distinct debug help colour")) return 1;
+    if (expect_help_token_not_accented(screen, "T Step Into",
+        "T Step Into must not use a distinct debug help colour")) return 1;
+    if (expect_help_token_not_accented(screen, "O Step Out",
+        "O Step Out must not use a distinct debug help colour")) return 1;
+    if (expect_help_token_not_accented(screen, "G Continue",
+        "G Continue must not use a distinct debug help colour")) return 1;
+    if (expect_help_token_not_accented(screen, "R Breakpt",
+        "R Breakpt must not use a distinct debug help colour")) return 1;
+    if (expect_help_token_not_accented(screen, "C=+R Brkpts",
+        "C=+R Brkpts must not use a distinct debug help colour")) return 1;
+    if (expect_help_token_not_accented(screen, "C=+X Reset",
+        "C=+X Reset must not use a distinct debug help colour")) return 1;
+    if (expect_help_token_not_accented(screen, "RETURN Follow",
+        "RETURN Follow must not use a distinct debug help colour")) return 1;
+    if (expect_help_token_not_accented(screen, "C=+D/RSTOP",
+        "C=+D/RSTOP must not use a distinct debug help colour")) return 1;
     if (expect(monitor.poll(0) == 0, "help test: ESC should close help")) return 1;
     if (expect(monitor.poll(0) == 0, "help test: RUN/STOP should leave Debug")) return 1;
     if (expect(monitor.poll(0) == 1, "help test: final RUN/STOP should exit")) return 1;
@@ -1420,6 +2398,1148 @@ static int test_edit_and_debug_compose_in_header()
     return 0;
 }
 
+// --- Freeze-mode render-target regression (temporary-BRK step-over et al.) ---
+//
+// These tests drive the real BrkDebugSession engine through FakeFreezeMachine.
+// The invariant under test: after any debug run that temporarily unfroze the
+// machine, the engine must re-freeze it before returning, so the monitor's
+// render target (the firmware/menu screen) is preserved instead of leaking into
+// the live C64 screen RAM. Before the fix the engine unfroze and never
+// re-froze, so `frozen` would be false here and the C64 screen sentinel would
+// later be overwritten by monitor redraws.
+
+static int test_freeze_step_over_refreezes_and_preserves_screen()
+{
+    FakeFreezeMachine m(true);
+    fake_seed_nop_run(m, 0x2000);
+    m.stamp_screen_sentinel(0x55, 40); // BASIC-like content in $0400
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.over_at(0x2000, pred, &ctx);
+
+    if (expect(r == DebugSession::DBG_OK, "freeze step-over must complete")) return 1;
+    if (expect(m.frozen,
+               "freeze step-over must re-freeze the C64 before returning to the monitor")) return 1;
+    if (expect(m.unfreeze_calls == 1,
+               "freeze step-over must unfreeze exactly once to run the step")) return 1;
+    if (expect(m.refreeze_calls == 1,
+               "freeze step-over must re-freeze exactly once after the step")) return 1;
+    if (expect(m.screen_sentinel_intact(0x55, 40),
+               "freeze step-over must not write monitor UI into C64 screen RAM")) return 1;
+    if (expect(m.screen_render_target_invalidated(),
+               "freeze step-over must set screen_render_target_invalidated so caller can restore chrome")) return 1;
+    return 0;
+}
+
+static int test_freeze_step_over_with_context_refreezes()
+{
+    FakeFreezeMachine m(true);
+    fake_seed_nop_run(m, 0x2000);
+    m.stamp_screen_sentinel(0x41, 40);
+
+    DebugContext from;
+    debug_context_reset(&from);
+    from.valid = true;
+    from.pc = 0x2000;
+    from.sp = 0xFF;
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.over(from, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK, "freeze step-over (with context) must complete")) return 1;
+    if (expect(m.frozen, "freeze step-over (with context) must re-freeze")) return 1;
+    if (expect(m.screen_sentinel_intact(0x41, 40),
+               "freeze step-over (with context) must not touch C64 screen RAM")) return 1;
+    return 0;
+}
+
+static int test_cleanup_to_context_without_entry_context_never_resets()
+{
+    FakeFreezeMachine m(false);
+    fake_seed_nop_run(m, 0x2000);
+    m.ram[0x1234] = 0x5A;
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.over_at(0x2000, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "Step without entry context must still complete")) return 1;
+
+    m.cleanup_to_context(NULL);
+    if (expect(m.reset_calls == 0,
+               "Leaving Debug without an entry context must never reset the machine")) return 1;
+    if (expect(m.ram[0x1234] == 0x5A,
+               "Leaving Debug must preserve unrelated memory changes")) return 1;
+    return 0;
+}
+
+static int test_freeze_step_into_refreezes()
+{
+    FakeFreezeMachine m(true);
+    fake_seed_nop_run(m, 0x2000);
+    m.stamp_screen_sentinel(0x42, 40);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.trace_at(0x2000, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK, "freeze step-into must complete")) return 1;
+    if (expect(m.frozen, "freeze step-into must re-freeze")) return 1;
+    if (expect(m.unfreeze_attempts == 1, "freeze step-into must call the unfreeze hook once")) return 1;
+    if (expect(m.refreeze_calls == 1, "freeze step-into must re-freeze once")) return 1;
+    if (expect(m.screen_sentinel_intact(0x42, 40),
+               "freeze step-into must not touch C64 screen RAM")) return 1;
+    if (expect(m.screen_render_target_invalidated(),
+               "freeze step-into must set render-target invalidation after refreeze")) return 1;
+    return 0;
+}
+
+static int test_freeze_step_out_refreezes()
+{
+    FakeFreezeMachine m(true);
+    m.stamp_screen_sentinel(0x43, 40);
+
+    m.ram[0x2001] = 0x20;
+    m.ram[0x2002] = 0x00;
+    m.ram[0x2003] = 0x30;
+    m.ram[0x2004] = 0xEA;
+    m.ram[0x3000] = 0xEA;
+
+    uint8_t jsr[3] = { 0x20, 0x00, 0x30 };
+    DebugPredictResult pred;
+    debug_predict(0x2001, jsr, false, &pred);
+    fake_seed_captured_context(m, 0x3000, 0xFB, 0, 0, 0, 0x24);
+    DebugContext from;
+    if (expect(m.trace_at(0x2001, pred, &from) == DebugSession::DBG_OK,
+               "freeze trace into JSR must prepare a Step Out target")) return 1;
+    m.unfreeze_attempts = 0;
+    m.unfreeze_calls = 0;
+    m.refreeze_calls = 0;
+    m.ram[FAKE_SENTINEL_ADDR] = 0x00;
+    m.arm_capture_context(0x2004, 0xFD, 0, 0, 0, 0x24);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.step_out(from, &ctx);
+    if (expect(r == DebugSession::DBG_OK, "freeze step-out must complete")) return 1;
+    if (expect(m.frozen, "freeze step-out must re-freeze")) return 1;
+    if (expect(m.unfreeze_attempts == 1, "freeze step-out must call the unfreeze hook once")) return 1;
+    if (expect(m.refreeze_calls == 1, "freeze step-out must re-freeze once")) return 1;
+    if (expect(m.screen_sentinel_intact(0x43, 40),
+               "freeze step-out must not touch C64 screen RAM")) return 1;
+    if (expect(m.screen_render_target_invalidated(),
+               "freeze step-out must set render-target invalidation after refreeze")) return 1;
+    return 0;
+}
+
+static int test_step_out_uses_traced_jsr_target_even_when_target_is_above_pc()
+{
+    FakeVisibleRomMachine m(false);
+    m.allow_visible_rom_patching = true;
+
+    m.kernal_rom[0x0021] = 0x20;
+    m.kernal_rom[0x0022] = 0x00;
+    m.kernal_rom[0x0023] = 0xE2;
+    m.kernal_rom[0x0024] = 0xEA;
+    m.kernal_rom[0x0200] = 0xEA;
+
+    // Older stack data that must not be selected; Step Out is driven by the
+    // return target recorded by the actual Trace-Into operation.
+    m.ram[0x01FA] = 0x03;
+    m.ram[0x01FB] = 0xC1;
+    m.ram[0xC101] = 0x20;
+    m.ram[0xC102] = 0x00;
+    m.ram[0xC103] = 0xC0;
+    m.ram[0xC104] = 0xEA;
+
+    uint8_t jsr[3] = { 0x20, 0x00, 0xE2 };
+    DebugPredictResult pred;
+    debug_predict(0xE021, jsr, false, &pred);
+    fake_seed_captured_context(m, 0xE200, 0xF7, 0, 0, 0, 0x24);
+    DebugContext from;
+    if (expect(m.trace_at(0xE021, pred, &from) == DebugSession::DBG_OK,
+               "KERNAL trace must prepare the Step Out return target")) return 1;
+    from.pc = 0xE100;
+    m.ram[FAKE_SENTINEL_ADDR] = 0x00;
+    m.arm_capture_context(0xE024, 0xF9, 0, 0, 0, 0x24);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.step_out(from, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "KERNAL Step Out must accept the traced JSR return target")) return 1;
+    if (expect(m.last_rom_patch_addr == 0xE024,
+               "KERNAL Step Out must patch the nearest KERNAL return target")) return 1;
+    if (expect(m.last_brk_patch_addr != 0xC104,
+               "KERNAL Step Out must not fall back to an older RAM caller")) return 1;
+    return 0;
+}
+
+static int test_step_out_ignores_nearby_rts_and_patches_after_traced_jsr()
+{
+    FakeFreezeMachine m(false);
+
+    // Active trace: $C6A0 JSR $C6E0 records return address $C6A3, so
+    // Step Out must install its temporary BRK at $C6A3. The current PC is
+    // deliberately below the JSR target to catch the old target<=PC heuristic.
+    m.ram[0xC6A0] = 0x20;
+    m.ram[0xC6A1] = 0xE0;
+    m.ram[0xC6A2] = 0xC6;
+    m.ram[0xC6A3] = 0xEA;
+    m.ram[0xC6E0] = 0xEA;
+
+    // Decoy RTS opcodes near both the JSR entry and current helper body. A
+    // nearby-RTS implementation would patch one of these instead of $C6A3.
+    m.ram[0xC6D2] = 0x60;
+    m.ram[0xC6D5] = 0x60;
+    m.ram[0xC6E1] = 0x60;
+
+    uint8_t jsr[3] = { 0x20, 0xE0, 0xC6 };
+    DebugPredictResult pred;
+    debug_predict(0xC6A0, jsr, false, &pred);
+    fake_seed_captured_context(m, 0xC6E0, 0xFD, 0, 0, 0, 0x24);
+    DebugContext from;
+    if (expect(m.trace_at(0xC6A0, pred, &from) == DebugSession::DBG_OK,
+               "RAM trace must prepare the Step Out return target")) return 1;
+    from.pc = 0xC6D0;
+    m.ram[FAKE_SENTINEL_ADDR] = 0x00;
+    m.arm_capture_context(0xC6A3, 0xFF, 0, 0, 0, 0x24);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.step_out(from, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "Step Out must use the active JSR stack frame")) return 1;
+    if (expect(m.last_brk_patch_addr == 0xC6A3,
+               "Step Out must patch the opcode immediately after the active JSR")) return 1;
+    if (expect(m.last_brk_patch_addr != 0xC6D2 &&
+               m.last_brk_patch_addr != 0xC6D5 &&
+               m.last_brk_patch_addr != 0xC6E1,
+               "Step Out must not patch nearby RTS opcodes")) return 1;
+    return 0;
+}
+
+static int test_step_out_refuses_stale_far_stack_frame()
+{
+    FakeFreezeMachine m(false);
+
+    DebugContext from;
+    debug_context_reset(&from);
+    from.valid = true;
+    from.pc = 0x2003;
+    from.sp = 0xF7;
+
+    // Stale interpreter frame left on the C64 stack while the user is debugging
+    // an arbitrary loop at $2000. It is a real JSR-looking frame, but it cannot
+    // be the active caller of the current program counter.
+    m.ram[0x01F8] = 0x03;
+    m.ram[0x01F9] = 0xC1;
+    m.ram[0xC101] = 0x20;
+    m.ram[0xC102] = 0x00;
+    m.ram[0xC103] = 0xC0;
+    m.ram[0xC104] = 0xEA;
+
+    DebugContext ctx;
+    DebugSession::Result r = m.step_out(from, &ctx);
+    if (expect(r == DebugSession::DBG_NOT_IN_SUBROUTINE,
+               "Step Out must report that no traced subroutine is active")) return 1;
+    if (expect(m.brk_patch_writes == 0,
+               "Refused Step Out must not install a temporary BRK")) return 1;
+    if (expect(m.ram[FAKE_SENTINEL_ADDR] == 0x00,
+               "Refused Step Out must not start execution")) return 1;
+    return 0;
+}
+
+static int test_traced_kernal_to_basic_step_out_patches_kernal_return()
+{
+    FakeVisibleRomMachine m(false);
+    m.allow_visible_rom_patching = true;
+
+    m.kernal_rom[0x000B] = 0x20;
+    m.kernal_rom[0x000C] = 0xD4;
+    m.kernal_rom[0x000D] = 0xBA;
+    m.kernal_rom[0x000E] = 0x20;
+    m.basic_rom[0x1AD4] = 0xEA;
+
+    uint8_t jsr[3] = { 0x20, 0xD4, 0xBA };
+    DebugPredictResult pred;
+    debug_predict(0xE00B, jsr, false, &pred);
+
+    fake_seed_captured_context(m, 0xBAD4, 0xF8, 0x00, 0xFF, 0xCF, 0x37);
+    DebugContext traced;
+    DebugSession::Result r = m.trace_at(0xE00B, pred, &traced);
+    if (expect(r == DebugSession::DBG_OK,
+               "Trace Into KERNAL JSR $BAD4 must complete")) return 1;
+    if (expect(traced.pc == 0xBAD4,
+               "Trace Into must capture the BASIC target PC")) return 1;
+
+    fake_seed_captured_context(m, 0xE00E, 0xFA, 0x00, 0xFF, 0xCF, 0x37);
+    m.arm_capture_context(0xE00E, 0xFA, 0x00, 0xFF, 0xCF, 0x37);
+    DebugContext out;
+    r = m.step_out(traced, &out);
+    if (expect(r == DebugSession::DBG_OK,
+               "Step Out from traced BASIC helper must complete")) return 1;
+    if (expect(m.last_rom_patch_addr == 0xE00E,
+               "Step Out must patch the KERNAL return target")) return 1;
+    if (expect(m.kernal_rom[0x000E] == 0x20,
+               "Step Out must restore the KERNAL return byte")) return 1;
+    return 0;
+}
+
+static int test_freeze_go_breakpoint_refreezes()
+{
+    FakeFreezeMachine m(true);
+    fake_seed_nop_run(m, 0x2000);
+    m.ram[0x2005] = 0xEA; // breakpoint target byte (non-zero)
+    m.stamp_screen_sentinel(0x44, 40);
+
+    MonitorBreakpoints bps;
+    bps.allocate(0x2005, 0x07);
+
+    DebugContext from;
+    debug_context_reset(&from);
+    from.valid = true;
+    from.pc = 0x2000;
+    from.sp = 0xFF;
+
+    DebugSession::Result r = m.go(from, &bps, 0x2000);
+    if (expect(r == DebugSession::DBG_OK, "freeze Go-to-breakpoint must complete")) return 1;
+    if (expect(m.frozen,
+               "freeze Go/continue to breakpoint must re-freeze before returning")) return 1;
+    if (expect(m.unfreeze_attempts == 1, "freeze Go must call the unfreeze hook once")) return 1;
+    if (expect(m.refreeze_calls == 1, "freeze Go must re-freeze once")) return 1;
+    if (expect(m.screen_sentinel_intact(0x44, 40),
+               "freeze Go must not touch C64 screen RAM")) return 1;
+    if (expect(m.screen_render_target_invalidated(),
+               "freeze Go must set render-target invalidation after refreeze")) return 1;
+    return 0;
+}
+
+static int test_visible_basic_step_uses_rom_patch_support()
+{
+    FakeVisibleRomMachine m(false);
+    fake_seed_rom_nop_run(m, 0xA000);
+    m.allow_visible_rom_patching = true;
+    m.ram[0xA001] = 0x5A;
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0xA000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.over_at(0xA000, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "Visible BASIC step must succeed when ROM patching is supported")) return 1;
+    if (expect(m.basic_rom[1] == 0xEA,
+               "Visible BASIC patch byte must be restored after the step")) return 1;
+    if (expect(m.ram[0xA001] == 0x5A,
+               "Visible BASIC patching must not scribble into underlying RAM")) return 1;
+    if (expect(m.rom_patch_writes == 2,
+               "Visible BASIC step must patch and restore the ROM image exactly once")) return 1;
+    return 0;
+}
+
+static int test_visible_rom_step_bytes_use_cpu_visible_mapping()
+{
+    FakeVisibleRomMachine m(false);
+    uint8_t bytes[3] = { 0, 0, 0 };
+
+    m.allow_visible_rom_patching = false;
+    m.cpu_port = 0x07;
+    m.kernal_rom[0] = 0x85;
+    m.kernal_rom[1] = 0x56;
+    m.kernal_rom[2] = 0xEA;
+    m.ram[0xE000] = 0x00;
+    m.ram[0xE001] = 0x00;
+    m.ram[0xE002] = 0x00;
+
+    if (expect(m.read_step_bytes(0xE000, bytes, 3),
+               "Visible KERNAL read_step_bytes must succeed")) return 1;
+    if (expect(bytes[0] == 0x85 && bytes[1] == 0x56 && bytes[2] == 0xEA,
+               "Visible KERNAL read_step_bytes must use ROM bytes, not RAM under ROM")) return 1;
+
+    DebugPredictResult pred;
+    debug_predict(0xE000, bytes, false, &pred);
+    if (expect(pred.kind != DBG_PREDICT_BRK && pred.kind != DBG_PREDICT_UNSAFE,
+               "Visible KERNAL ROM bytes must not be classified from RAM-under-ROM BRK")) return 1;
+
+    m.cpu_port = 0x05;
+    if (expect(m.read_step_bytes(0xE000, bytes, 3),
+               "Hidden KERNAL read_step_bytes must also succeed")) return 1;
+    if (expect(bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0x00,
+               "Hidden KERNAL read_step_bytes must fall back to RAM under ROM")) return 1;
+
+    m.cpu_port = 0x07;
+    m.basic_rom[0] = 0x18;
+    m.basic_rom[1] = 0xEA;
+    m.basic_rom[2] = 0xEA;
+    m.ram[0xA000] = 0x00;
+    m.ram[0xA001] = 0x00;
+    m.ram[0xA002] = 0x00;
+    if (expect(m.read_step_bytes(0xA000, bytes, 3),
+               "Visible BASIC read_step_bytes must succeed")) return 1;
+    if (expect(bytes[0] == 0x18 && bytes[1] == 0xEA && bytes[2] == 0xEA,
+               "Visible BASIC read_step_bytes must use ROM bytes, not RAM under ROM")) return 1;
+
+    return 0;
+}
+
+static int test_u64_debug_cpu_port_uses_monitor_bank()
+{
+    FakeCpuPortBackend backend;
+
+    backend.set_monitor_cpu_port(0x07);
+    backend.live_cpu_port = 0x05;
+    if (expect(u64_debug_step_cpu_port(&backend) == 0x07,
+               "U64 Debug stepping must use the monitor-selected CPU bank")) return 1;
+    if (expect(backend.live_reads == 0,
+               "U64 Debug stepping must not sample the live CPU port for cursor stepping")) return 1;
+
+    backend.set_monitor_cpu_port(0x05);
+    backend.live_cpu_port = 0x07;
+    if (expect(u64_debug_step_cpu_port(&backend) == 0x05,
+               "U64 Debug stepping must follow monitor bank changes")) return 1;
+    if (expect(backend.live_reads == 0,
+               "U64 Debug stepping must not sample live bank changes")) return 1;
+    if (expect(u64_debug_step_cpu_port(0) == 0x07,
+               "U64 Debug stepping must default to all ROMs visible without a backend")) return 1;
+
+    return 0;
+}
+
+static int test_visible_kernal_step_into_uses_rom_patch_support()
+{
+    FakeVisibleRomMachine m(false);
+    fake_seed_rom_nop_run(m, 0xE000);
+    m.allow_visible_rom_patching = true;
+    m.ram[0xE001] = 0x6C;
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0xE000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.trace_at(0xE000, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "Visible KERNAL Step Into must succeed when ROM patching is supported")) return 1;
+    if (expect(m.kernal_rom[1] == 0xEA,
+               "Visible KERNAL Step Into patch byte must be restored")) return 1;
+    if (expect(m.ram[0xE001] == 0x6C,
+               "Visible KERNAL Step Into must not patch RAM under ROM")) return 1;
+    if (expect(m.rom_patch_writes == 2,
+               "Visible KERNAL Step Into must patch and restore the ROM image")) return 1;
+    return 0;
+}
+
+static int test_visible_kernal_step_over_jsr_patches_fallthrough_rom()
+{
+    FakeVisibleRomMachine m(false);
+    m.allow_visible_rom_patching = true;
+    m.kernal_rom[0] = 0x20;
+    m.kernal_rom[1] = 0x0F;
+    m.kernal_rom[2] = 0xBC;
+    m.kernal_rom[3] = 0xEA;
+    m.ram[0xE003] = 0x7B;
+
+    uint8_t bytes[3] = { 0x20, 0x0F, 0xBC };
+    DebugPredictResult pred;
+    debug_predict(0xE000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.over_at(0xE000, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "Visible KERNAL Step Over JSR must patch the ROM fall-through target")) return 1;
+    if (expect(m.kernal_rom[3] == 0xEA,
+               "Visible KERNAL Step Over JSR must restore fall-through ROM byte")) return 1;
+    if (expect(m.ram[0xE003] == 0x7B,
+               "Visible KERNAL Step Over JSR must not patch RAM under ROM")) return 1;
+    if (expect(m.rom_patch_writes == 2,
+               "Visible KERNAL Step Over JSR must patch and restore ROM exactly once")) return 1;
+    return 0;
+}
+
+static int test_visible_kernal_step_without_rom_patch_support_refuses_cleanly()
+{
+    FakeVisibleRomMachine m(false);
+    fake_seed_rom_nop_run(m, 0xE000);
+    m.allow_visible_rom_patching = false;
+    m.ram[0xE001] = 0x6C;
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0xE000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.over_at(0xE000, pred, &ctx);
+    if (expect(r == DebugSession::DBG_NOT_SUPPORTED,
+               "Visible KERNAL step must report not-supported when ROM patching is unavailable")) return 1;
+    if (expect(m.kernal_rom[1] == 0xEA,
+               "Visible KERNAL step must leave the ROM byte untouched on refusal")) return 1;
+    if (expect(m.ram[0xE001] == 0x6C,
+               "Visible KERNAL refusal must not write into underlying RAM")) return 1;
+    if (expect(m.rom_patch_writes == 0,
+               "Visible KERNAL refusal must not attempt ROM patch writes")) return 1;
+    return 0;
+}
+
+static int test_visible_rom_breakpoint_go_uses_same_capability_gate()
+{
+    FakeVisibleRomMachine m(false);
+    fake_seed_rom_nop_run(m, 0xE000);
+    m.allow_visible_rom_patching = false;
+    m.ram[0xE001] = 0x6C;
+
+    MonitorBreakpoints bps;
+    bps.allocate(0xE001, 0x07);
+    DebugContext from;
+    debug_context_reset(&from);
+
+    DebugSession::Result r = m.go(from, &bps, 0xC000);
+    if (expect(r == DebugSession::DBG_NOT_SUPPORTED,
+               "Visible ROM breakpoint Go must refuse before execution when ROM patching is unavailable")) return 1;
+    if (expect(m.kernal_rom[1] == 0xEA,
+               "Unsupported visible ROM breakpoint must leave ROM untouched")) return 1;
+    if (expect(m.ram[0xE001] == 0x6C,
+               "Unsupported visible ROM breakpoint must not patch RAM under ROM")) return 1;
+    if (expect(m.rom_patch_writes == 0,
+               "Unsupported visible ROM breakpoint must not attempt ROM writes")) return 1;
+    if (expect(m.ram[FAKE_SENTINEL_ADDR] == 0x00,
+               "Unsupported visible ROM breakpoint must refuse before starting execution")) return 1;
+    return 0;
+}
+
+static int test_visible_rom_breakpoint_go_patches_rom_not_underlying_ram()
+{
+    FakeVisibleRomMachine m(false);
+    fake_seed_rom_nop_run(m, 0xE000);
+    m.allow_visible_rom_patching = true;
+    m.ram[0xE001] = 0x6C;
+
+    MonitorBreakpoints bps;
+    bps.allocate(0xE001, 0x07);
+    DebugContext from;
+    debug_context_reset(&from);
+
+    DebugSession::Result r = m.go(from, &bps, 0xC000);
+    if (expect(r == DebugSession::DBG_OK,
+               "Visible ROM breakpoint Go must run when ROM patching is supported")) return 1;
+    if (expect(m.kernal_rom[1] == 0xEA,
+               "Visible ROM breakpoint Go must restore the ROM byte")) return 1;
+    if (expect(m.ram[0xE001] == 0x6C,
+               "Visible ROM breakpoint Go must not use RAM under ROM as proof")) return 1;
+    if (expect(m.rom_patch_writes == 2,
+               "Visible ROM breakpoint Go must patch and restore the ROM image")) return 1;
+    return 0;
+}
+
+static int test_overlay_step_over_never_freezes()
+{
+    // Overlay-mode non-regression: the machine is never frozen, so the engine
+    // must neither unfreeze nor re-freeze, and must still complete the step.
+    FakeFreezeMachine m(false);
+    fake_seed_nop_run(m, 0x2000);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.over_at(0x2000, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK, "overlay step-over must complete")) return 1;
+    if (expect(!m.frozen, "overlay step-over must leave the machine unfrozen")) return 1;
+    if (expect(m.unfreeze_attempts == 0, "overlay step-over must not call the unfreeze hook")) return 1;
+    if (expect(m.unfreeze_calls == 0, "overlay step-over must not unfreeze")) return 1;
+    if (expect(m.refreeze_calls == 0, "overlay step-over must not re-freeze")) return 1;
+    if (expect(!m.screen_render_target_invalidated(),
+               "overlay step-over must not set screen_render_target_invalidated")) return 1;
+    return 0;
+}
+
+static int test_overlay_accessible_unfrozen_step_over_does_not_unfreeze()
+{
+    // Hardware overlay access is not the same as freeze ownership. Even if a
+    // backend reports that an unfreeze operation would be "accessible", the
+    // run-window must not invoke it unless machine_is_frozen() was true.
+    FakeFreezeMachine m(false);
+    m.accessible_when_unfrozen = true;
+    m.break_on_unfrozen_unfreeze_attempt = true;
+    fake_seed_nop_run(m, 0x2000);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.over_at(0x2000, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "overlay step-over must complete even if the unfreeze hook would be accessible")) return 1;
+    if (expect(m.unfreeze_attempts == 0,
+               "overlay run-window must not call unfreeze_if_accessible when not frozen")) return 1;
+    if (expect(m.unfreeze_calls == 0 && m.refreeze_calls == 0,
+               "overlay accessible/unfrozen step must not change freeze state")) return 1;
+    if (expect(!m.screen_render_target_invalidated(),
+               "overlay accessible/unfrozen step must not invalidate the render target")) return 1;
+    return 0;
+}
+
+static int test_overlay_render_target_disables_stale_frozen_unfreeze()
+{
+    // The overlay UI is not the C64 freezer render target. If C64 accessibility
+    // state is stale/true for any reason, the overlay run-window policy must
+    // still prevent freeze ownership calls.
+    FakeFreezeMachine m(true);
+    m.set_run_window_refreeze_enabled(false);
+    fake_seed_nop_run(m, 0x2000);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.over_at(0x2000, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "overlay render-target policy must still allow the BRK run")) return 1;
+    if (expect(m.frozen,
+               "overlay render-target policy must not change stale frozen state")) return 1;
+    if (expect(m.unfreeze_attempts == 0,
+               "overlay render-target policy must not call unfreeze even if machine_is_frozen is true")) return 1;
+    if (expect(m.unfreeze_calls == 0 && m.refreeze_calls == 0,
+               "overlay render-target policy must not touch freeze state")) return 1;
+    if (expect(!m.screen_render_target_invalidated(),
+               "overlay render-target policy must not invalidate the screen")) return 1;
+    return 0;
+}
+
+static int test_overlay_step_into_never_freezes()
+{
+    FakeFreezeMachine m(false);
+    fake_seed_nop_run(m, 0x2000);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext c1;
+    if (expect(m.trace_at(0x2000, pred, &c1) == DebugSession::DBG_OK,
+               "overlay step-into must complete")) return 1;
+    DebugContext c2;
+    if (expect(m.trace_at(0x2000, pred, &c2) == DebugSession::DBG_OK,
+               "overlay repeated step-into must complete")) return 1;
+    if (expect(m.unfreeze_attempts == 0, "overlay step-into must not call the unfreeze hook")) return 1;
+    if (expect(m.unfreeze_calls == 0 && m.refreeze_calls == 0,
+               "overlay step-into must never touch freeze state")) return 1;
+    if (expect(!m.screen_render_target_invalidated(),
+               "overlay step-into must not invalidate the render target")) return 1;
+    return 0;
+}
+
+static int test_overlay_step_out_never_freezes()
+{
+    FakeFreezeMachine m(false);
+
+    m.ram[0x2001] = 0x20;
+    m.ram[0x2002] = 0x00;
+    m.ram[0x2003] = 0x30;
+    m.ram[0x2004] = 0xEA;
+    m.ram[0x3000] = 0xEA;
+
+    uint8_t jsr[3] = { 0x20, 0x00, 0x30 };
+    DebugPredictResult pred;
+    debug_predict(0x2001, jsr, false, &pred);
+    fake_seed_captured_context(m, 0x3000, 0xFB, 0, 0, 0, 0x24);
+    DebugContext from;
+    if (expect(m.trace_at(0x2001, pred, &from) == DebugSession::DBG_OK,
+               "overlay trace into JSR must prepare a Step Out target")) return 1;
+    m.unfreeze_attempts = 0;
+    m.unfreeze_calls = 0;
+    m.refreeze_calls = 0;
+    m.ram[FAKE_SENTINEL_ADDR] = 0x00;
+    m.arm_capture_context(0x2004, 0xFD, 0, 0, 0, 0x24);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.step_out(from, &ctx);
+    if (expect(r == DebugSession::DBG_OK, "overlay step-out must complete for a valid JSR frame")) return 1;
+    if (expect(m.unfreeze_attempts == 0, "overlay step-out must not call the unfreeze hook")) return 1;
+    if (expect(m.unfreeze_calls == 0 && m.refreeze_calls == 0,
+               "overlay step-out must never touch freeze state")) return 1;
+    if (expect(!m.screen_render_target_invalidated(),
+               "overlay step-out must not invalidate the render target")) return 1;
+    return 0;
+}
+
+static int test_overlay_go_breakpoint_never_freezes()
+{
+    FakeFreezeMachine m(false);
+    fake_seed_nop_run(m, 0x2000);
+
+    MonitorBreakpoints bps;
+    bps.allocate(0x2001, 0x07);
+
+    DebugContext from;
+    debug_context_reset(&from);
+
+    DebugSession::Result r = m.go(from, &bps, 0x2000);
+    if (expect(r == DebugSession::DBG_OK, "overlay Go-to-breakpoint must complete")) return 1;
+    if (expect(m.unfreeze_attempts == 0, "overlay Go must not call the unfreeze hook")) return 1;
+    if (expect(m.unfreeze_calls == 0 && m.refreeze_calls == 0,
+               "overlay Go must never touch freeze state")) return 1;
+    if (expect(!m.screen_render_target_invalidated(),
+               "overlay Go must not invalidate the render target")) return 1;
+    return 0;
+}
+
+// Two consecutive overlay steps must each complete and must never touch the
+// freeze bracketing. A leaked run-window depth or a stale run_window_unfroze
+// from step 1 would change step 2's behaviour (or, in freeze mode, skip the
+// unfreeze); proving both steps run with zero unfreeze/refreeze and a clean
+// invalidated flag is the strongest overlay non-regression we can model.
+static int test_overlay_two_consecutive_steps_never_freeze()
+{
+    FakeFreezeMachine m(false);
+    fake_seed_nop_run(m, 0x2000);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext c1;
+    if (expect(m.over_at(0x2000, pred, &c1) == DebugSession::DBG_OK,
+               "overlay step 1 must complete")) return 1;
+    DebugContext c2;
+    if (expect(m.over_at(0x2000, pred, &c2) == DebugSession::DBG_OK,
+               "overlay step 2 must complete (run-window depth recovered)")) return 1;
+    if (expect(!m.frozen, "overlay steps must leave the machine unfrozen")) return 1;
+    if (expect(m.unfreeze_attempts == 0, "overlay steps must never call the unfreeze hook")) return 1;
+    if (expect(m.unfreeze_calls == 0, "overlay steps must never unfreeze")) return 1;
+    if (expect(m.refreeze_calls == 0, "overlay steps must never re-freeze")) return 1;
+    if (expect(!m.screen_render_target_invalidated(),
+               "overlay steps must not invalidate the render target")) return 1;
+    return 0;
+}
+
+static int test_overlay_cursor_step_from_parked_spin_uses_release_path()
+{
+    FakeFreezeMachine m(false);
+    m.nmi_from_spin_times_out = true;
+    m.ram[0x2000] = 0xEE; // INC $D020
+    m.ram[0x2001] = 0x20;
+    m.ram[0x2002] = 0xD0;
+    m.ram[0x2003] = 0x4C; // JMP $2000
+    m.ram[0x2004] = 0x00;
+    m.ram[0x2005] = 0x20;
+
+    uint8_t inc_bytes[3] = { 0xEE, 0x20, 0xD0 };
+    DebugPredictResult inc_pred;
+    debug_predict(0x2000, inc_bytes, false, &inc_pred);
+    m.arm_capture_context(0x2003, 0xF7, 0, 0, 0, 0x24);
+    DebugContext c1;
+    if (expect(m.over_at(0x2000, inc_pred, &c1) == DebugSession::DBG_OK,
+               "overlay INC step must park at JMP")) return 1;
+    if (expect(c1.valid && c1.pc == 0x2003,
+               "overlay INC step must capture $2003")) return 1;
+
+    uint8_t jmp_bytes[3] = { 0x4C, 0x00, 0x20 };
+    DebugPredictResult jmp_pred;
+    debug_predict(0x2003, jmp_bytes, false, &jmp_pred);
+    m.arm_capture_context(0x2000, 0xF7, 0, 0, 0, 0x24);
+    DebugContext c2;
+    if (expect(m.over_at(0x2003, jmp_pred, &c2) == DebugSession::DBG_OK,
+               "cursor-driven overlay step from parked spin must not NMI-timeout")) return 1;
+    if (expect(c2.valid && c2.pc == 0x2000,
+               "overlay JMP step must capture $2000")) return 1;
+    if (expect(!m.frozen, "overlay loop steps must leave the machine unfrozen")) return 1;
+    if (expect(m.unfreeze_calls == 0 && m.refreeze_calls == 0,
+               "overlay loop steps must never touch freeze state")) return 1;
+    return 0;
+}
+
+// Two consecutive freeze steps must each unfreeze-then-refreeze exactly once.
+// If step 1 leaked the run-window depth, step 2's outermost begin_run_window
+// would not fire (depth != 0) and the second unfreeze/refreeze would be lost,
+// dropping the counts below two. This pins the balance across steps.
+static int test_freeze_two_consecutive_steps_rebalance()
+{
+    FakeFreezeMachine m(true);
+    fake_seed_nop_run(m, 0x2000);
+    m.stamp_screen_sentinel(0x55, 40);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext c1;
+    if (expect(m.over_at(0x2000, pred, &c1) == DebugSession::DBG_OK,
+               "freeze step 1 must complete")) return 1;
+    if (expect(m.frozen, "freeze step 1 must leave the machine re-frozen")) return 1;
+    DebugContext c2;
+    if (expect(m.over_at(0x2000, pred, &c2) == DebugSession::DBG_OK,
+               "freeze step 2 must complete")) return 1;
+    if (expect(m.frozen, "freeze step 2 must leave the machine re-frozen")) return 1;
+    if (expect(m.unfreeze_calls == 2, "two freeze steps must unfreeze twice")) return 1;
+    if (expect(m.refreeze_calls == 2, "two freeze steps must re-freeze twice")) return 1;
+    if (expect(m.screen_sentinel_intact(0x55, 40),
+               "freeze steps must never write into C64 screen RAM")) return 1;
+    return 0;
+}
+
+// A timed-out overlay step must release control (DBG_TIMEOUT, not a hang) and
+// leave the run-window depth at zero so a later step still works. It must also
+// never freeze the machine on the failure path.
+static int test_overlay_step_timeout_then_recovers()
+{
+    FakeFreezeMachine m(false);
+    fake_seed_nop_run(m, 0x2000);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    m.sentinel_armed = false; // force the wait loop to its timeout
+    DebugContext c1;
+    if (expect(m.over_at(0x2000, pred, &c1) == DebugSession::DBG_TIMEOUT,
+               "overlay step must return DBG_TIMEOUT, never hang")) return 1;
+    if (expect(!m.frozen, "overlay timeout must not freeze the machine")) return 1;
+    if (expect(m.unfreeze_attempts == 0, "overlay timeout must not call the unfreeze hook")) return 1;
+    if (expect(m.refreeze_calls == 0, "overlay timeout must not re-freeze")) return 1;
+    if (expect(!m.screen_render_target_invalidated(),
+               "overlay timeout must not invalidate the render target")) return 1;
+
+    m.sentinel_armed = true; // engine recovers; depth must be back at zero
+    DebugContext c2;
+    if (expect(m.over_at(0x2000, pred, &c2) == DebugSession::DBG_OK,
+               "overlay step after timeout must complete (depth recovered)")) return 1;
+    if (expect(m.unfreeze_calls == 0 && m.refreeze_calls == 0,
+               "overlay timeout+recovery must never touch freeze state")) return 1;
+    if (expect(!m.screen_render_target_invalidated(),
+               "overlay timeout+recovery must leave render-target invalidation clear")) return 1;
+    return 0;
+}
+
+// A timed-out freeze step must still re-freeze on the failure path (so the
+// monitor render target is preserved) and recover its run-window depth so the
+// next step unfreezes/refreezes again.
+static int test_freeze_step_timeout_refreezes_and_recovers()
+{
+    FakeFreezeMachine m(true);
+    fake_seed_nop_run(m, 0x2000);
+    m.stamp_screen_sentinel(0x66, 40);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    m.sentinel_armed = false; // force timeout
+    DebugContext c1;
+    if (expect(m.over_at(0x2000, pred, &c1) == DebugSession::DBG_TIMEOUT,
+               "freeze step must return DBG_TIMEOUT, never hang")) return 1;
+    if (expect(m.frozen,
+               "freeze timeout must re-freeze before returning to the monitor")) return 1;
+    if (expect(m.unfreeze_attempts == 1 && m.unfreeze_calls == 1 && m.refreeze_calls == 1,
+               "freeze timeout must balance its unfreeze with a re-freeze")) return 1;
+    if (expect(m.screen_render_target_invalidated(),
+               "freeze timeout must invalidate the render target after refreeze")) return 1;
+
+    m.sentinel_armed = true;
+    DebugContext c2;
+    if (expect(m.over_at(0x2000, pred, &c2) == DebugSession::DBG_OK,
+               "freeze step after timeout must complete (depth recovered)")) return 1;
+    if (expect(m.frozen, "freeze step after timeout must re-freeze")) return 1;
+    if (expect(m.unfreeze_calls == 2 && m.refreeze_calls == 2,
+               "freeze timeout+recovery must rebalance to two unfreeze/refreeze")) return 1;
+    if (expect(m.screen_sentinel_intact(0x66, 40),
+               "freeze timeout must never write into C64 screen RAM")) return 1;
+    return 0;
+}
+
+static int test_cleanup_resume_trampoline_restores_full_context()
+{
+    FakeFreezeMachine m(false);
+    fake_seed_nop_run(m, 0x2000);
+    fake_seed_captured_context(m, 0x2001, 0xF9, 0x42, 0x17, 0x99, 0xA4);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext next;
+    if (expect(m.over_at(0x2000, pred, &next) == DebugSession::DBG_OK,
+               "Setup step must succeed before cleanup")) return 1;
+
+    m.cleanup();
+
+    if (expect(m.ram[FAKE_SPIN_LO] == (uint8_t)(FAKE_RESUME_TRAMP & 0xFF) &&
+               m.ram[FAKE_SPIN_HI] == (uint8_t)(FAKE_RESUME_TRAMP >> 8),
+               "Cleanup must retarget the parked CPU to the resume trampoline")) return 1;
+    if (expect(m.ram[FAKE_RESUME_TRAMP + 0] == 0xA2 &&
+               m.ram[FAKE_RESUME_TRAMP + 1] == 0xF9 &&
+               m.ram[FAKE_RESUME_TRAMP + 2] == 0x9A,
+               "Cleanup trampoline must restore SP before returning")) return 1;
+    if (expect(m.ram[FAKE_RESUME_TRAMP + 3] == 0xA9 &&
+               m.ram[FAKE_RESUME_TRAMP + 4] == 0x20 &&
+               m.ram[FAKE_RESUME_TRAMP + 6] == 0xA9 &&
+               m.ram[FAKE_RESUME_TRAMP + 7] == 0x01 &&
+               m.ram[FAKE_RESUME_TRAMP + 9] == 0xA9 &&
+               m.ram[FAKE_RESUME_TRAMP + 10] == 0xA4,
+               "Cleanup trampoline must push PCH, PCL, then SR for RTI")) return 1;
+    if (expect(m.ram[FAKE_RESUME_TRAMP + 6] == 0xA9 &&
+               m.ram[FAKE_RESUME_TRAMP + 7] == 0x01,
+               "Cleanup trampoline must include the captured PC low byte")) return 1;
+    if (expect(m.ram[FAKE_RESUME_TRAMP + 12] == 0xA0 &&
+               m.ram[FAKE_RESUME_TRAMP + 13] == 0x99 &&
+               m.ram[FAKE_RESUME_TRAMP + 14] == 0xA2 &&
+               m.ram[FAKE_RESUME_TRAMP + 15] == 0x17 &&
+               m.ram[FAKE_RESUME_TRAMP + 16] == 0xA9 &&
+               m.ram[FAKE_RESUME_TRAMP + 17] == 0x42 &&
+               m.ram[FAKE_RESUME_TRAMP + 18] == 0x40,
+               "Cleanup trampoline must restore Y, X, A and finish with RTI")) return 1;
+    return 0;
+}
+
+static int test_freeze_cleanup_after_step_allows_later_step()
+{
+    FakeFreezeMachine m(true);
+    fake_seed_nop_run(m, 0x2100);
+    fake_seed_captured_context(m, 0x2101, 0xF3, 0x33, 0x44, 0x55, 0x66);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2100, bytes, false, &pred);
+
+    DebugContext next;
+    if (expect(m.over_at(0x2100, pred, &next) == DebugSession::DBG_OK,
+               "Initial frozen step must succeed")) return 1;
+
+    m.cleanup();
+
+    if (expect(m.unfreeze_calls == 1 && m.refreeze_calls == 1,
+               "Cleanup must preserve the balanced freeze run-window counts")) return 1;
+    if (expect(m.ram[FAKE_SPIN_LO] == (uint8_t)(FAKE_RESUME_TRAMP & 0xFF) &&
+               m.ram[FAKE_SPIN_HI] == (uint8_t)(FAKE_RESUME_TRAMP >> 8),
+               "Frozen cleanup must stage a future resume path instead of leaving the spin loop stale")) return 1;
+
+    fake_seed_nop_run(m, 0x2200);
+    fake_seed_captured_context(m, 0x2201, 0xF2, 0x11, 0x22, 0x33, 0x44);
+    debug_predict(0x2200, bytes, false, &pred);
+    if (expect(m.over_at(0x2200, pred, &next) == DebugSession::DBG_OK,
+               "A later frozen step must still work after cleanup")) return 1;
+    return 0;
+}
+
+static int test_freeze_go_without_breakpoint_schedules_context_handoff()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.snapshot_result = DebugSession::DBG_OK;
+    backend.canned_snapshot_set = true;
+    debug_context_reset(&backend.canned_snapshot);
+    backend.canned_snapshot.valid = true;
+    backend.canned_snapshot.pc = 0xC123;
+    backend.canned_snapshot.sp = 0xF1;
+    backend.canned_snapshot.a = 0x11;
+    backend.canned_snapshot.x = 0x22;
+    backend.canned_snapshot.y = 0x33;
+    backend.canned_snapshot.sr = 0x44;
+    backend.write(0xC123, 0xEA);
+
+    const int keys[] = { 'A', 'D', 'G' };
+    FakeKeyboard keyboard(keys, 3);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_debug_run_window_refreeze_enabled(true);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM view ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug ok")) return 1;
+    if (expect(monitor.poll(0) == 1,
+               "Freeze-mode G without breakpoints must unwind out of the monitor")) return 1;
+    if (expect(backend.last_session && backend.last_session->go_calls == 0,
+               "Freeze no-breakpoint G must not enter the BRK go path")) return 1;
+
+    DebugContext go_ctx;
+    bool has_ctx = false;
+    uint16_t go_addr = 0;
+    if (expect(monitor.consume_pending_go(&go_addr, &go_ctx, &has_ctx),
+               "Freeze no-breakpoint G must schedule a pending handoff")) return 1;
+    if (expect(has_ctx, "Freeze no-breakpoint G must preserve the captured CPU context")) return 1;
+    if (expect(go_addr == 0xC123, "Pending handoff must target the captured PC")) return 1;
+    if (expect(go_ctx.pc == 0xC123 && go_ctx.sp == 0xF1 &&
+               go_ctx.a == 0x11 && go_ctx.x == 0x22 &&
+               go_ctx.y == 0x33 && go_ctx.sr == 0x44,
+               "Pending handoff must keep the full captured register state")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_freeze_go_with_breakpoint_still_uses_session_go()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+    backend.write(0x0801, 0xEA);
+
+    const int keys[] = { 'A', 'D', 'R', 'G' };
+    FakeKeyboard keyboard(keys, 4);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_debug_run_window_refreeze_enabled(true);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM view ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Toggle breakpoint ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Freeze G with breakpoint should stay in monitor")) return 1;
+    if (expect(backend.last_session && backend.last_session->go_calls == 1,
+               "Freeze G with a breakpoint must still run through session->go")) return 1;
+    if (expect(!monitor.consume_pending_go(NULL, NULL, NULL),
+               "Breakpoint Go must not schedule the no-breakpoint exit path")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+// --- Debug header/footer colour ---------------------------------------------
+// Header mode/address tokens and breakpoint rows use color_fg.
+// In Debug footer values, core registers/flags use the primary accent while
+// IRQ/NMI values remain in color_fg.
+
+static int test_debug_footer_value_highlight_policy()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    // Set a sentinel foreground (12) distinct from the primary accent so the
+    // assertions are meaningful.
+    ui.color_fg = 12;
+
+    const int keys[] = { 'A', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 4);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM view ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug ok")) return 1;
+
+    // The Dbg badge colour is the white primary accent; sample it so the
+    // assertions do not hard-code the accent constant.
+    char header[40];
+    screen.get_slice(1, 3, 38, header);
+    const char *dbg = strstr(header, "Dbg");
+    if (expect(dbg != NULL, "Header must show the Dbg badge")) return 1;
+    uint8_t accent = screen.colors[3][1 + (dbg - header)];
+
+    // Locate the footer label row (contains PC/SP/AC labels).
+    int label_y = -1;
+    for (int y = 0; y < 25; y++) {
+        char row[40];
+        screen.get_slice(1, y, 38, row);
+        if (strstr(row, "PC") != NULL && strstr(row, "SP") != NULL &&
+            strstr(row, "AC") != NULL && strstr(row, "NV-BDIZC") != NULL) {
+            label_y = y;
+            break;
+        }
+    }
+    if (expect(label_y >= 0, "Debug footer label row must be visible")) return 1;
+
+    // Label row stays in color_fg. Value row highlights PC/AC/XR/YR/SP/Flags
+    // (columns before IRQ) with the primary accent, while IRQ/NMI remain in
+    // color_fg.
+    for (int x = 1; x <= 38; x++) {
+        if (screen.chars[label_y][x] == ' ') continue;
+        if (expect(screen.colors[label_y][x] == ui.color_fg,
+                   "Debug footer labels must use color_fg")) return 1;
+    }
+    for (int x = 1; x <= 38; x++) {
+        if (screen.chars[label_y + 1][x] == ' ') continue;
+        if (x <= 26) {
+            if (expect(screen.colors[label_y + 1][x] == accent,
+                       "Debug footer core values must use the primary accent")) return 1;
+        } else {
+            if (expect(screen.colors[label_y + 1][x] == ui.color_fg,
+                       "Debug footer IRQ/NMI values must use color_fg")) return 1;
+        }
+    }
+
+    if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug")) return 1;
+    if (expect(monitor.poll(0) == 1, "Second RUN/STOP exits")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_debug_header_mode_and_address_use_foreground_color()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    // Set a sentinel foreground (12) distinct from the primary accent (1).
+    ui.color_fg = 12;
+
+    const int keys[] = { 'A', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 4);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM view ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug ok")) return 1;
+
+    char header[40];
+    screen.get_slice(1, 3, 38, header);
+    // The Dbg badge uses the white primary accent; sample it as the reference.
+    const char *dbg = strstr(header, "Dbg");
+    if (expect(dbg != NULL, "Header must still show the Dbg badge")) return 1;
+    uint8_t accent = screen.colors[3][1 + (dbg - header)];
+    if (expect(accent != ui.color_fg,
+               "Primary accent and color_fg must be distinct")) return 1;
+
+    // The view-mode token and the current-address token in the header use
+    // color_fg; only the Dbg badge uses the white primary accent.
+    const char *mode = strstr(header, "ASM");
+    if (expect(mode != NULL, "Header must show the ASM mode token")) return 1;
+    const char *addr = strstr(header, "$");
+    if (expect(addr != NULL, "Header must show the current address")) return 1;
+
+    int mode_x = 1 + (int)(mode - header);
+    for (int i = 0; i < 3; i++) {
+        if (expect(screen.colors[3][mode_x + i] == ui.color_fg,
+                   "Header mode text must use color_fg")) return 1;
+        if (expect(screen.colors[3][mode_x + i] != accent,
+                   "Header mode text must not use the white primary accent")) return 1;
+    }
+    int addr_x = 1 + (int)(addr - header);
+    for (int i = 0; i < 5; i++) {
+        if (expect(screen.colors[3][addr_x + i] == ui.color_fg,
+                   "Header address text must use color_fg")) return 1;
+    }
+
+    if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug")) return 1;
+    if (expect(monitor.poll(0) == 1, "Second RUN/STOP exits")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
 } // namespace
 
 #define RUN(name) do { fprintf(stderr, "RUN " #name "\n"); if (name()) { fprintf(stderr, "FAIL " #name "\n"); return 1; } } while(0)
@@ -1433,7 +3553,12 @@ int main()
     RUN(test_d_enters_debug_without_executing);
     RUN(test_d_inside_debug_performs_over);
     RUN(test_d_inside_debug_without_context_overs_from_cursor);
+    RUN(test_d_inside_debug_without_context_goto_keeps_cursor_authoritative);
+    RUN(test_d_refuses_undocumented_opcode_with_specific_warning);
+    RUN(test_debug_predictor_uses_session_bytes_over_backend_reads);
     RUN(test_t_traces_and_o_outs_inside_debug);
+    RUN(test_o_without_traced_jsr_reports_not_in_subroutine);
+    RUN(test_o_without_context_reports_not_in_subroutine);
     RUN(test_t_inside_debug_without_context_traces_from_cursor);
     RUN(test_g_invalidates_context);
     RUN(test_return_remains_non_executing_navigation);
@@ -1443,19 +3568,62 @@ int main()
     RUN(test_runstop_leaves_edit_before_debug);
     RUN(test_step_from_memory_view_recenters_asm_on_debug_pc);
     RUN(test_ctrl_x_resets_and_keeps_debug_open);
+    RUN(test_ctrl_x_local_reset_exits_monitor);
+    RUN(test_ctrl_x_reenters_monitor_without_debug_when_not_debugging);
     RUN(test_breakpoint_toggle_via_r);
     RUN(test_breakpoint_popup_store_reuses_selected_slot);
     RUN(test_breakpoint_popup_digit_jumps_to_slot);
     RUN(test_breakpoint_row_indicator_and_color);
+    RUN(test_breakpoint_label_replaces_row_indicator);
     RUN(test_source_indicators_are_three_chars);
     RUN(test_ctrl_r_opens_breakpoint_popup);
+    RUN(test_breakpoint_popup_navigation_redraws_only_popup);
+    RUN(test_debug_pc_viewport_keeps_context_margin);
     RUN(test_breakpoint_popup_blocks_debug_execution_keys);
     RUN(test_unsupported_session_emits_refusal);
     RUN(test_b_keeps_binary_view_in_debug);
     RUN(test_ctrl_b_keeps_bookmark_popup_in_debug);
     RUN(test_cleanup_runs_on_deinit);
+    RUN(test_ctrl_o_after_debug_step_closes_without_go_handoff);
+    RUN(test_stop_debugging_clears_stale_go_handoff);
+    RUN(test_stop_debugging_resumes_current_debug_context);
     RUN(test_help_screen_shows_debug_commands);
     RUN(test_edit_and_debug_compose_in_header);
+    RUN(test_freeze_step_over_refreezes_and_preserves_screen);
+    RUN(test_freeze_step_over_with_context_refreezes);
+    RUN(test_cleanup_to_context_without_entry_context_never_resets);
+    RUN(test_freeze_step_into_refreezes);
+    RUN(test_freeze_step_out_refreezes);
+    RUN(test_step_out_uses_traced_jsr_target_even_when_target_is_above_pc);
+    RUN(test_step_out_ignores_nearby_rts_and_patches_after_traced_jsr);
+    RUN(test_step_out_refuses_stale_far_stack_frame);
+    RUN(test_traced_kernal_to_basic_step_out_patches_kernal_return);
+    RUN(test_freeze_go_breakpoint_refreezes);
+    RUN(test_visible_basic_step_uses_rom_patch_support);
+    RUN(test_visible_rom_step_bytes_use_cpu_visible_mapping);
+    RUN(test_u64_debug_cpu_port_uses_monitor_bank);
+    RUN(test_visible_kernal_step_into_uses_rom_patch_support);
+    RUN(test_visible_kernal_step_over_jsr_patches_fallthrough_rom);
+    RUN(test_visible_kernal_step_without_rom_patch_support_refuses_cleanly);
+    RUN(test_visible_rom_breakpoint_go_uses_same_capability_gate);
+    RUN(test_visible_rom_breakpoint_go_patches_rom_not_underlying_ram);
+    RUN(test_overlay_step_over_never_freezes);
+    RUN(test_overlay_accessible_unfrozen_step_over_does_not_unfreeze);
+    RUN(test_overlay_render_target_disables_stale_frozen_unfreeze);
+    RUN(test_overlay_step_into_never_freezes);
+    RUN(test_overlay_step_out_never_freezes);
+    RUN(test_overlay_go_breakpoint_never_freezes);
+    RUN(test_overlay_two_consecutive_steps_never_freeze);
+    RUN(test_overlay_cursor_step_from_parked_spin_uses_release_path);
+    RUN(test_freeze_two_consecutive_steps_rebalance);
+    RUN(test_overlay_step_timeout_then_recovers);
+    RUN(test_freeze_step_timeout_refreezes_and_recovers);
+    RUN(test_cleanup_resume_trampoline_restores_full_context);
+    RUN(test_freeze_cleanup_after_step_allows_later_step);
+    RUN(test_freeze_go_without_breakpoint_schedules_context_handoff);
+    RUN(test_freeze_go_with_breakpoint_still_uses_session_go);
+    RUN(test_debug_footer_value_highlight_policy);
+    RUN(test_debug_header_mode_and_address_use_foreground_color);
 
     puts("machine_monitor_debug_test: OK");
     return 0;

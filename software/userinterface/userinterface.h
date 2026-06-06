@@ -57,6 +57,8 @@ typedef enum {
 class Editor;
 class HexEditor;
 class MemoryBackend;
+class MachineMonitor;
+extern "C" bool machine_monitor_request_reset_reentry(void *) __attribute__((weak));
 class UserInterface : public ConfigurableObject, public HostClient
 {
 private:
@@ -69,8 +71,8 @@ private:
     mstring title;
     UIObject *ui_objects[MAX_UI_OBJECTS];
     UIStatusBox *status_box;
+    MachineMonitor *active_machine_monitor;
     
-    void set_screen_title(void);
     void set_available(bool enable);
     int  pollFocussed(void);
     void peel_off(void);
@@ -79,6 +81,11 @@ private:
 public:
     int color_border, color_bg, color_fg, color_sel, color_sel_bg, reverse_sel;
     int color_status, color_inactive;
+    // Clears the screen and draws the title and chrome rows (title bar, border
+    // lines). Called on initial UI bring-up and may be called by UI objects
+    // that need to restore the chrome after temporarily clobbering it (e.g.
+    // after a freeze-mode debug step that restored the live C64 screen).
+    void set_screen_title(void);
 
     int config_save, filename_overflow_squeeze, navmode;
     bool logo;
@@ -93,6 +100,11 @@ public:
 
     // from HostClient
     virtual void release_host();
+    virtual bool request_reset_reentry_after_c64_reset()
+    {
+        return machine_monitor_request_reset_reentry ?
+            machine_monitor_request_reset_reentry(active_machine_monitor) : false;
+    }
 
     virtual bool is_available(void);
     virtual void run();
@@ -128,6 +140,7 @@ public:
     void run_machine_monitor(MemoryBackend *backend);
     void swapDisk(void);
     void send_keystroke(int key);
+    bool handle_global_reset_shortcut(void);
     static bool anyMenuActive(void);
 
     UIObject *get_root_object(void) { return ui_objects[0]; }
