@@ -109,6 +109,8 @@ Example:
 
 Assembly view shows decoded 6510 instructions, their instruction bytes, and the memory source used for each row.
 
+The highlighted address is the disassembly root: rows below it are decoded forward from that address, while rows above it are context only. Changing bytes before the highlighted address can refresh the context rows, but it will not silently change the instruction phase at the highlighted address. To inspect a different phase deliberately, move the root with the cursor keys or jump to the desired address.
+
 It also allows you to assemble instructions inline (in `E`dit mode) as well as debug code (in `D`ebug mode).
 
 Please see the **Edit Mode** respectively **Debug Mode** chapters below for more information.
@@ -310,6 +312,7 @@ Binary width details:
 - `G`: exit the monitor and execute from an address.
 - `F1` or `Shift+Space`: page up.
 - `F7` or `Space`: page down.
+- Assembly view, non-edit mode: `Up` / `Down` move to the previous / next instruction root; `Left` / `Right` move the decode root by one byte (`-1` / `+1`).
 - `Enter`: in Assembly view, follow the target of a jumpable instruction, or return to the most recent saved source location when the current instruction is not jumpable and the follow stack is non-empty.
 - `O`: cycle CPU port banking, `CPU0`..`CPU7`.
 - `Shift+O`: cycle the VIC bank override.
@@ -375,6 +378,8 @@ Edit behavior is view-specific:
 | Assembly | Edit instructions inline with mnemonic completion and direct operand typing |
 
 In edit mode, `Space` remains view-specific data entry and does not page.
+
+In Assembly edit mode, `Left` / `Right` move between editable parts of the current instruction. They do not change the disassembly root unless the cursor is already at the first or last editable part, where the existing row-to-row edit navigation applies. `Up` / `Down` move to the previous / next instruction row.
 
 `DEL` is logical delete, not raw backspace:
 
@@ -616,44 +621,49 @@ Notes:
 The bottom two rows of the monitor are reserved for a fixed-position CPU state table while Debug is active:
 
 ```text
-PC   SP AC XR YR NV-BDIZC IRQ  NMI
-C003 F7 01 00 FF 00100100 C123 EA31
+PC   AC XR YR SP NV-BDIZC IRQ  NMI
+C003 01 00 FF F7 00100100 C123 EA31
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `PC` | Program counter from the captured debug context |
-| `SP` | Stack pointer |
 | `AC` / `XR` / `YR` | Accumulator and index registers |
+| `SP` | Stack pointer |
 | `NV-BDIZC` | Status register bits 7..0 as an 8-character binary string |
 | `IRQ` | RAM IRQ vector at `$0314/$0315`, when valid |
 | `NMI` | RAM NMI vector at `$0318/$0319`, when valid |
 
-Unknown values render as blank spaces in their reserved fixed-width columns; they never appear as zeros, `?`, or placeholder text. Field positions stay put when values become known.
+Notes:
+
+- The values between program counter and status register (inclusive) are highlighted in the same color as the `Dbg` or `Edit` header flags to improve visibility.
+- Unknown values render as blank spaces in their reserved fixed-width columns; they never appear as zeros, `?`, or placeholder text. Field positions stay put when values become known.
 
 ### Breakpoints
 
-There are 10 non-persistent breakpoint slots:
+There are 10 breakpoint slots:
 
 - `R` toggles a breakpoint at the current Assembly address.
-- Opcode rows with a breakpoint show `[BRKx]` immediately before the memory source marker, for example `[BRK0][BAS]`.
+- Opcode rows with a breakpoint show `[BRKx]` immediately before the memory source marker, for example `[BRK0][BAS]`. When Debug mode is active and the slot is enabled, the whole row is drawn in the same accent color as the `Dbg` / `Edit` header flags so live breakpoints are immediately visible. Disabled slots and rows shown while Debug mode is off use the regular foreground color.
+- Breakpoints are kept in volatile RAM. They survive a `C=+X` reset and an ordinary monitor close/reopen, but power-cycling the device clears them.
 - On U64, breakpoints in BASIC, KERNAL, and character ROM use temporary patches in the volatile U64 ROM image, so ROM code remains step-capable without copying ROMs into C64 RAM or writing flash.
 
-`C=+R` opens the breakpoint list which offers these shortcuts:
+`C=+R` opens the breakpoint list which offers these shortcuts (the popup help row uses abbreviated forms in parentheses to fit the line):
 
 | Key | Action |
 | --- | --- |
 | `Up` / `Down` | Select slot |
 | `Return` | Jump to the selected slot |
-| `0`-`9` | Jump directly to a slot |
-| `S` | Store the current address into the selected slot |
-| `E` | Toggle slot enable / disable |
-| `DEL` | Reset the selected slot |
+| `0`-`9` | Jump directly to a slot (`Jmp`) |
+| `S` | Store the current address into the selected slot (`Sto`) |
+| `L` | Change the label, up to 4 chars (`Lab`) |
+| `E` | Toggle slot enable / disable (`En`) |
+| `DEL` | Reset the selected slot (`Res`) |
 | `RUN/STOP` | Close the popup |
 
 ### Help screen
 
-`F3` or `?` shows the Debug help screen while Debug is active. 
+`F3` or `?` shows the Debug help screen while Debug is active.
 
 It keeps the normal help layout, replaces the keys Debug owns with Debug actions, and highlights those Debug shortcuts with the same accent color used for the `Dbg` and `Edit` header flags.
 

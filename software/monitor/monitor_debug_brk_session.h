@@ -47,8 +47,16 @@ public:
     virtual Result over(const DebugContext &from,
                         const DebugPredictResult &pred,
                         DebugContext *ctx);
+    virtual Result over(const DebugContext &from,
+                        const DebugPredictResult &pred,
+                        const MonitorBreakpoints *breakpoints,
+                        DebugContext *ctx);
     virtual Result over_at(uint16_t start_pc,
                            const DebugPredictResult &pred,
+                           DebugContext *ctx);
+    virtual Result over_at(uint16_t start_pc,
+                           const DebugPredictResult &pred,
+                           const MonitorBreakpoints *breakpoints,
                            DebugContext *ctx);
     virtual Result trace(const DebugContext &from,
                          const DebugPredictResult &pred,
@@ -57,14 +65,25 @@ public:
                             const DebugPredictResult &pred,
                             DebugContext *ctx);
     virtual Result step_out(const DebugContext &from, DebugContext *ctx);
+    virtual Result step_out(const DebugContext &from,
+                            const MonitorBreakpoints *breakpoints,
+                            DebugContext *ctx);
     virtual Result go(const DebugContext &from,
                       const MonitorBreakpoints *breakpoints,
                       uint16_t start_pc);
+    virtual Result run_to(const DebugContext &from,
+                          uint16_t target_pc,
+                          const MonitorBreakpoints *breakpoints,
+                          uint16_t start_pc,
+                          DebugContext *ctx);
     virtual void cleanup(void);
     virtual void cleanup_to_context(const DebugContext *ctx);
     virtual bool read_step_bytes(uint16_t address, uint8_t *dst, uint8_t len);
     virtual void forget_context(void);
     virtual bool screen_render_target_invalidated(void) const { return screen_was_clobbered; }
+    virtual bool claim_debug_ownership(bool remote);
+    virtual void refresh_debug_ownership(void);
+    virtual void release_debug_ownership(void);
 
 private:
     enum PatchInstallResult {
@@ -100,7 +119,7 @@ private:
     // firmware chrome rows need restoring before the next visible redraw.
     bool screen_was_clobbered;
     uint8_t saved_handler_bytes[100];
-    uint8_t saved_nmi_trampoline_bytes[16];
+    uint8_t saved_nmi_trampoline_bytes[24];
     bool nmi_trampoline_installed;
     uint8_t saved_nmi_vector[2];
     uint8_t saved_brk_vector[2];
@@ -117,24 +136,35 @@ private:
     int find_free_patch(void);
     bool already_patched(uint16_t addr);
     PatchInstallResult install_brk_at(uint16_t addr, uint8_t cpu_port);
+    PatchInstallResult install_breakpoints(const MonitorBreakpoints *breakpoints,
+                                           uint16_t skip_address,
+                                           bool skip_address_valid);
+    bool context_at_breakpoint(const DebugContext &ctx,
+                               const MonitorBreakpoints *breakpoints,
+                               uint16_t skip_address,
+                               bool skip_address_valid) const;
     void restore_patches(void);
     void fill_vectors(DebugContext *ctx, uint8_t cpu_port);
     void clear_return_targets(void);
     void push_return_target(uint16_t target);
     bool peek_return_target(uint16_t *target) const;
     void pop_return_target(uint16_t target);
+    void drop_queued_execution_keys(void);
     Result wait_for_sentinel(int timeout_ms);
     void read_captured_context(DebugContext *ctx, uint8_t cpu_port);
     void release_to_run(const DebugContext *from);
     void resume_from_parked_context(const DebugContext &from);
     void reset_spin_target(void);
-    void nmi_redirect_to(uint16_t target);
+    void nmi_redirect_to(uint16_t target, uint8_t cpu_port, bool force_cpu_port);
     Result perform_run(const DebugContext *from, uint16_t start_pc,
                        bool use_start_pc, DebugContext *out, uint8_t cpu_port);
     Result step_with_predict(const DebugContext *from, uint16_t start_pc,
                              const DebugPredictResult &pred,
                              bool prefer_jsr_target,
-                             DebugContext *out, uint8_t cpu_port);
+                             DebugContext *out, uint8_t cpu_port,
+                             const MonitorBreakpoints *breakpoints = 0,
+                             uint16_t skip_breakpoint_address = 0,
+                             bool skip_breakpoint_address_valid = false);
 };
 
 #endif

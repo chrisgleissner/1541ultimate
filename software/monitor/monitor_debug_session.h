@@ -48,15 +48,30 @@ public:
     virtual Result snapshot(DebugContext *ctx) = 0;
 
     // Step over: install BRK at fall_through, resume, wait, restore. JSR is
-    // handled identically (BRK at PC + 3).
+    // handled identically (BRK at PC + 3). Backends that support active
+    // breakpoints during the run may override the breakpoint-table overload.
     virtual Result over(const DebugContext &from,
                         const struct DebugPredictResult &pred,
                         DebugContext *ctx) = 0;
+    virtual Result over(const DebugContext &from,
+                        const struct DebugPredictResult &pred,
+                        const MonitorBreakpoints *breakpoints,
+                        DebugContext *ctx) {
+        (void)breakpoints;
+        return over(from, pred, ctx);
+    }
     virtual Result over_at(uint16_t start_pc,
                            const struct DebugPredictResult &pred,
                            DebugContext *ctx) {
         (void)start_pc; (void)pred; (void)ctx;
         return DBG_NOT_SUPPORTED;
+    }
+    virtual Result over_at(uint16_t start_pc,
+                           const struct DebugPredictResult &pred,
+                           const MonitorBreakpoints *breakpoints,
+                           DebugContext *ctx) {
+        (void)breakpoints;
+        return over_at(start_pc, pred, ctx);
     }
 
     // Step into: BRK at the predicted next PC. For JSR this enters the
@@ -75,6 +90,12 @@ public:
     // the captured SP. Returns DBG_REFUSED when stack context is unsafe.
     virtual Result step_out(const DebugContext &from,
                             DebugContext *ctx) = 0;
+    virtual Result step_out(const DebugContext &from,
+                            const MonitorBreakpoints *breakpoints,
+                            DebugContext *ctx) {
+        (void)breakpoints;
+        return step_out(from, ctx);
+    }
 
     // Resume execution honouring active breakpoints. Invalidates the context
     // on the calling side. When `from.valid` is false (no prior capture),
@@ -85,6 +106,19 @@ public:
     virtual Result go(const DebugContext &from,
                       const MonitorBreakpoints *breakpoints,
                       uint16_t start_pc) = 0;
+
+    // Run until `target_pc` is hit, using a temporary non-visible breakpoint
+    // alongside the visible breakpoint table. If `from.valid` is false, the
+    // backend should start from `start_pc`.
+    virtual Result run_to(const DebugContext &from,
+                          uint16_t target_pc,
+                          const MonitorBreakpoints *breakpoints,
+                          uint16_t start_pc,
+                          DebugContext *ctx)
+    {
+        (void)from; (void)target_pc; (void)breakpoints; (void)start_pc; (void)ctx;
+        return DBG_NOT_SUPPORTED;
+    }
 
     // Restore every patched byte / vector / trampoline state. MUST be safe
     // to call at any time (success, failure, mode change, destructor) and
@@ -132,6 +166,10 @@ public:
     // Cleared at the start of the next CPU-run window. Always false in overlay
     // mode because overlay sessions disable freeze/refreeze run windows.
     virtual bool screen_render_target_invalidated(void) const { return false; }
+
+    virtual bool claim_debug_ownership(bool remote) { (void)remote; return true; }
+    virtual void refresh_debug_ownership(void) { }
+    virtual void release_debug_ownership(void) { }
 };
 
 #endif
