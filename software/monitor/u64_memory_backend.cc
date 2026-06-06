@@ -1,4 +1,5 @@
 #include "u64_memory_backend.h"
+#include "monitor_debug_u64.h"
 #include "u64_machine.h"
 #include "u64.h"
 #include "filemanager.h"
@@ -169,6 +170,23 @@ void U64MemoryBackend :: set_frozen(bool on)
     }
 }
 
+bool U64MemoryBackend :: reset_machine(void)
+{
+    if (!machine) {
+        return false;
+    }
+    if (stopped_machine_for_session) {
+        machine->end_stopped_session(stopped_machine_for_session);
+        stopped_machine_for_session = false;
+    }
+    if (machine->is_accessible()) {
+        machine->unfreeze();
+    }
+    machine->reset();
+    load_monitor_rom_cache(machine);
+    return true;
+}
+
 uint8_t U64MemoryBackend :: read(uint16_t address)
 {
     if (!machine) {
@@ -239,4 +257,9 @@ uint8_t U64MemoryBackend :: get_live_vic_bank(void)
 uint8_t U64MemoryBackend :: monitor_poll_hz(void) const
 {
     return (C64_VIDEOFORMAT & VIDEO_FMT_60_HZ) ? 60 : 50;
+}
+
+DebugSession *U64MemoryBackend :: create_debug_session(void)
+{
+    return create_u64_debug_session(this);
 }

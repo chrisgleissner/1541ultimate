@@ -905,7 +905,10 @@ static int test_kernal_disassembly_mapping(void)
         0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF,
         0x18, 0x00, 0x00
     };
-    const int keys[] = { 'J', 'D', 'o', KEY_BREAK };
+    // 'A' switches to disassembly view without entering Debug mode; 'D' now
+    // enters Debug per DBG-CMD-001 and would intercept the following 'o' as
+    // step-out rather than cycling the CPU bank.
+    const int keys[] = { 'J', 'A', 'o', KEY_BREAK };
     FakeKeyboard keyboard(keys, 4);
 
     memset(backend.ram + 0xE000, 0x00, 0x40);
@@ -925,13 +928,13 @@ static int test_kernal_disassembly_mapping(void)
     screen.get_slice(1, 4, 38, line);
     if (expect(strstr(line, "E000 85 56") == line, "Visible KERNAL bytes at E000 are incorrect.")) return 1;
     if (expect(strstr(line, "STA $56") != NULL, "Visible KERNAL disassembly at E000 is incorrect.")) return 1;
-    if (expect(strstr(line, "[KERNAL]") != NULL, "Visible KERNAL source annotation missing.")) return 1;
+    if (expect(strstr(line, "[KRN]") != NULL, "Visible KERNAL source annotation missing.")) return 1;
     if (expect(screen.reverse_chars[4][1], "Disassembly view did not highlight the selected instruction.")) return 1;
 
     screen.get_slice(1, 5, 38, line);
     if (expect(strstr(line, "E002 20 0F BC") == line, "Visible KERNAL bytes at E002 are incorrect.")) return 1;
     if (expect(strstr(line, "JSR $BC0F") != NULL, "Visible KERNAL disassembly at E002 is incorrect.")) return 1;
-    if (expect(strstr(line, "[KERNAL]") != NULL, "E002 KERNAL source annotation missing.")) return 1;
+    if (expect(strstr(line, "[KRN]") != NULL, "E002 KERNAL source annotation missing.")) return 1;
 
     screen.get_slice(1, 6, 38, line);
     if (expect(strstr(line, "E005 A5 61") == line, "Visible KERNAL bytes at E005 are incorrect.")) return 1;
@@ -981,7 +984,7 @@ static int test_disassembly_instruction_stepping(void)
         0x88, 0x90, 0x03, 0x20, 0xD4, 0xBA, 0x20, 0xCC,
         0xBC, 0xA5, 0x07
     };
-    const int keys[] = { 'J', 'D', KEY_DOWN, KEY_DOWN, KEY_UP, KEY_UP, KEY_BREAK };
+    const int keys[] = { 'J', 'A', KEY_DOWN, KEY_DOWN, KEY_UP, KEY_UP, KEY_BREAK };
     FakeKeyboard keyboard(keys, 7);
 
     memcpy(backend.kernal, kernal_bytes, sizeof(kernal_bytes));
@@ -1516,7 +1519,7 @@ static int test_monitor_interaction(void)
         "Close monitor: C=+O/RSTOP",
         "Leave edit:    C=+E/RSTOP",
         "Copy/Paste:    C=+C / C=+V",
-        "Follow/Return: RETURN",
+        "Reset/Follow:  C=+X Reset / RETURN",
         NULL
     };
     monitor_reset_saved_state();
@@ -1612,7 +1615,7 @@ static int test_monitor_interaction(void)
     }
 
     ui.set_prompt("E013", 1);
-    const int goto_disasm_keys[] = { 'J', 'D', KEY_BREAK };
+    const int goto_disasm_keys[] = { 'J', 'A', KEY_BREAK };
     FakeKeyboard goto_disasm_keyboard(goto_disasm_keys, 3);
     ui.keyboard = &goto_disasm_keyboard;
     screen.clear();
@@ -1852,8 +1855,11 @@ static int test_monitor_interaction(void)
         toggle_monitor.deinit();
     }
 
-    const int ignored_keys[] = { 'D', '.', 'R', ':', 'Q', 'P', KEY_BREAK };
-    FakeKeyboard ignored_keyboard(ignored_keys, 7);
+    // 'A' switches to disassembly without entering Debug mode. 'R' is no
+    // longer a candidate "ignored" key because the spec routes it to the
+    // range toggle outside Debug and to breakpoint toggle inside Debug.
+    const int ignored_keys[] = { 'A', '.', ':', 'Q', 'P', KEY_BREAK };
+    FakeKeyboard ignored_keyboard(ignored_keys, 6);
     ui.keyboard = &ignored_keyboard;
     screen.clear();
     ui.popup_count = 0;
@@ -1868,7 +1874,6 @@ static int test_monitor_interaction(void)
     if (expect(ignored_monitor.poll(0) == 0, "'.' should be ignored now that left/right already handle byte stepping.")) return 1;
     screen.get_slice(1, 3, 38, status);
     if (expect(strstr(status, "MONITOR ASM $0000") == status, "'.' should not change the disassembly viewport.")) return 1;
-    if (expect(ignored_monitor.poll(0) == 0, "'R' should be ignored now that register editing is unsupported.")) return 1;
     if (expect(ignored_monitor.poll(0) == 0, "':' should be ignored after 'E' takes over edit entry.")) return 1;
     if (expect(ignored_monitor.poll(0) == 0, "Q should be ignored while not editing.")) return 1;
     if (expect(ignored_monitor.poll(0) == 0, "P should be ignored, not handled as a command.")) return 1;
@@ -2046,7 +2051,7 @@ static int test_monitor_reopen_restores_state(void)
     backend.write(0xC125, 0x00);
 
     {
-        const int first_keys[] = { 'J', 'D', 'U', 'o', KEY_BREAK };
+        const int first_keys[] = { 'J', 'A', 'U', 'o', KEY_BREAK };
         FakeKeyboard first_keyboard(first_keys, 5);
         ui.screen = &screen;
         ui.keyboard = &first_keyboard;
@@ -2523,7 +2528,7 @@ static int test_screen_charset_toggle_and_header(void)
         if (expect(mon.poll(0) == 0, "ASM U test: ASM view switch failed.")) return 1;
         if (expect(mon.poll(0) == 0, "ASM U test: undocumented toggle failed.")) return 1;
         screen.get_slice(1, 3, 38, header);
-        if (expect(strstr(header, "Undoc") != NULL,
+        if (expect(strstr(header, "Undc") != NULL,
                    "ASM U must keep toggling undocumented opcodes.")) return 1;
         if (expect(mon.poll(0) == 1, "ASM U test: exit failed.")) return 1;
         mon.deinit();
@@ -4568,8 +4573,8 @@ static int test_illegal_mode_header_label(void)
                "Visible monitor UI must no longer show the old IllOp label.")) return 1;
     if (expect(mon.poll(0) == 0, "Illegal mode label test: U toggle failed.")) return 1;
     screen.get_slice(1, 3, 38, line);
-    if (expect(strstr(line, "Undoc") != NULL,
-               "Enabled undocumented-opcode mode must show the compact Undoc label in the header.")) return 1;
+    if (expect(strstr(line, "Undc") != NULL,
+               "Enabled undocumented-opcode mode must show the compact Undc label in the header.")) return 1;
     if (expect(strstr(line, "Illegal:ON") == NULL,
                "Illegal opcode mode must no longer show the old long header text.")) return 1;
     if (expect(mon.poll(0) == 1, "Illegal mode label test: exit failed.")) return 1;
@@ -5545,21 +5550,23 @@ static int test_header_invariants_and_parity(void)
         screen.get_slice(1, 3, 38, header);
         if (expect(strstr(header, "Edit Mode") == NULL,
                    "Header must show Edit, not Edit Mode.")) return 1;
-        if (expect(strncmp(header + 34, "EDIT", 4) == 0,
-                   "Edit indicator must be fixed at top-right and uppercase.")) return 1;
+        // Per the Debug-mode spec, the Edit indicator is always written as
+        // mixed-case `Edit` so it can compose with `Dbg` cleanly.
+        if (expect(strncmp(header + 34, "Edit", 4) == 0,
+                   "Edit indicator must be fixed at top-right.")) return 1;
         if (expect(screen.colors[3][35] == 1 && screen.colors[3][36] == 1 &&
                    screen.colors[3][37] == 1 && screen.colors[3][38] == 1,
-                   "EDIT must use the shared UI accent colour used for the help/title text.")) return 1;
-        if (expect(strncmp(header + 19, "Range", 5) == 0,
+                   "Edit must use the shared UI accent colour used for the help/title text.")) return 1;
+        if (expect(strncmp(header + 18, "Range", 5) == 0,
                    "Range indicator must use its fixed slot.")) return 1;
-        if (expect(strncmp(header + 25, "Frz", 3) == 0,
+        if (expect(strncmp(header + 23, "Frz", 3) == 0,
                    "Freeze indicator must use its compact fixed slot.")) return 1;
         if (expect(strstr(header, "W=") == NULL,
                    "Header must not display binary width.")) return 1;
         if (expect(mon.poll(0) == 0, "Header test: RUN/STOP should leave edit mode first.")) return 1;
         screen.get_slice(1, 3, 38, header);
-        if (expect(strstr(header, "EDIT") == NULL,
-                   "Leaving edit mode must clear the far-right EDIT indicator area.")) return 1;
+        if (expect(strstr(header, "Edit") == NULL,
+                   "Leaving edit mode must clear the far-right Edit indicator area.")) return 1;
         if (expect(mon.poll(0) == 1, "Header test: exit failed.")) return 1;
         mon.deinit();
     }
@@ -5631,7 +5638,7 @@ static int test_poll_mode_refreshes_visible_ram(void)
     if (expect(mon.poll(0) == 0, "Poll mode test: P toggle failed.")) return 1;
 
     screen.get_slice(1, 3, 38, header);
-    if (expect(strncmp(header + 29, "Poll", 4) == 0,
+    if (expect(strncmp(header + 27, "Pl", 2) == 0,
                "Poll indicator must appear in the top-right flag area.")) return 1;
 
     screen.get_slice(1, 4, 8, line);
@@ -5735,11 +5742,11 @@ static int test_edit_indicator_layout_across_views(void)
             if (expect(mon.poll(0) == 0, "Edit indicator cross-view test: command sequence failed.")) return 1;
         }
         screen.get_slice(1, 3, 38, header);
-        if (expect(strncmp(header + 34, "EDIT", 4) == 0,
-                   "EDIT must remain far-right aligned in every edit-capable view.")) return 1;
+        if (expect(strncmp(header + 34, "Edit", 4) == 0,
+                   "Edit must remain far-right aligned in every edit-capable view.")) return 1;
         if (expect(screen.colors[3][35] == 1 && screen.colors[3][36] == 1 &&
                    screen.colors[3][37] == 1 && screen.colors[3][38] == 1,
-                   "EDIT must keep the shared UI accent colour in every edit-capable view.")) return 1;
+                   "Edit must keep the shared UI accent colour in every edit-capable view.")) return 1;
         mon.deinit();
     }
 
@@ -5761,14 +5768,14 @@ static int test_edit_indicator_layout_across_views(void)
             if (expect(mon.poll(0) == 0, "Edit indicator layout test: ASM/freeze sequence failed.")) return 1;
         }
         screen.get_slice(1, 3, 38, header);
-        if (expect(strncmp(header + 19, "Undoc", 5) == 0,
-                   "Undoc must remain visible to the left of Poll and EDIT.")) return 1;
-        if (expect(strncmp(header + 25, "Frz", 3) == 0,
-                   "Frz must remain visible to the left of Poll and EDIT.")) return 1;
-        if (expect(strncmp(header + 29, "Poll", 4) == 0,
-                   "Poll must appear immediately to the left of EDIT.")) return 1;
-        if (expect(strncmp(header + 34, "EDIT", 4) == 0,
-                   "EDIT must remain fixed at the far right when Undoc, Freeze, and Poll are active.")) return 1;
+        if (expect(strncmp(header + 18, "Undc", 4) == 0,
+                   "Undc must remain visible to the left of Frz, Pl, and Edit.")) return 1;
+        if (expect(strncmp(header + 23, "Frz", 3) == 0,
+                   "Frz must remain visible to the left of Pl and Edit.")) return 1;
+        if (expect(strncmp(header + 27, "Pl", 2) == 0,
+                   "Pl must appear immediately to the left of Dbg/Edit.")) return 1;
+        if (expect(strncmp(header + 34, "Edit", 4) == 0,
+                   "Edit must remain fixed at the far right when Undc, Frz, and Pl are active.")) return 1;
         mon.deinit();
     }
 
@@ -5800,7 +5807,7 @@ static int test_poll_mode_disabled_on_full_refresh_screen(void)
     if (expect(strstr(ui.last_popup, "TELNET") != NULL,
                "Poll mode warning must mention the telnet restriction.")) return 1;
     screen.get_slice(1, 3, 38, header);
-    if (expect(strncmp(header + 29, "Poll", 4) != 0,
+    if (expect(strncmp(header + 27, "Pl", 2) != 0,
                "Poll indicator must stay disabled on full-refresh screens.")) return 1;
     if (expect(mon.poll(0) == 1, "Telnet poll-mode guard: exit failed.")) return 1;
     mon.deinit();
@@ -6590,6 +6597,57 @@ static int test_asm_edit_return_advances(void)
     return 0;
 }
 
+struct ResetShortcutBackend : public FakeMemoryBackend
+{
+    int reset_calls;
+
+    ResetShortcutBackend() : reset_calls(0) { }
+    virtual bool supports_reset(void) const { return true; }
+    virtual bool reset_machine(void) { reset_calls++; return true; }
+};
+
+static int test_reset_shortcut_is_global(void)
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    ResetShortcutBackend backend;
+    const int keys[] = {
+        KEY_HELP,
+        KEY_CTRL_X,
+        'E',
+        KEY_CTRL_X,
+        KEY_CTRL_X,
+        KEY_BREAK
+    };
+    FakeKeyboard kb(keys, sizeof(keys) / sizeof(keys[0]));
+
+    ui.screen = &screen;
+    ui.keyboard = &kb;
+    monitor_reset_saved_state();
+
+    BackendMachineMonitor mon(&ui, &backend);
+    mon.init(&screen, &kb);
+
+    if (expect(mon.poll(0) == 0, "F3 should show help before reset shortcut test.")) return 1;
+    if (expect(mon.poll(0) == 0, "CTRL+X from help should reset without exiting monitor.")) return 1;
+    if (expect(backend.reset_calls == 1,
+               "CTRL+X must reset even while help is visible.")) return 1;
+
+    if (expect(mon.poll(0) == 0, "E should enter edit mode before reset shortcut test.")) return 1;
+    if (expect(mon.poll(0) == 0, "CTRL+X from edit should reset without exiting monitor.")) return 1;
+    if (expect(backend.reset_calls == 2,
+               "CTRL+X must reset even while edit mode is active.")) return 1;
+
+    if (expect(mon.poll(0) == 0, "CTRL+X from view mode should reset without exiting monitor.")) return 1;
+    if (expect(backend.reset_calls == 3,
+               "CTRL+X must reset from normal monitor view mode.")) return 1;
+
+    if (expect(mon.poll(0) == 1, "RUN/STOP should still close monitor after reset shortcut test.")) return 1;
+    mon.deinit();
+    monitor_reset_saved_state();
+    return 0;
+}
+
 int main()
 {
     if (test_disassembler()) return 1;
@@ -6671,6 +6729,7 @@ int main()
     if (test_warning_popups_preserve_status_row()) return 1;
     if (test_asm_follow_and_return_navigation()) return 1;
     if (test_restricted_backend_guards_platform_features()) return 1;
+    if (test_reset_shortcut_is_global()) return 1;
 
     puts("machine_monitor_test: OK");
     return 0;

@@ -15,6 +15,8 @@ To open the monitor, use one of the following:
 
 Open the built-in help with `F3` or `?`.
 
+While the monitor is open, `C=+X` resets / breaks the U64 from any monitor mode, including Help, Edit, Debug, and popups.
+
 To close the monitor:
 
 - Press `C=+O` again.
@@ -27,7 +29,7 @@ The monitor screen has three fixed regions:
 ### Header
 
 - Shows the current view, cursor address, and active modes.
-- Mode indicators may include `Undoc`, `Frz`, `Poll`, or `EDIT`.
+- Mode indicators may include `Undc`, `Frz`, `Pl`, `Dbg`, or `Edit`.
 
 ### Body
 
@@ -46,7 +48,7 @@ Example layout:
 
 ```text
 +--------------------------------------+
-|MONITOR ASM $E011  Undoc Frz Poll EDIT|
+|MONITOR ASM $E011  Undc Frz Pl Dbg Edit|
 |...                                   |
 |CPU7 $A:BAS $D:I/O $E:KRN VIC0 $0000  |
 +--------------------------------------+
@@ -104,24 +106,24 @@ Example:
 ```text
 +--------------------------------------+
 |MONITOR ASM $E011                     |
-|DFF9 FF           ???             [IO]|
-|DFFA 00           BRK             [IO]|
-|DFFB 00           BRK             [IO]|
-|DFFC FF           ???             [IO]|
-|DFFD 00           BRK             [IO]|
-|DFFE 00           BRK             [IO]|
-|DFFF 00           BRK             [IO]|
-|E000 85 56        STA $56     [KERNAL]|
-|E002 20 0F BC     JSR $BC0F   [KERNAL]|
-|E005 A5 61        LDA $61     [KERNAL]|
-|E007 C9 88        CMP #$88    [KERNAL]|
-|E009 90 03        BCC $E00E   [KERNAL]|
-|E00B 20 D4 BA     JSR $BAD4   [KERNAL]|
-|E00E 20 CC BC     JSR $BCCC   [KERNAL]|
-|E011 A5 07        LDA $07     [KERNAL]|
-|E013 18           CLC         [KERNAL]|
-|E014 69 81        ADC #$81    [KERNAL]|
-|E016 F0 F3        BEQ $E00B   [KERNAL]|
+|DFF9 FF           ???            [I/O]|
+|DFFA 00           BRK            [I/O]|
+|DFFB 00           BRK            [I/O]|
+|DFFC FF           ???            [I/O]|
+|DFFD 00           BRK            [I/O]|
+|DFFE 00           BRK            [I/O]|
+|DFFF 00           BRK            [I/O]|
+|E000 85 56        STA $56        [KRN]|
+|E002 20 0F BC     JSR $BC0F      [KRN]|
+|E005 A5 61        LDA $61        [KRN]|
+|E007 C9 88        CMP #$88       [KRN]|
+|E009 90 03        BCC $E00E      [KRN]|
+|E00B 20 D4 BA     JSR $BAD4      [KRN]|
+|E00E 20 CC BC     JSR $BCCC      [KRN]|
+|E011 A5 07        LDA $07        [KRN]|
+|E013 18           CLC            [KRN]|
+|E014 69 81        ADC #$81       [KRN]|
+|E016 F0 F3        BEQ $E00B      [KRN]|
 |CPU7 $A:BAS $D:I/O $E:KRN VIC0 $0000  |
 +--------------------------------------+
 ```
@@ -563,6 +565,97 @@ Default slots are aimed at common C64 locations:
 |0-9/RET Jmp  S Set  L Label  DEL Reset|
 +--------------------------------------+
 ```
+
+## Debug Mode
+
+Debug is a modal state layered on the Assembly view. Entering Debug does not execute CPU instructions by itself; execution only happens when an explicit Debug command (`D` for Over, `T` for Trace, `O` for Out, `G` for Go) is pressed while Debug is active.
+
+| Key | Outside Debug | Inside Debug |
+| --- | --- | --- |
+| `D` | Enter Debug, no execution | Over |
+| `T` | Transfer memory | Trace |
+| `O` | CPU bank cycle | Out |
+| `G` | Go / execute | Go |
+| `R` | Range mode | Toggle breakpoint |
+| `C=+R` | (unassigned) | Breakpoint list |
+| `RUN/STOP` | Normal monitor close | Leave Edit first, then Debug |
+| `C=+D` | (unassigned) | Exit Debug |
+| `C=+X` | Reset / break the machine | Reset / break the machine |
+| `RETURN` | Assembly follow / return | Assembly follow / return |
+
+`RETURN` is non-executing subroutine navigation. `O` is executing step-out: do not confuse it with `RETURN`.
+
+In Debug + Edit, `RUN/STOP` / `ESC` unwind one mode at a time: the first press leaves `Edit` and keeps `Dbg`, the second leaves `Dbg`.
+
+`B` keeps Binary view and `C=+B` keeps the bookmark overview. Neither is repurposed for breakpoints.
+
+### Status flag
+
+Debug shows a compact `Dbg` indicator in the same flag area as `Undc`, `Frz`, `Pl`, and `Edit`:
+
+```text
+Undc Frz Pl Dbg Edit
+```
+
+Both `Dbg` and `Edit` are shown when Debug + Edit are active. The flag area uses the fixed 20-character layout `Undc Frz Pl Dbg Edit`.
+
+### CPU footer
+
+The bottom two rows of the monitor are reserved for a fixed-position CPU state table while Debug is active:
+
+```text
+PC   SP AC XR YR NV-BDIZC IRQ  NMI
+C003 F7 01 00 FF 00100100 C123 EA31
+```
+
+| Field | Meaning |
+| --- | --- |
+| `PC` | Program counter from the captured debug context |
+| `SP` | Stack pointer |
+| `AC` / `XR` / `YR` | Accumulator and index registers |
+| `NV-BDIZC` | Status register bits 7..0 as an 8-character binary string |
+| `IRQ` | RAM IRQ vector at `$0314/$0315`, when valid |
+| `NMI` | RAM NMI vector at `$0318/$0319`, when valid |
+
+Unknown values render as blank spaces in their reserved fixed-width columns; they never appear as zeros, `?`, or placeholder text. Field positions stay put when values become known.
+
+### Breakpoints
+
+There are 10 non-persistent breakpoint slots. `R` toggles a breakpoint at the current Assembly address; opcode rows with a breakpoint show `[BRKx]` immediately before the memory source marker, for example `[BRK0][BAS]`. On U64, breakpoints in BASIC, KERNAL, and character ROM use temporary patches in the volatile U64 ROM image, so ROM code remains step-capable without copying ROMs into C64 RAM or writing flash. `C=+R` opens the breakpoint list. The popup controls are:
+
+| Key | Action |
+| --- | --- |
+| `Up` / `Down` | Select slot |
+| `Return` | Jump to the selected slot |
+| `0`-`9` | Jump directly to a slot |
+| `S` | Store the current address into the selected slot |
+| `E` | Toggle slot enable / disable |
+| `DEL` | Reset the selected slot |
+| `RUN/STOP` | Close the popup |
+
+### Help screen
+
+`F3` or `?` shows the Debug help screen while Debug is active. It keeps the normal help layout, replaces the keys Debug owns with Debug actions, and highlights those Debug shortcuts with the same accent color used for the `Dbg` and `Edit` header flags. `RETURN` remains non-executing follow / return navigation; `O` is executing step-out. `C=+X Reset` is the emergency reset / break shortcut.
+
+### Patch safety
+
+Every BRK patch, including temporary U64 ROM-image patches, plus every vector hook and trampoline is saved and restored on normal completion, breakpoint clear, timeout, cancel, debug-off, and monitor close. U64 ROM-image patches are volatile only; rebooting or reloading ROMs restores the configured BASIC/KERNAL image even if a debug session is interrupted before cleanup. Unsafe targets are refused rather than corrupting memory or fabricating CPU state.
+
+### Hardware support
+
+| Capability                              | U64 (Elite) | U2 / U2+ cartridge |
+| --------------------------------------- | ----------- | ------------------ |
+| Memory view, edit, fill, compare        | Yes         | Yes                |
+| `G` jump to address                     | Yes         | Yes                |
+| BRK-based step / over / trace / out     | Yes         | Yes                |
+| Breakpoints in C64 RAM                  | Yes         | Yes                |
+| Breakpoints in BASIC / KERNAL / CHAR ROM | Yes (volatile U64 ROM-image patch) | Not available - C64 ROM is read-only from the cartridge |
+| Monitor-side CPU bank selection (`O`)    | Yes         | Not available - status line shows `CPU BANK N/A` |
+| Monitor-side VIC bank selection (`SH+O`) | Yes         | Not available - status line shows `VIC N/A` |
+| Freeze toggle (`Z`)                      | Yes         | Not available |
+| REST `/v1/machine` memory API            | Yes         | Yes (`route_machine.cc` is linked into all target builds) |
+
+The Debug stepping engine itself is shared between U64 and U2: both back-ends sit on the same BRK trampoline plus IRQ/NMI vector hook (`software/monitor/monitor_debug_brk_session.cc`). Only the platform-specific hooks (stopped-session bracketing, ROM-image patching, NMI pulse, reset) differ.
 
 ## Additional Notes
 

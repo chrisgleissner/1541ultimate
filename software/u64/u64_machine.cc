@@ -130,17 +130,19 @@ static void copy_raw_block(volatile uint8_t *ram, bool freezerMenu, uint32_t add
         uint32_t overlap;
         if ((address < 2048) && ((address + len) > 1024)) {
             uint32_t start = (address > 1024) ? address : 1024;
+            uint32_t end = 2048;
             overlap = address + len - start;
-            if (overlap > 1024) {
-                overlap = 1024;
+            if (overlap > (end - start)) {
+                overlap = end - start;
             }
             memcpy(dst + (start - address), ((uint8_t *)screen_backup) + (start - 1024), overlap);
         }
         if ((address < 4096) && ((address + len) > 2048)) {
             uint32_t start = (address > 2048) ? address : 2048;
+            uint32_t end = 4096;
             overlap = address + len - start;
-            if (overlap > 2048) {
-                overlap = 2048;
+            if (overlap > (end - start)) {
+                overlap = end - start;
             }
             memcpy(dst + (start - address), ((uint8_t *)ram_backup) + (start - 2048), overlap);
         }
@@ -173,22 +175,6 @@ void U64Machine :: after_memory_access(uint8_t *pb, bool freezerMenu, bool stopp
         // if we were in freezer menu, the backup of the 1K-4K RAM should be used to restore memory
         memcpy(pb + 1024, screen_backup, 1024);
         memcpy(pb + 2048, ram_backup, 2048);
-    }
-}
-
-bool U64Machine :: begin_stopped_session()
-{
-    bool wasStopped = is_stopped();
-    if (!wasStopped) {
-        stop(false);
-    }
-    return !wasStopped;
-}
-
-void U64Machine :: end_stopped_session(bool stopped_it)
-{
-    if (stopped_it) {
-        resume();
     }
 }
 

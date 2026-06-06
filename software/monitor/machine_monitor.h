@@ -6,6 +6,9 @@
 #include "ui_elements.h"
 #include "memory_backend.h"
 #include "monitor_bookmarks.h"
+#include "monitor_breakpoints.h"
+#include "monitor_debug.h"
+#include "monitor_debug_session.h"
 
 enum MonitorError {
     MONITOR_OK = 0,
@@ -209,6 +212,11 @@ class MachineMonitor : public UIObject
     uint8_t last_live_vic_bank;
     bool vic_bank_override;
     MonitorBookmarks *bookmarks;
+    MonitorDebug debug;
+    MonitorBreakpoints breakpoints;
+    class DebugSession *debug_session;
+    bool breakpoint_popup_active;
+    uint8_t breakpoint_selected;
     bool bookmark_popup_active;
     uint8_t bookmark_selected;
     char bookmark_status_text[40];
@@ -312,6 +320,27 @@ class MachineMonitor : public UIObject
                         bool template_mode = false, bool uppercase = true);
     bool prompt_hunt_command(const char *title, char *buffer, int max_len);
     void toggle_help();
+    bool debug_active(void) const { return debug.is_active(); }
+    bool debug_input_active(void) const { return debug.is_active() || breakpoint_popup_active; }
+    int  debug_handle_key(int key);
+    void debug_enter(void);
+    void debug_leave(void);
+    void debug_sync_cursor_to_context(void);
+    bool debug_handle_terminal_result(DebugSession::Result result);
+    void debug_request_over(void);
+    void debug_request_trace(void);
+    void debug_request_out(void);
+    void debug_request_go(void);
+    void debug_toggle_breakpoint(void);
+    void debug_open_breakpoint_popup(void);
+    int  debug_breakpoint_popup_handle_key(int key);
+    void debug_close_breakpoint_popup(void);
+    void debug_render_breakpoint_popup(void);
+    void debug_cleanup_session(void);
+    DebugSession *ensure_debug_session(void);
+    bool debug_capture_context(DebugContext *out);
+    bool handle_reset_shortcut(void);
+    void draw_debug_footer(void);
     void dismiss_bookmark_status(void);
     bool update_bookmark_status(void);
     void show_bookmark_status(uint8_t slot, const MonitorBookmarkSlot *bookmark, int kind);
