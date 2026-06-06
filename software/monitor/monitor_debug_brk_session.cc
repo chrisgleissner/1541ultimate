@@ -192,6 +192,7 @@ BrkDebugSession :: BrkDebugSession()
       hard_vector_installed(false),
       hard_rom_vector_installed(false), has_last_context(false),
       has_resume_context(false),
+      rom_bp_hit_pc_valid(false), rom_bp_hit_pc(0),
       return_target_count(0)
 {
     memset(patches, 0, sizeof(patches));
@@ -265,6 +266,7 @@ void BrkDebugSession :: request_reset_cancel(void)
         debug_context_reset(&last_context);
         has_resume_context = false;
         debug_context_reset(&resume_context);
+        rom_bp_hit_pc_valid = false;
     }
     reset_cancel_requested = true;
 }
@@ -1146,8 +1148,20 @@ void BrkDebugSession :: release_to_run(const DebugContext *from,
             recommit_visible_rom_fetch_byte(from->pc, execution_cpu_port(from)) ||
             visible_rom_recommitted;
     }
-    if (visible_rom_recommitted) {
-        settle_visible_rom_for_live_fetch();
+    // Only the first step resuming where a free-run breakpoint just trapped in
+    // visible ROM needs the sustained settle: that fetch line still holds the BRK
+    // and only a continuous run refreshes it.
+    bool sustained_settle = false;
+    if (from && from->valid && rom_bp_hit_pc_valid &&
+            from->pc == rom_bp_hit_pc) {
+        sustained_settle = true;
+        rom_bp_hit_pc_valid = false;
+    }
+    // Settle ONLY for that re-trap. On a plain forward step the settle's extra
+    // stop/resume cycle frees the 6510 briefly and lets it run past the BRK; the
+    // recommit writes above already place the BRK in the stopped ROM image.
+    if (visible_rom_recommitted && sustained_settle) {
+        settle_visible_rom_for_live_fetch(sustained_settle);
     }
     poke_visible(SENTINEL_ADDR, 0x00);
     poke_visible(STORE_TRAP_MODE, 0x00);
@@ -1235,7 +1249,8 @@ void BrkDebugSession :: reset_spin_target(void)
 }
 
 void BrkDebugSession :: nmi_redirect_to(uint16_t target, uint8_t cpu_port,
-                                        bool force_cpu_port, bool staged)
+                                        bool force_cpu_port, bool staged,
+                                        bool sustained_settle)
 {
     bool clean = has_banked_ram_patch();
     bool stopped_it = clean ? begin_clean_stopped_session() : begin_stopped_session();
@@ -1308,8 +1323,10 @@ void BrkDebugSession :: nmi_redirect_to(uint16_t target, uint8_t cpu_port,
     if (recommit_visible_rom_patches()) {
         visible_rom_recommitted = true;
     }
-    if (visible_rom_recommitted) {
-        settle_visible_rom_for_live_fetch();
+    // Settle only on the bp-hit re-trap (see release_to_run): on a plain launch
+    // the extra stop/resume frees the 6510 and lets it run past the BRK.
+    if (visible_rom_recommitted && sustained_settle) {
+        settle_visible_rom_for_live_fetch(sustained_settle);
     }
     // Clear the sentinel as the last act before releasing the CPU, while it is
     // still stopped and therefore cannot set it. In freeze mode the run window
@@ -1842,6 +1859,15 @@ DebugSession::Result BrkDebugSession :: go(const DebugContext &from,
     cpu_parked_in_spin = true;
     last_context = captured;
     has_last_context = true;
+    // A free-run breakpoint hit in visible ROM leaves the live fetch path holding
+    // the BRK for this PC. Flag it so the next step launched from here gets the
+    // one-shot sustained ROM-fetch settle (see release_to_run / the member note).
+    if (captured.valid &&
+            monitor_backing_store_is_visible_rom(
+                monitor_backing_store_for_cpu_port(captured.pc, cpu_port))) {
+        rom_bp_hit_pc_valid = true;
+        rom_bp_hit_pc = captured.pc;
+    }
     end_run_window();
     return DBG_OK;
 }
