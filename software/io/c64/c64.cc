@@ -41,14 +41,14 @@
 
 #if U64
 // Pristine FPGA ROM-image snapshot + dirty flag. The machine-code monitor's debug
-// engine steps RAM-under-ROM and KERNAL/BASIC ROM by patching BRK traps directly
-// into the FPGA ROM-image buffers (U64_*_BASE). If such a patch is not restored
-// before a reset (e.g. a REST reset fired while the debug CPU is parked), the
-// stale byte stays in the KERNAL image and the next C64 reset executes it during
-// early boot, wedging the machine (blank screen, no READY, frozen jiffy) with no
-// recovery short of a JTAG ROM reload. To make every reset self-healing we capture
-// the authoritative ROM image once it is loaded (init_system_roms) and re-apply it
-// on reset whenever the monitor has flagged the image dirty.
+// engine steps RAM-under-ROM and KERNAL/BASIC ROM by patching BRK traps into the
+// volatile FPGA ROM-image buffers (U64_*_BASE). No flash, firmware image, ROM
+// file, or configured cartridge storage is changed; a device cold boot reloads
+// those ROM images through init_system_roms(). The snapshot below is only a warm
+// C64-reset safety net: if a reset fires while a debug trap is still present, the
+// stale byte could otherwise be fetched by the next C64 boot attempt. We capture
+// the freshly loaded authoritative image and re-apply it during reset so warm
+// resets are self-healing too.
 namespace {
     uint8_t s_pristine_kernal[8192];
     uint8_t s_pristine_basic[8192];
@@ -648,11 +648,9 @@ void C64::resume(void)
 void C64::reset(void)
 {
 #if U64
-    // Heal any debug BRK patch the monitor left in the FPGA ROM image before the
-    // CPU starts executing the reset/boot code, so a leaked KERNAL/BASIC byte can
-    // never wedge the boot. The dirty flag is still maintained for diagnostics,
-    // but reset is the recovery chokepoint and must be robust even if a stale
-    // patch path failed to mark the image dirty.
+    // Heal any debug BRK patch left in the volatile FPGA ROM image before the CPU
+    // starts executing reset/boot code. A cold device boot reloads the configured
+    // ROM images; this restore keeps warm C64 resets equally self-healing.
     restore_pristine_rom_image();
 #endif
     C64_MODE = MODE_NORMAL;
@@ -992,7 +990,7 @@ void C64::init_system_roms(void)
     }
 
     // The ROM image is now authoritative (freshly loaded from config). Snapshot it
-    // so reset() can heal any debug BRK patch left in the FPGA ROM image.
+    // so reset() can heal any debug BRK patch left in the volatile FPGA ROM image.
     capture_pristine_rom_image();
 
 #else
