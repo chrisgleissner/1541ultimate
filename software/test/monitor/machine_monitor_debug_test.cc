@@ -4336,6 +4336,8 @@ static int test_debug_ownership_blocks_second_stakeholder_until_remote_expires()
 {
     FakeFreezeMachine telnet_owner(false);
     FakeFreezeMachine local_owner(false);
+    FakeFreezeMachine leaked_local_owner(false);
+    FakeFreezeMachine reclaiming_telnet_owner(false);
 
     set_fake_ms_timer(100);
     if (expect(telnet_owner.claim_debug_ownership(true),
@@ -4348,6 +4350,15 @@ static int test_debug_ownership_blocks_second_stakeholder_until_remote_expires()
                "A stale remote owner must expire so a new stakeholder can claim Debug")) return 1;
     local_owner.release_debug_ownership();
     telnet_owner.release_debug_ownership();
+
+    set_fake_ms_timer(1000);
+    if (expect(leaked_local_owner.claim_debug_ownership(false),
+               "Initial local stakeholder must claim debug ownership")) return 1;
+    advance_fake_ms_timer(3501);
+    if (expect(reclaiming_telnet_owner.claim_debug_ownership(true),
+               "A stale local owner must expire so a later telnet session can claim Debug")) return 1;
+    reclaiming_telnet_owner.release_debug_ownership();
+    leaked_local_owner.release_debug_ownership();
     return 0;
 }
 
@@ -4759,7 +4770,7 @@ static int test_debug_next_opcode_bracket_markers()
 
 // --- Debug header/footer colour ---------------------------------------------
 // Header mode/address tokens and breakpoint rows use color_fg.
-// In Debug footer labels, PC/A/X/Y/SP and active flag letters use the primary
+// In Debug footer labels, PC/A/X/Y/S and active flag letters use the primary
 // accent; in the value row, PC/AC/XR/YR/SP and the SR bit string use the
 // primary accent while IRQ/NMI stay in color_fg.
 
@@ -4821,7 +4832,6 @@ static int test_debug_footer_value_highlight_policy()
         MonitorDebug::FOOTER_POS_XR + 0,
         MonitorDebug::FOOTER_POS_YR + 0,
         MonitorDebug::FOOTER_POS_SP + 0,
-        MonitorDebug::FOOTER_POS_SP + 1,
         MonitorDebug::FOOTER_POS_FLAGS + 3,
         MonitorDebug::FOOTER_POS_FLAGS + 5,
         MonitorDebug::FOOTER_POS_FLAGS + 7,
