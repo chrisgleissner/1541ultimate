@@ -63,7 +63,7 @@ struct MachineMonitorState
     uint8_t disasm_offset;
     bool illegal_enabled;
     uint8_t screen_charset;
-    uint8_t cpu_port;
+    uint8_t view_cpu_port;
 };
 
 struct Clipboard {
@@ -79,10 +79,16 @@ struct Cursor {
 const char *monitor_error_text(MonitorError error);
 void monitor_reset_saved_state(void);
 void monitor_invalidate_saved_state(void);
+void monitor_reset_saved_cpu_view(void);
 void monitor_apply_go(MachineMonitorState *state, uint16_t address);
 void monitor_format_hex_row(uint16_t address, const uint8_t *bytes, char *out);
 void monitor_format_text_row(uint16_t address, const uint8_t *bytes, int count, bool screen_codes, char *out);
-void monitor_format_status_line(char *out, uint8_t port01, uint8_t vic_bank);
+void monitor_format_status_line(char *out, uint8_t view_cpu_port, uint8_t vic_bank);
+void monitor_format_status_line(char *out, uint8_t view_cpu_port, uint8_t live_cpu_port,
+                                uint8_t vic_bank);
+void monitor_format_breakpoint_mismatch(char *out, int out_len,
+                                        MonitorBackingStore target,
+                                        MonitorBackingStore current);
 
 MonitorError monitor_parse_address(const char *text, uint16_t *address);
 MonitorError monitor_parse_expression(const char *text, uint16_t *value);
@@ -195,7 +201,7 @@ class MachineMonitor : public UIObject
     uint8_t asm_edit_pending;
     enum { ASM_LANE_MAX_ROWS = 256 };
     mutable bool asm_lane_valid;
-    mutable uint8_t asm_lane_cpu_port;
+    mutable uint8_t asm_lane_view_cpu_port;
     mutable bool asm_lane_illegal_enabled;
     mutable uint16_t asm_lane_rows[ASM_LANE_MAX_ROWS];
     mutable uint8_t asm_lane_lengths[ASM_LANE_MAX_ROWS];
@@ -239,8 +245,12 @@ class MachineMonitor : public UIObject
     bool debug_run_window_refreeze_enabled;
     bool reset_exits_monitor;
     bool reset_exit_pending;
+    bool release_host_after_exit;
     bool reopen_after_reset;
+    bool reopen_on_debug_reset;
     bool restore_debug_after_reset;
+    bool deferred_debug_go_pending;
+    DebugContext deferred_debug_go_context;
     bool breakpoint_popup_active;
     uint8_t breakpoint_selected;
     bool bookmark_popup_active;
@@ -361,6 +371,9 @@ class MachineMonitor : public UIObject
     void debug_request_cursor(void);
     bool debug_has_breakpoint(void) const;
     bool debug_has_enabled_breakpoint(void) const;
+    MonitorBackingStore breakpoint_target_for_view(uint16_t address) const;
+    MonitorBackingStore breakpoint_target_for_live_cpu(uint16_t address) const;
+    void show_breakpoint_mapping_note(uint16_t address, MonitorBackingStore target);
     void debug_toggle_breakpoint(void);
     void debug_open_breakpoint_popup(void);
     void edit_breakpoint_label(uint8_t slot);
@@ -382,6 +395,7 @@ class MachineMonitor : public UIObject
     // No-op in overlay mode because overlay sessions disable freeze/refreeze
     // run windows.
     void debug_full_restore_screen(void);
+    void restore_underlying_status_row(void);
     void draw_debug_footer(void);
     void dismiss_bookmark_status(void);
     bool update_bookmark_status(void);
@@ -447,6 +461,7 @@ class MachineMonitor : public UIObject
     bool disasm_same_source(uint16_t a, uint16_t b) const;
     bool disasm_crosses_source_boundary(uint16_t start, uint16_t end) const;
     bool disasm_is_io_source(uint16_t address) const;
+    bool disasm_explicitly_targets(uint16_t candidate, uint16_t address) const;
     bool disasm_find_prev_addr(uint16_t address, uint16_t *previous) const;
     bool    asm_is_branch(uint16_t address);
     uint8_t asm_edit_part_count(uint16_t address);
@@ -468,7 +483,11 @@ public:
     MachineMonitor(UserInterface *ui, MemoryBackend *backend);
     void set_debug_run_window_refreeze_enabled(bool enabled);
     void set_reset_exits_monitor(bool enabled);
+    bool consume_release_host_after_exit(void);
+    bool has_deferred_debug_go(void) const { return deferred_debug_go_pending; }
+    void dispatch_deferred_debug_go(void);
     void request_reopen_after_reset(void);
+    void request_debug_reset_cancel(void);
     bool consume_reopen_after_reset(void);
     void init(Screen *screen, Keyboard *keyboard);
     void deinit(void);

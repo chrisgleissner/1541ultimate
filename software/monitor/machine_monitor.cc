@@ -68,6 +68,13 @@ static MachineMonitorState monitor_saved_state = {
 static bool monitor_reset_reopen_state_valid = false;
 static MachineMonitorState monitor_reset_reopen_state;
 static bool monitor_reset_reopen_debug_active = false;
+// Set on every C64 hardware reset (REST / C=+X / RESET button). The next fresh
+// monitor open syncs its view bank to the live CPU bank so re-entry decodes the
+// memory the CPU actually sees (e.g. RAM-under-ROM when $01 low bits are 5),
+// instead of carrying a stale exploratory view or a hardcoded ROM (bank 7) view.
+// This does NOT touch ordinary close/reopen (no intervening reset), so manual
+// O bank exploration still persists across those opens.
+static bool monitor_sync_view_to_live_on_open = false;
 
 // Process-lifetime breakpoint storage. Survives monitor close/reopen, the
 // C=+X reset reentry path, and Stop-Debugging cleanup, but is volatile RAM
@@ -91,9 +98,13 @@ static MachineMonitorState monitor_reset_reentry_state(const MachineMonitorState
     sanitized.current_addr = source.current_addr;
     sanitized.base_addr = source.base_addr;
     sanitized.disasm_offset = source.disasm_offset;
+    if (source.view == MONITOR_VIEW_ASM) {
+        sanitized.base_addr = source.current_addr;
+        sanitized.disasm_offset = 0;
+    }
     sanitized.illegal_enabled = source.illegal_enabled;
     sanitized.screen_charset = source.screen_charset;
-    sanitized.cpu_port = source.cpu_port;
+    sanitized.view_cpu_port = source.view_cpu_port;
     return sanitized;
 }
 
@@ -1017,22 +1028,34 @@ static uint8_t normalize_cpu_mode(uint8_t cpu_port)
     return cpu_port & 0x07;
 }
 
-static void format_status_line_impl(char *line, uint8_t port01, uint8_t vic_bank)
+static void format_status_line_impl(char *line, uint8_t view_cpu_port,
+                                    uint8_t live_cpu_port, uint8_t vic_bank)
 {
-    uint8_t cpu_bank = port01 & 0x07;
-    const MonitorCpuStatusFields *fields = &monitor_cpu_status_fields[cpu_bank];
+    uint8_t monitor_bank = view_cpu_port & 0x07;
+    uint8_t cpu_bank = live_cpu_port & 0x07;
+    const MonitorCpuStatusFields *fields = &monitor_cpu_status_fields[monitor_bank];
     uint16_t vic_base;
     int pos;
 
     vic_bank &= 0x03;
     vic_base = monitor_vic_bank_bases[vic_bank];
 
-    sprintf(line, "CPU%c $A:%s $D:%s $E:%s VIC%c $",
-            (char)('0' + cpu_bank),
-            fields->a000,
-            fields->d000,
-            fields->e000,
-            (char)('0' + vic_bank));
+    if (cpu_bank == monitor_bank) {
+        sprintf(line, "CPU%c $A:%s $D:%s $E:%s VIC%c $",
+                (char)('0' + cpu_bank),
+                fields->a000,
+                fields->d000,
+                fields->e000,
+                (char)('0' + vic_bank));
+    } else {
+        sprintf(line, "C%cO%c $A:%s $D:%s $E:%s VIC%c $",
+                (char)('0' + cpu_bank),
+                (char)('0' + monitor_bank),
+                fields->a000,
+                fields->d000,
+                fields->e000,
+                (char)('0' + vic_bank));
+    }
     pos = strlen(line);
     dump_hex_word(line, pos, vic_base);
     line[pos + 4] = 0;
@@ -1081,9 +1104,30 @@ uint8_t monitor_screen_code_for_char(char c, uint8_t screen_charset)
     return 0xFF;
 }
 
-void monitor_format_status_line(char *line, uint8_t port01, uint8_t vic_bank)
+void monitor_format_status_line(char *line, uint8_t view_cpu_port, uint8_t vic_bank)
 {
-    format_status_line_impl(line, port01, vic_bank);
+    format_status_line_impl(line, view_cpu_port, view_cpu_port, vic_bank);
+}
+
+void monitor_format_status_line(char *line, uint8_t view_cpu_port,
+                                uint8_t live_cpu_port, uint8_t vic_bank)
+{
+    format_status_line_impl(line, view_cpu_port, live_cpu_port, vic_bank);
+}
+
+void monitor_format_breakpoint_mismatch(char *out, int out_len,
+                                        MonitorBackingStore target,
+                                        MonitorBackingStore current)
+{
+    if (!out || out_len <= 0) {
+        return;
+    }
+    sprintf(out, "BRK %s, CPU %s; not mapped now",
+            monitor_backing_store_tag(target),
+            monitor_backing_store_tag(current));
+    if ((int)strlen(out) >= out_len) {
+        out[out_len - 1] = 0;
+    }
 }
 
 const char *monitor_error_text(MonitorError error)
@@ -1109,7 +1153,7 @@ void monitor_reset_saved_state(void)
     monitor_saved_state.disasm_offset = 0;
     monitor_saved_state.illegal_enabled = false;
     monitor_saved_state.screen_charset = MONITOR_SCREEN_CHARSET_UPPER_GRAPHICS;
-    monitor_saved_state.cpu_port = 0x07;
+    monitor_saved_state.view_cpu_port = 0x07;
     monitor_reset_reopen_state_valid = false;
     monitor_reset_reopen_debug_active = false;
 
@@ -1137,6 +1181,21 @@ void monitor_invalidate_saved_state(void)
     monitor_saved_state_valid = false;
     monitor_reset_reopen_state_valid = false;
     monitor_reset_reopen_debug_active = false;
+}
+
+void monitor_reset_saved_cpu_view(void)
+{
+    // Called on a C64 hardware reset. Rather than hardcoding CPU7 (which is only
+    // correct when the post-reset CPU actually banks ROM in, and otherwise leaves
+    // the monitor showing ROM while the live CPU runs RAM-under-ROM -> the C5O7
+    // footer mismatch), request that the next fresh monitor open sync its view
+    // bank to the live CPU bank. 0x07 is kept as the persisted fallback for the
+    // case where the next open cannot read a live CPU port.
+    monitor_saved_state.view_cpu_port = 0x07;
+    if (monitor_reset_reopen_state_valid) {
+        monitor_reset_reopen_state.view_cpu_port = 0x07;
+    }
+    monitor_sync_view_to_live_on_open = true;
 }
 
 void monitor_apply_go(MachineMonitorState *state, uint16_t address)
@@ -1815,7 +1874,7 @@ MachineMonitor :: MachineMonitor(UserInterface *ui, MemoryBackend *mem_backend) 
         state.disasm_offset = 0;
         state.illegal_enabled = false;
         state.screen_charset = MONITOR_SCREEN_CHARSET_UPPER_GRAPHICS;
-        state.cpu_port = 0x07;
+        state.view_cpu_port = 0x07;
     }
     state.screen_charset = normalize_screen_charset(state.screen_charset);
     last_load_use_prg = monitor_last_load_use_prg;
@@ -1876,7 +1935,7 @@ MachineMonitor :: MachineMonitor(UserInterface *ui, MemoryBackend *mem_backend) 
     asm_edit_part = 0;
     asm_edit_pending = 0;
     asm_lane_valid = false;
-    asm_lane_cpu_port = 0;
+    asm_lane_view_cpu_port = 0;
     asm_lane_illegal_enabled = false;
     asm_lane_count = 0;
     asm_lane_top = 0;
@@ -1906,7 +1965,11 @@ MachineMonitor :: MachineMonitor(UserInterface *ui, MemoryBackend *mem_backend) 
     debug_run_window_refreeze_enabled = false;
     reset_exits_monitor = false;
     reset_exit_pending = false;
+    release_host_after_exit = false;
     reopen_after_reset = false;
+    reopen_on_debug_reset = true;
+    deferred_debug_go_pending = false;
+    debug_context_reset(&deferred_debug_go_context);
     // Restore breakpoints from process-lifetime storage so they survive a
     // C=+X reset reentry and an ordinary monitor close/reopen. Power-off
     // clears `monitor_saved_breakpoints` because it lives in volatile RAM.
@@ -1941,12 +2004,39 @@ void MachineMonitor :: set_reset_exits_monitor(bool enabled)
     reset_exits_monitor = enabled;
 }
 
+bool MachineMonitor :: consume_release_host_after_exit(void)
+{
+    bool ret = release_host_after_exit;
+    release_host_after_exit = false;
+    return ret;
+}
+
 void MachineMonitor :: request_reopen_after_reset(void)
 {
     monitor_reset_reopen_state = monitor_reset_reentry_state(state);
     monitor_reset_reopen_state_valid = true;
     monitor_reset_reopen_debug_active = debug.is_active();
     reopen_after_reset = true;
+    reopen_on_debug_reset = true;
+    if (debug_session) {
+        debug_session->request_reset_cancel();
+    }
+}
+
+void MachineMonitor :: request_debug_reset_cancel(void)
+{
+    // Cancels any in-flight debug sentinel wait without scheduling a monitor
+    // reopen. Used by the REST reset path so the debug engine tears down its
+    // BRK patches and handler before the machine reset pulse fires, without
+    // treating the REST reset as a user-initiated "C=+X while in the monitor"
+    // event that would cause the monitor to reopen.
+    reopen_after_reset = false;
+    reopen_on_debug_reset = false;
+    monitor_reset_reopen_state_valid = false;
+    monitor_reset_reopen_debug_active = false;
+    if (debug_session) {
+        debug_session->request_reset_cancel();
+    }
 }
 
 bool MachineMonitor :: consume_reopen_after_reset(void)
@@ -1984,7 +2074,7 @@ void MachineMonitor :: apply_go_local(uint16_t address)
 {
     uint16_t span = row_span();
     state.current_addr = address;
-    debug_cursor_override = restore_debug_after_reset || !debug.is_active() || !debug.has_context();
+    debug_cursor_override = true;
     if (state.view == MONITOR_VIEW_BINARY) {
         if (span == 0) span = 1;
         state.base_addr = (uint16_t)(address - (address % span));
@@ -3178,7 +3268,7 @@ void MachineMonitor :: capture_bookmark(MonitorBookmarkSlot *bookmark) const
     cursor = active_cursor();
     bookmark->address = cursor.address;
     bookmark->view = (uint8_t)state.view;
-    bookmark->cpu_bank = (uint8_t)(state.cpu_port & 0x07);
+    bookmark->cpu_bank = (uint8_t)(state.view_cpu_port & 0x07);
     bookmark->vic_bank = (uint8_t)(current_vic_bank & 0x03);
     switch (state.view) {
         case MONITOR_VIEW_HEX:
@@ -3211,9 +3301,9 @@ bool MachineMonitor :: restore_location(const MonitorBookmarkSlot *bookmark)
     }
 
     if (backend && backend->supports_cpu_banking()) {
-        state.cpu_port = (uint8_t)(bookmark->cpu_bank & 0x07);
-        backend->set_monitor_cpu_port(state.cpu_port);
-    } else if ((state.cpu_port & 0x07) != (bookmark->cpu_bank & 0x07)) {
+        state.view_cpu_port = (uint8_t)(bookmark->cpu_bank & 0x07);
+        backend->set_monitor_cpu_port(state.view_cpu_port);
+    } else if ((state.view_cpu_port & 0x07) != (bookmark->cpu_bank & 0x07)) {
         return false;
     }
 
@@ -3498,7 +3588,7 @@ int MachineMonitor :: bookmark_popup_handle_key(int key)
     if (key == KEY_DELETE || key == KEY_BACK) {
         if (bookmarks) {
             bookmarks->reset_slot_to_default(bookmark_selected,
-                                             (uint8_t)(state.cpu_port & 0x07),
+                                             (uint8_t)(state.view_cpu_port & 0x07),
                                              (uint8_t)(current_vic_bank & 0x03));
             const MonitorBookmarkSlot *reset = bookmarks->get(bookmark_selected);
             show_bookmark_status(bookmark_selected, reset, MONITOR_BOOKMARK_STATUS_LABEL_RESET);
@@ -3598,7 +3688,7 @@ void MachineMonitor :: disasm_lane_sync_state(void)
 void MachineMonitor :: disasm_lane_reset(uint16_t address)
 {
     asm_lane_valid = true;
-    asm_lane_cpu_port = (uint8_t)(state.cpu_port & 0x07);
+    asm_lane_view_cpu_port = (uint8_t)(state.view_cpu_port & 0x07);
     asm_lane_illegal_enabled = state.illegal_enabled;
     asm_lane_rows[0] = address;
     asm_lane_lengths[0] = 0;
@@ -3675,14 +3765,14 @@ void MachineMonitor :: disasm_lane_extend_forward_to(int index) const
 void MachineMonitor :: disasm_lane_ensure(void) const
 {
     if (asm_lane_valid &&
-        asm_lane_cpu_port == (uint8_t)(state.cpu_port & 0x07) &&
+        asm_lane_view_cpu_port == (uint8_t)(state.view_cpu_port & 0x07) &&
         asm_lane_illegal_enabled == state.illegal_enabled &&
         asm_lane_count > 0) {
         return;
     }
 
     asm_lane_valid = true;
-    asm_lane_cpu_port = (uint8_t)(state.cpu_port & 0x07);
+    asm_lane_view_cpu_port = (uint8_t)(state.view_cpu_port & 0x07);
     asm_lane_illegal_enabled = state.illegal_enabled;
     asm_lane_rows[0] = state.base_addr;
     asm_lane_lengths[0] = 0;
@@ -3825,6 +3915,29 @@ bool MachineMonitor :: disasm_is_io_source(uint16_t address) const
     return strcmp(source ? source : "", "IO") == 0;
 }
 
+bool MachineMonitor :: disasm_explicitly_targets(uint16_t candidate, uint16_t address) const
+{
+    uint8_t bytes[3];
+
+    read_row(candidate, bytes, 3);
+    if (bytes[0] == 0x4C) {
+        uint16_t target = (uint16_t)(bytes[1] | ((uint16_t)bytes[2] << 8));
+        return target == address;
+    }
+    switch (bytes[0]) {
+        case 0x10: case 0x30: case 0x50: case 0x70:
+        case 0x90: case 0xB0: case 0xD0: case 0xF0:
+        {
+            int8_t rel = (int8_t)bytes[1];
+            uint16_t target = (uint16_t)(candidate + 2 + rel);
+            return target == address;
+        }
+        default:
+            break;
+    }
+    return false;
+}
+
 uint16_t MachineMonitor :: disasm_next_addr(uint16_t address) const
 {
     if (address == 0xFFFF) {
@@ -3872,12 +3985,19 @@ bool MachineMonitor :: disasm_find_prev_addr(uint16_t address, uint16_t *previou
     for (int back = 3; back >= 1; back--) {
         uint16_t candidate = (uint16_t)(address - back);
         if (disasm_length(candidate) == (uint16_t)back) {
+            bool crosses_source = disasm_crosses_source_boundary(candidate,
+                                                                 address);
             int score = 0;
 
+            if (crosses_source &&
+                    (disasm_is_io_source(candidate) || disasm_is_io_source(address)) &&
+                    !disasm_explicitly_targets(candidate, address)) {
+                continue;
+            }
             if (disasm_same_source(candidate, address)) {
                 score += 8;
             }
-            if (!disasm_crosses_source_boundary(candidate, address)) {
+            if (!crosses_source) {
                 score += 4;
             }
             if (!disasm_is_io_source(candidate)) {
@@ -4282,9 +4402,34 @@ void MachineMonitor :: draw_status()
         sprintf(line, "CPU VIEW  VIC%d $%04X", current_vic_bank & 0x03,
                 monitor_vic_bank_bases[current_vic_bank & 0x03]);
     } else if (backend && !backend->supports_vic_bank()) {
-        sprintf(line, "CPU%d  VIC N/A", state.cpu_port & 0x07);
+        uint8_t live_cpu_port = backend ? backend->get_live_cpu_port() : state.view_cpu_port;
+        if ((state.view_cpu_port & 0x07) == (live_cpu_port & 0x07)) {
+            sprintf(line, "CPU%d  VIC N/A", state.view_cpu_port & 0x07);
+        } else {
+            bool accent_mask[40];
+            sprintf(line, "C%dO%d  VIC N/A", live_cpu_port & 0x07,
+                    state.view_cpu_port & 0x07);
+            memset(accent_mask, 0, sizeof(accent_mask));
+            accent_mask[1] = true;
+            accent_mask[3] = true;
+            draw_with_style_mask(window, window->get_size_y() - 1, line, strlen(line),
+                                 NULL, accent_mask,
+                                 get_ui()->color_fg, MONITOR_UI_ACCENT_COLOR);
+            return;
+        }
     } else {
-        monitor_format_status_line(line, state.cpu_port, current_vic_bank);
+        uint8_t live_cpu_port = backend ? backend->get_live_cpu_port() : state.view_cpu_port;
+        bool accent_mask[40];
+        monitor_format_status_line(line, state.view_cpu_port, live_cpu_port, current_vic_bank);
+        if ((state.view_cpu_port & 0x07) != (live_cpu_port & 0x07)) {
+            memset(accent_mask, 0, sizeof(accent_mask));
+            accent_mask[1] = true;
+            accent_mask[3] = true;
+            draw_with_style_mask(window, window->get_size_y() - 1, line, strlen(line),
+                                 NULL, accent_mask,
+                                 get_ui()->color_fg, MONITOR_UI_ACCENT_COLOR);
+            return;
+        }
     }
     draw_padded(window, window->get_size_y() - 1, line, strlen(line));
 }
@@ -4301,8 +4446,31 @@ void MachineMonitor :: debug_full_restore_screen(void)
     }
     if (screen) {
         get_ui()->set_screen_title();
+        restore_underlying_status_row();
     }
     redraw_full();
+}
+
+void MachineMonitor :: restore_underlying_status_row(void)
+{
+    if (!screen || !get_ui()) {
+        return;
+    }
+    UIObject *root = get_ui()->get_root_object();
+    if (root) {
+        root->redraw();
+    }
+    const char *help = "F3=HELP";
+    int width = screen->get_size_x();
+    int height = screen->get_size_y();
+    int x = width - (int)strlen(help) - 1;
+    if (x < 0) {
+        x = 0;
+    }
+    screen->move_cursor(x, height - 1);
+    screen->output("\eA");
+    screen->output(help);
+    screen->output("\eO");
 }
 
 void MachineMonitor :: draw_debug_footer()
@@ -4896,8 +5064,15 @@ void MachineMonitor :: draw_disassembly()
         int brk_pos = -1;
         bool reverse_mask[MONITOR_DISASM_ROW_CHARS];
         bool accent_mask[MONITOR_DISASM_ROW_CHARS];
+        bool debug_next_row = debug.is_active() && debug.has_context() &&
+                              debug.context().valid && addr == debug.context().pc;
 
-        if (row_len) {
+        if (debug_next_row && debug_session &&
+                debug_session->read_step_bytes(addr, row_bytes, 3)) {
+            // Execution-facing PC row: use the live $0001 mapping, not the
+            // monitor view selected by O.
+            row_len = 0;
+        } else if (row_len) {
             int lane_index = asm_lane_top + line_idx;
             memset(row_bytes, 0, sizeof(row_bytes));
             if (lane_index >= 0 && lane_index < asm_lane_count) {
@@ -4925,9 +5100,7 @@ void MachineMonitor :: draw_disassembly()
         // The next-to-execute instruction (the captured debug PC) is decorated
         // independently of the movable cursor, so the user can scroll/move the
         // cursor while still seeing what will run next.
-        bool debug_next_row = debug.is_active() && debug.has_context() &&
-                              debug.context().valid && row_len != 0 &&
-                              addr == debug.context().pc;
+        debug_next_row = debug_next_row && row_len != 0;
         // For an RTS on the debug PC row, render the return address inferred
         // from the stack as "$XXXX" so it can be highlighted just like a
         // JMP/JSR/branch target. rts_target_col is the column of the '$' within
@@ -4962,8 +5135,12 @@ void MachineMonitor :: draw_disassembly()
         line[13] = ' ';
         line[14] = ' ';
 
-        bp_slot = breakpoints.find_at(addr);
-        source = monitor_source_indicator(backend->source_name(addr));
+        MonitorBackingStore row_target = debug_next_row ?
+            breakpoint_target_for_live_cpu(addr) : breakpoint_target_for_view(addr);
+        bp_slot = breakpoints.find_at(addr, row_target);
+        source = debug_next_row ?
+            monitor_source_indicator(monitor_backing_store_source_name(row_target)) :
+            monitor_source_indicator(backend->source_name(addr));
         source_len = (int)strlen(source);
         if (source_len > 3) {
             source_len = 3;
@@ -5852,6 +6029,7 @@ bool MachineMonitor :: debug_enter()
         redraw_full();
         return false;
     }
+    debug.invalidate_context();
     debug.enter();
     if (restore_debug_after_reset) {
         debug_cursor_override = true;
@@ -5869,6 +6047,9 @@ bool MachineMonitor :: debug_enter()
     DebugContext captured;
     debug_entry_context_valid = false;
     debug_context_reset(&debug_entry_context);
+    if (debug_cursor_override) {
+        debug.invalidate_context();
+    }
     bool skip_capture = debug_cursor_override && backend &&
         disassembler_6502_is_illegal(backend->read(state.current_addr));
     if (!restore_debug_after_reset && !skip_capture && debug_capture_context(&captured)) {
@@ -6030,6 +6211,23 @@ void MachineMonitor :: debug_cleanup_session()
     }
 }
 
+void MachineMonitor :: dispatch_deferred_debug_go(void)
+{
+    if (!deferred_debug_go_pending) {
+        return;
+    }
+    deferred_debug_go_pending = false;
+    if (debug_session) {
+        debug_session->cleanup_to_context(&deferred_debug_go_context);
+        delete debug_session;
+        debug_session = NULL;
+    }
+    debug_context_reset(&deferred_debug_go_context);
+    if (backend) {
+        backend->end_session();
+    }
+}
+
 bool MachineMonitor :: debug_capture_context(DebugContext *out)
 {
     if (!out) {
@@ -6049,20 +6247,34 @@ bool MachineMonitor :: debug_handle_terminal_result(DebugSession::Result result)
     if (result != DebugSession::DBG_RESET) {
         return false;
     }
-    request_reopen_after_reset();
     monitor_log("debug reset-result");
+    if (reopen_on_debug_reset) {
+        request_reopen_after_reset();
+    } else {
+        reopen_after_reset = false;
+        monitor_reset_reopen_state_valid = false;
+        monitor_reset_reopen_debug_active = false;
+    }
     clear_pending_go();
-    restore_debug_after_reset = debug.is_active();
+    restore_debug_after_reset = reopen_on_debug_reset && debug.is_active();
     if (restore_debug_after_reset) {
         debug_cursor_override = true;
     }
     debug.invalidate_context();
     debug_cleanup_session();
-    if (screen) {
+    // Direct render targets (Freeze/Overlay) draw into the live C64 screen via
+    // `screen`. reset_machine() has just unfrozen + reset the C64, so it now owns
+    // its screen RAM again: redrawing the monitor here would paint the monitor
+    // chrome onto the booting C64 screen. These modes exit + reopen, and the
+    // reopen re-takes ownership before repainting, so skip the redraw here.
+    // Non-direct hosts (e.g. Telnet) keep their own screen and stay open, so they
+    // still need the refresh.
+    if (screen && !reset_exits_monitor) {
         get_ui()->set_screen_title();
         redraw_full();
     }
-    reset_exit_pending = reset_exits_monitor;
+    reset_exit_pending = reopen_on_debug_reset ? reset_exits_monitor : true;
+    reopen_on_debug_reset = true;
     return true;
 }
 
@@ -6093,7 +6305,11 @@ int MachineMonitor :: handle_reset_shortcut(void)
         redraw_full();
         return 0;
     }
-    if (screen) {
+    // See debug_handle_terminal_result(): for direct render targets the C64 owns
+    // its screen again immediately after reset_machine(), so a redraw here would
+    // smear the monitor onto the booting C64 screen. The exit + reopen repaints
+    // with ownership re-taken; only non-direct hosts (Telnet) need this refresh.
+    if (screen && !reset_exits_monitor) {
         get_ui()->set_screen_title();
         redraw_full();
     }
@@ -6369,7 +6585,10 @@ void MachineMonitor :: debug_request_out()
 void MachineMonitor :: debug_request_go()
 {
     DebugContext from = debug.context();
-    if (!from.valid) {
+    if (debug_cursor_override) {
+        debug_context_reset(&from);
+    }
+    if (!from.valid && !debug_cursor_override) {
         DebugContext snap;
         if (debug_capture_context(&snap)) {
             debug.set_context(snap);
@@ -6395,22 +6614,43 @@ void MachineMonitor :: debug_request_go()
     // captured context is already in hand, the session prefers `from.pc`
     // and ignores this fallback.
     uint16_t start_pc = state.current_addr;
-    if (debug_run_window_refreeze_enabled && !debug_has_enabled_breakpoint()) {
-        // Freeze-mode no-breakpoint Go must unwind through run_machine_monitor()
-        // so the C64 freezer ownership is released before execution starts.
+    if (debug_run_window_refreeze_enabled &&
+            !debug_has_enabled_breakpoint() &&
+            from.valid &&
+            session->has_parked_context_handoff()) {
+        // Freeze-mode parked-context G must let the monitor fully tear down
+        // and release ownership before the BRK session hands execution back to
+        // the live machine. Defer that handoff to run_machine_monitor(), which
+        // calls cleanup_to_context() after deinit() and ownership release.
+        last_go_addr = from.pc;
+        last_go_valid = true;
+        deferred_debug_go_pending = true;
+        deferred_debug_go_context = from;
+        release_host_after_exit = true;
+        clear_pending_go();
+        debug.invalidate_context();
+        monitor_log_address("debug go deferred", last_go_addr);
+        return;
+    }
+    if ((debug_run_window_refreeze_enabled || reset_exits_monitor) &&
+            !debug_has_enabled_breakpoint()) {
+        // Direct UI no-breakpoint Go uses the debug session's own parked-spin
+        // release path, then unwinds through run_machine_monitor() so Freeze
+        // releases freezer ownership and Overlay disables the render owner
+        // before execution continues at full speed.
         last_go_addr = from.valid ? from.pc : start_pc;
         last_go_valid = true;
-        go_pending = true;
-        go_pending_addr = last_go_addr;
-        go_pending_has_context = from.valid;
-        if (from.valid) {
-            go_pending_context = from;
-        } else {
-            debug_context_reset(&go_pending_context);
+        DebugSession::Result result = session->go(from, &breakpoints, start_pc);
+        if (debug_handle_terminal_result(result)) {
+            return;
         }
-        if (debug_session) {
-            debug_session->forget_context();
+        if (result != DebugSession::DBG_OK) {
+            printf("MCM debug go $%04X %s\n", last_go_addr,
+                   monitor_debug_result_name(result));
+            return;
         }
+        release_host_after_exit = true;
+        clear_pending_go();
         debug.invalidate_context();
         monitor_log_address("debug go handoff", last_go_addr);
         return;
@@ -6428,6 +6668,7 @@ void MachineMonitor :: debug_request_go()
         if (session->snapshot(&captured) == DebugSession::DBG_OK &&
             captured.valid) {
             debug.set_context(captured);
+            debug_cursor_override = false;
             debug_sync_cursor_to_context();
         }
     } else {
@@ -6502,22 +6743,56 @@ bool MachineMonitor :: debug_has_enabled_breakpoint(void) const
     return false;
 }
 
+MonitorBackingStore MachineMonitor :: breakpoint_target_for_view(uint16_t address) const
+{
+    uint8_t view_cpu_port = state.view_cpu_port & 0x07;
+
+    return backend ? backend->backing_store_for_cpu_port(address, view_cpu_port) :
+        monitor_backing_store_for_cpu_port(address, view_cpu_port);
+}
+
+MonitorBackingStore MachineMonitor :: breakpoint_target_for_live_cpu(uint16_t address) const
+{
+    uint8_t live_cpu_port = backend ? backend->get_live_cpu_port() : state.view_cpu_port;
+
+    return backend ? backend->backing_store_for_cpu_port(address, live_cpu_port) :
+        monitor_backing_store_for_cpu_port(address, live_cpu_port);
+}
+
+void MachineMonitor :: show_breakpoint_mapping_note(uint16_t address,
+                                                    MonitorBackingStore target)
+{
+    MonitorBackingStore current = breakpoint_target_for_live_cpu(address);
+
+    if (target == current) {
+        return;
+    }
+    char msg[40];
+    monitor_format_breakpoint_mismatch(msg, sizeof(msg), target, current);
+    get_ui()->popup(msg, BUTTON_OK);
+    redraw_full();
+}
+
 void MachineMonitor :: debug_toggle_breakpoint()
 {
     uint16_t target = state.current_addr;
-    int existing = breakpoints.find_at(target);
+    MonitorBackingStore backing_store = breakpoint_target_for_view(target);
+    int existing = breakpoints.find_at(target, backing_store);
     if (existing >= 0) {
         breakpoints.clear_slot(existing);
         printf("MCM breakpoint clear %d $%04X\n", existing, target);
         return;
     }
-    int slot = breakpoints.allocate(target, (uint8_t)(state.cpu_port & 0x07));
+    int slot = breakpoints.allocate(target, (uint8_t)(state.view_cpu_port & 0x07),
+                                    backing_store);
     if (slot < 0) {
         get_ui()->popup("NO FREE BRK SLOT", BUTTON_OK);
         redraw_full();
         return;
     }
-    printf("MCM breakpoint set %d $%04X\n", slot, target);
+    printf("MCM breakpoint set %d $%04X %s\n", slot, target,
+           monitor_backing_store_tag(backing_store));
+    show_breakpoint_mapping_note(target, backing_store);
 }
 
 void MachineMonitor :: debug_open_breakpoint_popup()
@@ -6582,6 +6857,10 @@ int MachineMonitor :: debug_breakpoint_popup_handle_key(int key)
         breakpoint_selected = (uint8_t)(key - '0');
         const MonitorBreakpointSlot *bp = breakpoints.get(breakpoint_selected);
         if (bp && bp->used) {
+            state.view_cpu_port = (uint8_t)(bp->view_cpu_port & 0x07);
+            if (backend && backend->supports_cpu_banking()) {
+                backend->set_monitor_cpu_port(state.view_cpu_port);
+            }
             apply_go_local(bp->address);
             printf("MCM breakpoint jump %u $%04X\n", (unsigned)breakpoint_selected, bp->address);
             debug_close_breakpoint_popup();
@@ -6594,6 +6873,10 @@ int MachineMonitor :: debug_breakpoint_popup_handle_key(int key)
     if (key == KEY_RETURN) {
         const MonitorBreakpointSlot *bp = breakpoints.get(breakpoint_selected);
         if (bp && bp->used) {
+            state.view_cpu_port = (uint8_t)(bp->view_cpu_port & 0x07);
+            if (backend && backend->supports_cpu_banking()) {
+                backend->set_monitor_cpu_port(state.view_cpu_port);
+            }
             state.current_addr = bp->address;
             apply_go_local(bp->address);
             printf("MCM breakpoint jump %u $%04X\n", (unsigned)breakpoint_selected, bp->address);
@@ -6603,9 +6886,14 @@ int MachineMonitor :: debug_breakpoint_popup_handle_key(int key)
         return 0;
     }
     if (key == 's' || key == 'S') {
+        MonitorBackingStore backing_store = breakpoint_target_for_view(state.current_addr);
         breakpoints.store_slot(breakpoint_selected, state.current_addr,
-                               (uint8_t)(state.cpu_port & 0x07));
-        printf("MCM breakpoint store %u $%04X\n", (unsigned)breakpoint_selected, state.current_addr);
+                               (uint8_t)(state.view_cpu_port & 0x07),
+                               backing_store);
+        printf("MCM breakpoint store %u $%04X %s\n",
+               (unsigned)breakpoint_selected, state.current_addr,
+               monitor_backing_store_tag(backing_store));
+        show_breakpoint_mapping_note(state.current_addr, backing_store);
         refresh_popup_overlay();
         return 0;
     }
@@ -6772,7 +7060,11 @@ int MachineMonitor :: debug_handle_key(int key)
         draw();
         return 0;
     }
-    if (key == 'o' || key == 'O') {
+    if (key == 'u' || key == 'U') {
+        // Debug-mode Step Out. This deliberately overrides the Assembly-view
+        // undocumented-opcode toggle that 'U' performs outside Debug. 'O'/'o'
+        // are left to fall through to the normal dispatcher so the monitor
+        // view CPU bank can still be cycled while Debug is active.
         debug_request_out();
         if (reset_exit_pending) {
             return MENU_EXIT;
@@ -6785,7 +7077,7 @@ int MachineMonitor :: debug_handle_key(int key)
         if (reset_exit_pending) {
             return MENU_EXIT;
         }
-        if (go_pending) {
+        if (go_pending || release_host_after_exit) {
             return 1;
         }
         draw();
@@ -6820,13 +7112,24 @@ void MachineMonitor :: init(Screen *scr, Keyboard *keyb)
     window->set_color(get_ui()->color_fg);
     content_height = window->get_size_y() - 2;
     backend->begin_session();
-    state.cpu_port = normalize_cpu_mode(state.cpu_port);
+    // After a C64 hardware reset, the next fresh open follows the live CPU bank so
+    // the user re-enters at the memory the CPU actually sees (RAM-under-ROM when
+    // $01 low bits are 5), not a stale/forced view -> fixes the C5O7 mismatch.
+    // Skipped when restoring an in-flight debug session, whose carried view bank
+    // is the authoritative debug-context bank.
+    if (monitor_sync_view_to_live_on_open) {
+        monitor_sync_view_to_live_on_open = false;
+        if (!restore_debug_after_reset && backend->supports_cpu_banking()) {
+            state.view_cpu_port = (uint8_t)(backend->get_live_cpu_port() & 0x07);
+        }
+    }
+    state.view_cpu_port = normalize_cpu_mode(state.view_cpu_port);
     if (backend->supports_cpu_banking()) {
-        backend->set_monitor_cpu_port(state.cpu_port);
+        backend->set_monitor_cpu_port(state.view_cpu_port);
     }
     current_vic_bank = backend->supports_vic_bank() ? backend->get_live_vic_bank() : 0;
     if (bookmarks) {
-        bookmarks->ensure_loaded((uint8_t)(state.cpu_port & 0x07), (uint8_t)(current_vic_bank & 0x03));
+        bookmarks->ensure_loaded((uint8_t)(state.view_cpu_port & 0x07), (uint8_t)(current_vic_bank & 0x03));
     }
     last_live_vic_bank = current_vic_bank;
     vic_bank_override = false;
@@ -6844,7 +7147,7 @@ void MachineMonitor :: deinit(void)
     monitor_saved_state.disasm_offset = 0;
     monitor_saved_state.illegal_enabled = state.illegal_enabled;
     monitor_saved_state.screen_charset = normalize_screen_charset(state.screen_charset);
-    monitor_saved_state.cpu_port = state.cpu_port;
+    monitor_saved_state.view_cpu_port = state.view_cpu_port;
     monitor_saved_state_valid = true;
     monitor_last_load_use_prg = last_load_use_prg;
     monitor_last_load_start = last_load_start;
@@ -6866,8 +7169,10 @@ void MachineMonitor :: deinit(void)
     // Restore every patched byte / vector / trampoline before the backend
     // session ends. Cleanup is idempotent so this is safe even if the user
     // never used Debug mode.
-    debug_cleanup_session();
-    backend->end_session();
+    if (!deferred_debug_go_pending) {
+        debug_cleanup_session();
+        backend->end_session();
+    }
     if (clipboard.data) {
         free(clipboard.data);
         clipboard.data = NULL;
@@ -6938,7 +7243,7 @@ int MachineMonitor :: handle_key(int key)
     // view-switch / file commands while Debug is on.
     if (debug.is_active() && !edit_mode) {
         int r = debug_handle_key(key);
-        if (r >= 0) {
+        if (r != -1) {
             return r;
         }
     } else if (!edit_mode && (key == 'd' || key == 'D')) {
@@ -7036,6 +7341,7 @@ int MachineMonitor :: handle_key(int key)
         }
         if (debug.is_active() && key == KEY_CTRL_D) {
             debug_leave();
+            exit_edit_mode();
             draw();
             return 0;
         }
@@ -7390,9 +7696,9 @@ int MachineMonitor :: handle_key(int key)
                 redraw_full();
                 break;
             }
-            state.cpu_port = next_cpu_mode(state.cpu_port);
-            backend->set_monitor_cpu_port(state.cpu_port);
-            printf("MCM cpu-bank $%02X\n", state.cpu_port);
+            state.view_cpu_port = next_cpu_mode(state.view_cpu_port);
+            backend->set_monitor_cpu_port(state.view_cpu_port);
+            printf("MCM cpu-bank $%02X\n", state.view_cpu_port);
             if (state.view == MONITOR_VIEW_ASM) {
                 restore_disasm_cursor_row(asm_row);
             }

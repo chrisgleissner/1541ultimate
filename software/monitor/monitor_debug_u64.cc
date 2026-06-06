@@ -15,8 +15,13 @@
 #include "u64_machine.h"
 #include "u64.h"
 #include "monitor_file_io.h"
+#include "itu.h"
 #include "FreeRTOS.h"
 #include "task.h"
+
+// Defined in c64.cc: flags the FPGA ROM image as patched so C64::reset() heals it
+// before the booting CPU can execute a stale BRK left in KERNAL/BASIC ROM.
+extern "C" void u64_mark_rom_image_dirty(void) __attribute__((weak));
 
 namespace {
 
@@ -90,21 +95,59 @@ class U64DebugSession : public BrkDebugSession
         rom_patch_shadow[slot].byte = byte;
     }
 
+    void wait_for_cpu_visible_rom_byte(uint16_t addr, uint8_t cpu_port, uint8_t byte)
+    {
+        for (int i = 0; i < 8; i++) {
+            if (machine->peek_cpu(addr, cpu_port) == byte) {
+                return;
+            }
+            vTaskDelay(1);
+        }
+    }
+
 protected:
     virtual bool backend_ready(void) const { return machine != 0; }
     virtual uint8_t current_cpu_port(void) const
     {
         return u64_debug_step_cpu_port(backend);
     }
+    virtual void note_captured_cpu_port(uint8_t cpu_port)
+    {
+        if (backend) {
+            backend->set_observed_live_cpu_port(cpu_port);
+        }
+    }
     virtual bool begin_stopped_session(void) { return machine->begin_stopped_session(); }
     virtual void end_stopped_session(bool stopped_it) { machine->end_stopped_session(stopped_it); }
     virtual uint8_t peek_cpu(uint16_t address, uint8_t cpu_port)
     {
-        return machine->peek_cpu(address, cpu_port);
+        volatile uint8_t *rom = rom_patch_ptr(address, cpu_port);
+        if (rom) {
+            // The U64 ROM image buffers are write targets, not authoritative
+            // read sources on every core. Read through the CPU-visible aperture
+            // so verification sees the byte the 6510 will fetch.
+            return machine->peek_cpu(address, cpu_port);
+        }
+        if (monitor_backing_store_for_cpu_port(address, cpu_port) == MONITOR_BACKING_IO) {
+            return machine->peek_visible(address);
+        }
+        return machine->peek_raw(address);
     }
     virtual void poke_cpu(uint16_t address, uint8_t byte, uint8_t cpu_port)
     {
-        machine->poke_cpu(address, byte, cpu_port);
+        volatile uint8_t *rom = rom_patch_ptr(address, cpu_port);
+        if (rom) {
+            *rom = byte;
+            if (u64_mark_rom_image_dirty) u64_mark_rom_image_dirty();
+            remember_rom_patch_shadow(address, byte, cpu_port);
+            wait_for_cpu_visible_rom_byte(address, cpu_port, byte);
+            return;
+        }
+        if (monitor_backing_store_for_cpu_port(address, cpu_port) == MONITOR_BACKING_IO) {
+            machine->poke_visible(address, byte);
+            return;
+        }
+        machine->poke_raw(address, byte);
     }
     virtual uint8_t peek_visible(uint16_t address)
     {
@@ -113,6 +156,11 @@ protected:
     virtual void poke_visible(uint16_t address, uint8_t byte)
     {
         machine->poke_visible(address, byte);
+    }
+    virtual void poke_visible_preserving_freeze_restore(uint16_t address,
+                                                        uint8_t byte)
+    {
+        machine->poke_visible_preserving_freeze_restore(address, byte);
     }
     virtual void unfreeze_if_accessible(void)
     {
@@ -145,12 +193,45 @@ protected:
         machine->end_stopped_session(stopped_it);
         C64_MODE = MODE_NORMAL;
     }
+    virtual bool begin_clean_stopped_session(void)
+    {
+        // Patched high-memory release path. A raster-synced stop pairs the launch
+        // with the mode-1 resume used by the reliable freeze path, so the live CPU
+        // observes freshly armed high-memory BRKs on release.
+        return machine->begin_stopped_session(true);
+    }
+    virtual void settle_visible_rom_for_live_fetch(void)
+    {
+        // Overlay/Telnet only. A visible-ROM BRK has just been (re)written into
+        // the FPGA ROM image while the machine is stopped. The CPU-visible DMA
+        // aperture can read the new byte before the live instruction-fetch path
+        // observes it, so briefly clock the CPU, then stop again for the
+        // controlled launch. The caller clears any stale sentinel afterwards.
+        if (!machine || machine->is_accessible()) {
+            return;
+        }
+        machine->end_stopped_session(true);
+        wait_10us(50);
+        machine->begin_stopped_session();
+    }
+    virtual void request_staged_nmi(void)
+    {
+        C64_MODE = C64_MODE_NMI;
+    }
+    virtual void clear_staged_nmi(void)
+    {
+        wait_10us(1);
+        C64_MODE = MODE_NORMAL;
+    }
     virtual void delay_ms(int ms)
     {
         vTaskDelay(ms / portTICK_PERIOD_MS);
     }
     virtual bool free_run_no_breakpoint(uint16_t address)
     {
+        if (backend) {
+            backend->clear_observed_live_cpu_port();
+        }
         monitor_io::jump_to(address);
         return true;
     }
@@ -163,21 +244,30 @@ protected:
     {
         volatile uint8_t *rom = rom_patch_ptr(addr, cpu_port);
         if (rom) {
-            int shadow = find_rom_patch_shadow(addr, cpu_port);
-            if (shadow >= 0) {
-                return rom_patch_shadow[shadow].byte;
-            }
-            return backend ? backend->read(addr) : machine->peek_cpu(addr, cpu_port);
+            // Keep reads aligned with actual 6510 fetches. The volatile ROM
+            // image pointer remains the write target only.
+            return machine->peek_cpu(addr, cpu_port);
         }
-        return machine->peek_cpu(addr, cpu_port);
+        if (monitor_backing_store_for_cpu_port(addr, cpu_port) == MONITOR_BACKING_IO) {
+            return machine->peek_visible(addr);
+        }
+        return machine->peek_raw(addr);
     }
     virtual bool read_step_bytes(uint16_t address, uint8_t *dst, uint8_t len)
     {
-        if (!backend || !dst) {
+        if (!dst) {
             return false;
         }
+        uint8_t cpu_port = current_cpu_port();
         for (uint8_t i = 0; i < len; i++) {
-            dst[i] = backend->read((uint16_t)(address + i));
+            uint16_t current = (uint16_t)(address + i);
+            if (backend && backend->get_monitor_cpu_port() == cpu_port &&
+                    monitor_backing_store_is_visible_rom(
+                        monitor_backing_store_for_cpu_port(current, cpu_port))) {
+                dst[i] = backend->read(current);
+            } else {
+                dst[i] = read_patch_byte(current, cpu_port);
+            }
         }
         return true;
     }
@@ -186,10 +276,16 @@ protected:
         volatile uint8_t *rom = rom_patch_ptr(addr, cpu_port);
         if (rom) {
             *rom = byte;
+            if (u64_mark_rom_image_dirty) u64_mark_rom_image_dirty();
             remember_rom_patch_shadow(addr, byte, cpu_port);
+            wait_for_cpu_visible_rom_byte(addr, cpu_port, byte);
             return;
         }
-        machine->poke_cpu(addr, byte, cpu_port);
+        if (monitor_backing_store_for_cpu_port(addr, cpu_port) == MONITOR_BACKING_IO) {
+            machine->poke_visible(addr, byte);
+            return;
+        }
+        machine->poke_raw(addr, byte);
     }
 
 public:
