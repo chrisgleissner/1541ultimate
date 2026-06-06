@@ -517,8 +517,8 @@ static int test_opcode_metadata_consistency(void)
 //   '-' implied   'A' accumulator   'i' #immediate
 //   'z' zp   'x' zp,X   'y' zp,Y   'I' (zp,X)   'J' (zp),Y
 //   'a' abs  'X' abs,X  'Y' abs,Y   'P' (abs)   'r' relative
-// Illegal mnemonics use this codebase's established names (ALR/AXS/AHX/TAS),
-// which alias the c64ref ASR/SBX/SHA/SHS for the same opcodes.
+// Illegal mnemonics use this codebase's established names (ALR/SBX/SHA/TAS),
+// which alias the c64ref ASR/AXS/AHX/SHS for the same opcodes.
 static int test_disassembler_all_opcodes_match_c64ref(void)
 {
     struct OpRef { const char *mnem; char mode; };
@@ -557,12 +557,12 @@ static int test_disassembler_all_opcodes_match_c64ref(void)
     {"NOP",'X'}, {"ADC",'X'}, {"ROR",'X'}, {"RRA",'X'},
     {"NOP",'i'}, {"STA",'I'}, {"NOP",'i'}, {"SAX",'I'},
     {"STY",'z'}, {"STA",'z'}, {"STX",'z'}, {"SAX",'z'},
-    {"DEY",'-'}, {"NOP",'i'}, {"TXA",'-'}, {"XAA",'i'},
+    {"DEY",'-'}, {"NOP",'i'}, {"TXA",'-'}, {"ANE",'i'},
     {"STY",'a'}, {"STA",'a'}, {"STX",'a'}, {"SAX",'a'},
-    {"BCC",'r'}, {"STA",'J'}, {"JAM",'-'}, {"AHX",'J'},
+    {"BCC",'r'}, {"STA",'J'}, {"JAM",'-'}, {"SHA",'J'},
     {"STY",'x'}, {"STA",'x'}, {"STX",'y'}, {"SAX",'y'},
     {"TYA",'-'}, {"STA",'Y'}, {"TXS",'-'}, {"TAS",'Y'},
-    {"SHY",'X'}, {"STA",'X'}, {"SHX",'Y'}, {"AHX",'Y'},
+    {"SHY",'X'}, {"STA",'X'}, {"SHX",'Y'}, {"SHA",'Y'},
     {"LDY",'i'}, {"LDA",'I'}, {"LDX",'i'}, {"LAX",'I'},
     {"LDY",'z'}, {"LDA",'z'}, {"LDX",'z'}, {"LAX",'z'},
     {"TAY",'-'}, {"LDA",'i'}, {"TAX",'-'}, {"LAX",'i'},
@@ -573,7 +573,7 @@ static int test_disassembler_all_opcodes_match_c64ref(void)
     {"LDY",'X'}, {"LDA",'X'}, {"LDX",'Y'}, {"LAX",'Y'},
     {"CPY",'i'}, {"CMP",'I'}, {"NOP",'i'}, {"DCP",'I'},
     {"CPY",'z'}, {"CMP",'z'}, {"DEC",'z'}, {"DCP",'z'},
-    {"INY",'-'}, {"CMP",'i'}, {"DEX",'-'}, {"AXS",'i'},
+    {"INY",'-'}, {"CMP",'i'}, {"DEX",'-'}, {"SBX",'i'},
     {"CPY",'a'}, {"CMP",'a'}, {"DEC",'a'}, {"DCP",'a'},
     {"BNE",'r'}, {"CMP",'J'}, {"JAM",'-'}, {"DCP",'J'},
     {"NOP",'x'}, {"CMP",'x'}, {"DEC",'x'}, {"DCP",'x'},

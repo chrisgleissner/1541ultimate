@@ -1426,6 +1426,8 @@ def picker_path(snapshot: Snapshot) -> str:
     The picker prints the active path on the bottom line, below its border."""
     for line in reversed(snapshot.lines):
         text = line.strip()
+        if text.endswith("-F3=HELP-"):
+            text = text[:-len("-F3=HELP-")].rstrip()
         if text and not text.startswith("+"):
             return text
     return ""
