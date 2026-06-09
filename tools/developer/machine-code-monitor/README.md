@@ -5,7 +5,7 @@ This directory contains the real-device machine monitor validation harness.
 ## Service
 
 The firmware exposes the machine monitor through the standard telnet session on port `23`.
-The validation harness connects to the normal remote-menu session and enters the monitor with `Ctrl+O`.
+The validation harness connects to the normal remote-menu session and enters the monitor through the Developer menu.
 
 ## Run
 

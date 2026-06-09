@@ -1512,8 +1512,8 @@ static int test_monitor_interaction(void)
         "",
         "Bookmarks:  C=+B List   C=+0-9 Jump",
         "",
-        "Open monitor:  C=+O",
-        "Close monitor: C=+O/RSTOP",
+        "Open monitor:  C=+R",
+        "Close monitor: C=+M/RSTOP",
         "Leave edit:    C=+E/RSTOP",
         "Copy/Paste:    C=+C / C=+V",
         "Follow/Return: RETURN",
@@ -1840,7 +1840,7 @@ static int test_monitor_interaction(void)
     }
 
     {
-        const int toggle_keys[] = { KEY_CTRL_O };
+        const int toggle_keys[] = { KEY_CTRL_M };
         FakeKeyboard toggle_keyboard(toggle_keys, 1);
         ui.keyboard = &toggle_keyboard;
         screen.clear();
@@ -1848,7 +1848,7 @@ static int test_monitor_interaction(void)
 
         BackendMachineMonitor toggle_monitor(&ui, &backend);
         toggle_monitor.init(&screen, &toggle_keyboard);
-        if (expect(toggle_monitor.poll(0) == 1, "CBM+O should close the monitor directly.")) return 1;
+        if (expect(toggle_monitor.poll(0) == 1, "CBM+M should close the monitor directly.")) return 1;
         toggle_monitor.deinit();
     }
 

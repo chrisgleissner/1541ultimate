@@ -53,7 +53,6 @@ KEYS = {
     "RUNSTOP": b"\x11",
     "CTRL_B": b"\x02",
     "CTRL_E": b"\x05",
-    "CTRL_O": b"\x0f",
     "CBM_B": b"\x1bb",
     "CBM_1": b"\x1b1",
     "ESC": b"\x1bx",
@@ -392,13 +391,6 @@ class MonitorSession:
         return self.send_text(address + "\r", f"G {address}")
 
     def enter_monitor(self) -> Snapshot:
-        snapshot = self.send_key("CTRL_O")
-        try:
-            snapshot.find_status_line()
-            return snapshot
-        except Failure:
-            pass
-
         snapshot = self.send_key("F5")
         snapshot = self.send_char("D")
         snapshot = self.send_key("ENTER")

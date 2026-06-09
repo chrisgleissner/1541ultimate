@@ -35,8 +35,10 @@ public:
 #define KEY_CTRL_I 0x09
 #define KEY_CTRL_J 0x0A
 #define KEY_CTRL_L 0x0C
+#define KEY_CTRL_M 0xBA // avoid clash with KEY_RETURN
 #define KEY_CTRL_N 0x0E
 #define KEY_CTRL_O 0x0F
+#define KEY_CTRL_R 0x12
 #define KEY_CTRL_V 0x16
 
 #define KEY_CTRL_0  0xB0

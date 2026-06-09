@@ -40,8 +40,8 @@ static const char *const monitor_help_lines[] = {
     "",
     "Bookmarks:  C=+B List   C=+0-9 Jump",
     "",
-    "Open monitor:  C=+O",
-    "Close monitor: C=+O/RSTOP",
+    "Open monitor:  C=+R",
+    "Close monitor: C=+M/RSTOP",
     "Leave edit:    C=+E/RSTOP",
     "Copy/Paste:    C=+C / C=+V",
     "Follow/Return: RETURN",
@@ -2343,7 +2343,7 @@ int MachineMonitor :: number_picker_handle_key(int key)
         draw();
         return 0;
     }
-    if (key == KEY_CTRL_O) {
+    if (key == KEY_CTRL_M) {
         number_picker_active = false;
         return 1;
     }
@@ -4337,10 +4337,10 @@ void MachineMonitor :: hunt_picker_jump()
 
 int MachineMonitor :: hunt_picker_handle_key(int key)
 {
-    if (key == KEY_ESCAPE || key == KEY_BREAK || key == KEY_CTRL_O) {
+    if (key == KEY_ESCAPE || key == KEY_BREAK || key == KEY_CTRL_M) {
         hunt_picker_close();
         draw();
-        return (key == KEY_CTRL_O) ? 1 : 0;
+        return (key == KEY_CTRL_M) ? 1 : 0;
     }
     if (key == KEY_RETURN) {
         hunt_picker_jump();
@@ -4650,7 +4650,7 @@ int MachineMonitor :: opcode_picker_handle_key(int key)
         draw();
         return 0;
     }
-    if (key == KEY_CTRL_O) {
+    if (key == KEY_CTRL_M) {
         opcode_picker_close();
         return 1;
     }
@@ -5006,7 +5006,7 @@ int MachineMonitor :: handle_key(int key)
     }
 
     if (edit_mode) {
-        if (key == KEY_CTRL_O) {
+        if (key == KEY_CTRL_M) {
             return 1;
         }
         if (key == KEY_BREAK || key == KEY_ESCAPE || key == KEY_CTRL_E) {
@@ -5395,7 +5395,7 @@ int MachineMonitor :: handle_key(int key)
             toggle_help();
             break;
         case 'x': case 'X':
-        case KEY_CTRL_O:
+        case KEY_CTRL_M:
         case KEY_BREAK:
         case KEY_ESCAPE:
             return 1;

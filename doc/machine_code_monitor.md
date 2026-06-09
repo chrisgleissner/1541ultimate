@@ -6,18 +6,18 @@ It supports hexadecimal, ASCII, screen-code, binary, and assembly views, plus in
 
 ## Entry and Exit
 
-`C=` denotes the Commodore key. For example, `C=+O` means: hold the Commodore key, then press `O`.
+`C=` denotes the Commodore key. For example, `C=+R` means: hold the Commodore key, then press `R`.
 
 To open the monitor, use one of the following:
 
-- Press `C=+O`.
+- Press `C=+R`.
 - Press `F5`, open `Developer`, then select `Machine Code Monitor`.
 
 Open the built-in help with `F3` or `?`.
 
 To close the monitor:
 
-- Press `C=+O` again.
+- Press `C=+M` again.
 - Press `RUN/STOP` when no edit operation or popup is active.
 
 ## Screen Layout

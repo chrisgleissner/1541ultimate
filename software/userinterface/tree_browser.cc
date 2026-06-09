@@ -442,7 +442,7 @@ int TreeBrowser :: handle_key(int c)
             reset_quick_seek();
             ret = swap_interface_type(user_interface);
             break;
-        case KEY_CTRL_O:
+        case KEY_CTRL_R:
             reset_quick_seek();
             state->refresh = true;
             if (get_machine_monitor_task) {
