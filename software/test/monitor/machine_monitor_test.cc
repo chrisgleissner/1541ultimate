@@ -2453,10 +2453,11 @@ static int test_monitor_interaction(void)
         "",
         "Bookmarks:   C=+B List    C=+0-9 Jump",
         "",
-        "Monitor:        C=+O Open/Close",
-        "Leave edit:     C=+E/RSTOP",
-        "Copy/Paste:     C=+C / C=+V",
-        "Reset/Follow:   C=+X Reset / RETURN",
+        "Open monitor:  C=+O",
+        "Close monitor: C=+O/RSTOP",
+        "Leave edit:    C=+E/RSTOP",
+        "Copy/Paste:    C=+C / C=+V",
+        "Reset/Follow:  C=+X Reset / RETURN",
         NULL
     };
     monitor_reset_saved_state();
