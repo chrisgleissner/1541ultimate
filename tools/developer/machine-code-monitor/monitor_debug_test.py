@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import socket
 import sys
 import time
 import urllib.request
@@ -53,6 +54,7 @@ SAFE_CPU_PORT_LOW_BITS = 0x07
 # pass; use --chunk-size explicitly when investigating service-path slowdowns.
 SUITE_CHUNK_SIZE = 0
 SUITE_CHUNK_COOLDOWN_SECONDS = 6.0
+LIFECYCLE_REPETITIONS = 2
 
 # Post-group hygiene recovery. The per-group cleanup resets the C64 and then probes
 # the jiffy clock ($00A2) to prove the KERNAL IRQ is actually running. Under sustained
@@ -322,7 +324,8 @@ def _clear_all_breakpoints(session: "mt.MonitorSession", context: str) -> None:
     session.sock.sendall(b"\x12")
     snap = session.capture()
     if "BREAKPOINTS" not in snap.text():
-        raise mt.Failure(f"{context}: breakpoint popup did not open:\n{snap.text()}")
+        # Outside Debug mode, no popup means no breakpoints to clear.
+        return
 
     session.send_key_repeat("UP", 9)
     for slot in range(10):
@@ -406,7 +409,13 @@ def _wait_for_c64_ready(rest_host: str, timeout: float = 8.0) -> None:
             if stable_since == 0.0:
                 stable_since = now
             elif now - stable_since >= 0.75:
-                return
+                jiffy = mt.read_rest_memory(rest_host, 0x00A2, 3)
+                jiffy_deadline = time.time() + 2.0
+                while time.time() < jiffy_deadline:
+                    time.sleep(0.1)
+                    if mt.read_rest_memory(rest_host, 0x00A2, 3) != jiffy:
+                        return
+                raise mt.Failure("C64 READY prompt appeared but jiffy clock did not advance")
         else:
             stable_since = 0.0
         time.sleep(0.1)
@@ -833,6 +842,11 @@ def _reopen_monitor(session: "mt.MonitorSession") -> None:
         # The previous command may already have left the monitor. Continue
         # with the same CTRL+O entry path used by the normal telnet harness.
         pass
+    try:
+        session.capture().find_status_line()
+        return
+    except mt.Failure:
+        pass
     last_error = None
     for _ in range(6):
         try:
@@ -841,6 +855,11 @@ def _reopen_monitor(session: "mt.MonitorSession") -> None:
             return
         except mt.Failure as exc:
             last_error = exc
+    try:
+        session.enter_monitor()
+        return
+    except mt.Failure as exc:
+        last_error = exc
     raise mt.Failure(f"Could not re-enter monitor: {last_error}")
 
 
@@ -1986,6 +2005,133 @@ def _assert_no_forced_cpu7_status(session: "mt.MonitorSession", context: str) ->
     return snap
 
 
+def _check_lifecycle_liveness(rest_host: str, context: str) -> None:
+    url = f"http://{rest_host}/v1/version"
+    with urllib.request.urlopen(url, timeout=5.0) as response:
+        response.read()
+    mt.read_rest_memory(rest_host, 0x0400, 1)
+    for name, port in (("Telnet", 23), ("FTP", 21)):
+        try:
+            with socket.create_connection((rest_host, port), timeout=5.0):
+                pass
+        except OSError as exc:
+            raise mt.Failure(
+                f"{context}: {name} listener did not accept TCP connection: {exc}") from exc
+
+
+def _enter_lifecycle_debug_at(session: "mt.MonitorSession", address: int,
+                              monitor_bank: int, source: str,
+                              context: str) -> mt.Snapshot:
+    _reopen_monitor(session)
+    _ensure_no_debug(session)
+    _select_monitor_view(session, monitor_bank, f"{context}: select O{monitor_bank}")
+    session.goto(f"{address:04X}")
+    session.send_char("A")
+    if "Dbg" not in _header_line(session):
+        session.send_char("D")
+    snap = session.capture()
+    _assert_no_debug_modal_snapshot(snap, context)
+    _assert_snapshot_contains(snap, f"MONITOR ASM ${address:04X}", context)
+    row = _disassembly_row(snap, address)
+    if f"[{source}]" not in row:
+        raise mt.Failure(
+            f"{context}: row ${address:04X} missing [{source}]: {row!r}\n{snap.text()}")
+    return snap
+
+
+def _telnet_run_to_breakpoint_then_continue(
+        rest_host: str, session: "mt.MonitorSession", label: str,
+        start_addr: int, breakpoint_addr: int, breakpoint_bank: int,
+        breakpoint_source: str, context_pcs: tuple[int, ...],
+        start_source: str = "RAM", start_bank: int = 7,
+        progress_addr: int | None = None, progress_len: int = 0) -> None:
+    _enter_lifecycle_debug_at(session, start_addr, start_bank, start_source,
+                              f"{label}: enter Debug at ${start_addr:04X}")
+    for expected_pc in context_pcs:
+        _step_and_assert_pc(session, "D", expected_pc,
+                            f"{label}: establish context ${expected_pc:04X}")
+    _select_monitor_view(session, breakpoint_bank,
+                         f"{label}: select O{breakpoint_bank}")
+    if not context_pcs or context_pcs[-1] != breakpoint_addr:
+        session.goto(f"{breakpoint_addr:04X}")
+    row = _disassembly_row(session.capture(), breakpoint_addr)
+    if f"[{breakpoint_source}]" not in row:
+        raise mt.Failure(
+            f"{label}: breakpoint row is not [{breakpoint_source}]: {row!r}")
+    _ensure_breakpoint_at(session, breakpoint_addr,
+                          f"{label}: set breakpoint at ${breakpoint_addr:04X}")
+    session.send_char("G")
+    _wait_for_pc(session, f"{breakpoint_addr:04X}")
+    _assert_no_debug_modal(session, f"{label}: run to breakpoint ${breakpoint_addr:04X}")
+    _clear_breakpoint_at(session, breakpoint_addr,
+                         f"{label}: remove breakpoint at ${breakpoint_addr:04X}")
+    session.send_char("G")
+    _assert_no_debug_modal(session, f"{label}: continue after breakpoint removal")
+    if progress_addr is not None:
+        _assert_rest_region_keeps_changing(
+            rest_host, progress_addr, progress_len,
+            f"{label}: full-speed continue after breakpoint removal")
+
+
+def _telnet_lifecycle_reenter(rest_host: str, session: "mt.MonitorSession",
+                              label: str, address: int, source: str,
+                              bank: int, expected_pc: int,
+                              step_key: str = "D") -> None:
+    _reset_c64_core(rest_host)
+    _check_lifecycle_liveness(rest_host, f"{label}: liveness after reset")
+    _enter_lifecycle_debug_at(session, address, bank, source,
+                              f"{label}: re-enter Debug")
+    _step_and_assert_pc(session, step_key, expected_pc,
+                        f"{label}: first re-entered step")
+    _check_lifecycle_liveness(rest_host, f"{label}: liveness after re-entry step")
+    _ensure_no_debug(session)
+
+
+def _run_telnet_lifecycle_case(rest_host: str, session: "mt.MonitorSession",
+                               label: str, banking: str) -> None:
+    _reset_c64_core(rest_host)
+    _reopen_monitor(session)
+    _ensure_no_debug(session)
+    _clear_all_breakpoints(session, f"{label}: setup clear breakpoints")
+    if banking == "ram":
+        _load_repeat_redebug_fixtures(rest_host)
+        _telnet_run_to_breakpoint_then_continue(
+            rest_host, session, label,
+            0xC300, 0xC302, 7, "RAM", (0xC302,),
+            progress_addr=0x0600, progress_len=0x01E8)
+        _telnet_lifecycle_reenter(
+            rest_host, session, label, 0xC300, "RAM", 7, 0xC302)
+    elif banking == "ram-under-rom":
+        _load_repeat_redebug_fixtures(rest_host)
+        _telnet_run_to_breakpoint_then_continue(
+            rest_host, session, label,
+            0xC000, 0xE000, 5, "RAM",
+            (0xC001, 0xC003, 0xC005, 0xC007, 0xC009, 0xC00B, 0xE000))
+        _telnet_lifecycle_reenter(
+            rest_host, session, label, 0xC000, "RAM", 7, 0xC001)
+    elif banking == "rom":
+        _telnet_run_to_breakpoint_then_continue(
+            rest_host, session, label,
+            0xE002, 0xBC0F, 7, "BAS", (),
+            start_source="KRN", start_bank=7)
+        _telnet_lifecycle_reenter(
+            rest_host, session, label, 0xE002, "KRN", 7, 0xBC0F,
+            step_key="T")
+    else:
+        raise mt.Failure(f"Unknown Telnet lifecycle banking target: {banking}")
+
+
+def run_telnet_lifecycle_matrix_tests(rest_host: str,
+                                      session: "mt.MonitorSession") -> None:
+    scenarios = ("rom", "ram-under-rom", "ram")
+    for banking in scenarios:
+        for repetition in range(1, LIFECYCLE_REPETITIONS + 1):
+            label = f"Telnet lifecycle {banking} rep {repetition}/{LIFECYCLE_REPETITIONS}"
+            with mt.check(label, u2=False,
+                          u2_reason="U64 reset/re-entry lifecycle coverage is required"):
+                _run_telnet_lifecycle_case(rest_host, session, label, banking)
+
+
 def run_banked_breakpoint_tests(rest_host: str, session: "mt.MonitorSession") -> None:
     """Prove monitor-view breakpoints and live $0001 execution stay separate."""
 
@@ -2743,6 +2889,7 @@ TEST_GROUPS = (
     ("deep-trace", run_deep_kernal_basic_trace_tests),
     ("banked-breakpoints", run_banked_breakpoint_tests),
     ("repeat-redebug", run_repeat_redebug_tests),
+    ("lifecycle-matrix", run_telnet_lifecycle_matrix_tests),
     ("banked-continue-no-breakpoints", run_banked_continue_no_breakpoints_tests),
     ("brk-orchestrator", run_brk_orchestrator_tests),
     ("side-effect-step", run_side_effect_step_tests),
@@ -2795,7 +2942,12 @@ def main() -> int:
                         default=SUITE_CHUNK_COOLDOWN_SECONDS,
                         help="Seconds to idle at each chunk boundary before the extra "
                              "reset.")
+    parser.add_argument("--lifecycle-repetitions", type=int,
+                        default=int(os.environ.get("U64_MONITOR_LIFECYCLE_REPETITIONS", "2")),
+                        help="Repetitions per Telnet lifecycle banking scenario.")
     args = parser.parse_args()
+    if args.lifecycle_repetitions < 1:
+        parser.error("--lifecycle-repetitions must be at least 1")
     selected_tests = _parse_selected_tests(parser, args.test)
     if args.list_tests:
         for name, _runner in TEST_GROUPS:
@@ -2809,6 +2961,8 @@ def main() -> int:
     mt.TestConfig.keep_going = args.keep_going or args.target == "u2"
     mt.TestConfig.failures = []
     mt.TestConfig.skipped = []
+    global LIFECYCLE_REPETITIONS
+    LIFECYCLE_REPETITIONS = args.lifecycle_repetitions
 
     rest_host = args.rest_host or args.host
     if args.target == "u2":

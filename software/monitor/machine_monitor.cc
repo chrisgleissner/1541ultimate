@@ -2039,6 +2039,22 @@ void MachineMonitor :: request_debug_reset_cancel(void)
     }
 }
 
+void MachineMonitor :: invalidate_live_cpu_port_view(void)
+{
+    // Reset invalidates any debug-session live-bank snapshot.
+    if (backend) {
+        backend->invalidate_live_cpu_port_cache();
+    }
+}
+
+bool MachineMonitor :: is_debug_session_active(void) const
+{
+    if (!debug_session) {
+        return false;
+    }
+    return debug_session->is_debug_session_active();
+}
+
 bool MachineMonitor :: consume_reopen_after_reset(void)
 {
     bool ret = reopen_after_reset;
@@ -4379,6 +4395,22 @@ void MachineMonitor :: draw_header()
     }
 }
 
+// True when a step would execute RAM mapped underneath ROM or I/O.
+static bool monitor_step_bank_is_ram_under_rom(MemoryBackend *backend,
+                                               uint16_t pc, uint8_t cpu_port)
+{
+    if (!backend || !backend->supports_cpu_banking()) {
+        return false;
+    }
+    cpu_port &= 0x07;
+    if (cpu_port == 0x07) {
+        return false;   // all ROMs visible: nothing banked in under ROM
+    }
+    MonitorBackingStore here = backend->backing_store_for_cpu_port(pc, cpu_port);
+    MonitorBackingStore rom_view = backend->backing_store_for_cpu_port(pc, 0x07);
+    return (here == MONITOR_BACKING_RAM) && (rom_view != MONITOR_BACKING_RAM);
+}
+
 void MachineMonitor :: draw_status()
 {
     char line[40];
@@ -4397,6 +4429,30 @@ void MachineMonitor :: draw_status()
                     (int)strlen(bookmark_status_text));
         window->set_color(get_ui()->color_fg);
         return;
+    }
+
+    // Warn without losing the parseable CPU/VIC status tokens.
+    if (debug.is_active()) {
+        const DebugContext &dctx = debug.context();
+        uint16_t step_pc = dctx.valid ? dctx.pc : state.current_addr;
+        uint8_t exec_port = (dctx.valid && dctx.live_cpu_port_valid) ?
+            (uint8_t)(dctx.live_cpu_port & 0x07) : (uint8_t)(state.view_cpu_port & 0x07);
+        if (monitor_step_bank_is_ram_under_rom(backend, step_pc, exec_port)) {
+            uint8_t live = backend ? (uint8_t)(backend->get_live_cpu_port() & 0x07)
+                                   : exec_port;
+            uint8_t view = (uint8_t)(state.view_cpu_port & 0x07);
+            if (live == view) {
+                sprintf(line, "CPU%d ! RAM-under-ROM step VIC%d",
+                        view, current_vic_bank & 0x03);
+            } else {
+                sprintf(line, "C%dO%d ! RAM-under-ROM step VIC%d",
+                        live, view, current_vic_bank & 0x03);
+            }
+            window->set_color(MONITOR_UI_ACCENT_COLOR);
+            draw_padded(window, window->get_size_y() - 1, line, (int)strlen(line));
+            window->set_color(get_ui()->color_fg);
+            return;
+        }
     }
 
     if (backend && !backend->supports_cpu_banking() && !backend->supports_vic_bank()) {
@@ -6061,6 +6117,15 @@ void MachineMonitor :: debug_sync_cursor_to_context(void)
     if (!debug.is_active() || !debug.has_context()) {
         return;
     }
+    // After a step, follow the CPU bank unless the user changes view bank again.
+    if (backend && backend->supports_cpu_banking() &&
+            debug.context().live_cpu_port_valid) {
+        uint8_t cpu_bank = (uint8_t)(debug.context().live_cpu_port & 0x07);
+        if ((uint8_t)(state.view_cpu_port & 0x07) != cpu_bank) {
+            state.view_cpu_port = cpu_bank;
+            backend->set_monitor_cpu_port(cpu_bank);
+        }
+    }
     old_addr = state.current_addr;
     pc = debug.context().pc;
     if (state.view == MONITOR_VIEW_ASM) {
@@ -7060,6 +7125,8 @@ void MachineMonitor :: init(Screen *scr, Keyboard *keyb)
     if (monitor_sync_view_to_live_on_open) {
         monitor_sync_view_to_live_on_open = false;
         if (!restore_debug_after_reset && backend->supports_cpu_banking()) {
+            // Re-read the live bank after reset; any captured debug bank is stale.
+            backend->invalidate_live_cpu_port_cache();
             state.view_cpu_port = (uint8_t)(backend->get_live_cpu_port() & 0x07);
         }
     }

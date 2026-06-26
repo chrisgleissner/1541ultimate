@@ -361,6 +361,23 @@ void U64Machine :: poke_raw(uint16_t address, uint8_t byte)
     after_memory_access(0, freezerMenu, stopped_it);
 }
 
+void U64Machine :: poke_cpu_rom(volatile uint8_t *image_ptr, uint8_t byte)
+{
+    if (!image_ptr) {
+        return;
+    }
+    // Same served bracket as poke_raw, but for a ROM-image buffer.
+    bool stopped_it = false;
+    bool freezerMenu = before_memory_access(true, &stopped_it);
+    uint8_t saved_serve = C64_SERVE_CONTROL;
+
+    C64_SERVE_CONTROL = saved_serve | SERVE_WHILE_STOPPED;
+    *image_ptr = byte;
+    C64_SERVE_CONTROL = saved_serve;
+
+    after_memory_access(0, freezerMenu, stopped_it);
+}
+
 void U64Machine :: poke_cpu(uint16_t address, uint8_t byte, uint8_t cpu_port)
 {
     bool stopped_it = false;

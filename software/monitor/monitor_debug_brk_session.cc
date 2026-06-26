@@ -42,6 +42,8 @@ static const uint16_t SPIN_OPERAND_LO = 0x0388;
 static const uint16_t SPIN_OPERAND_HI = 0x0389;
 static const uint16_t TRAMPOLINE_ADDR = 0x038A;
 static const uint16_t NMI_TRAMPOLINE_ADDR = 0x03B0;
+// Low-RAM scratch for a copied instruction plus trailing trap.
+static const uint16_t INSN_TRAMPOLINE_ADDR = 0x0340;
 static const uint16_t HARD_BRK_STUB_ADDR = 0x03C8;
 static const uint16_t HARD_BRK_ORIG_VECTOR_LO = 0x03EE;
 static const uint16_t BRK_VECTOR_LO   = 0x0316;
@@ -625,6 +627,10 @@ BrkDebugSession::PatchInstallResult BrkDebugSession :: install_brk_at(
         write_patch_byte(addr, 0x00, cpu_port);
     }
     bool verify = patch_verify_now(addr, current_cpu_port(), target);
+    if (verify && visible_rom_patch && machine_is_frozen()) {
+        // Frozen read-back sees the backup, not the served ROM image.
+        verify = false;
+    }
     if (verify && read_patch_byte(addr, cpu_port) != 0x00) {
         end_stopped_session(stopped_it);
         return PATCH_INSTALL_FAILED;
@@ -966,6 +972,20 @@ uint8_t BrkDebugSession :: execution_cpu_port(const DebugContext *ctx) const
 {
     if (ctx && ctx->valid && ctx->live_cpu_port_valid) {
         return (uint8_t)(ctx->live_cpu_port & 0x07);
+    }
+    return current_cpu_port();
+}
+
+uint8_t BrkDebugSession :: execution_cpu_port_for_start(uint16_t start_pc) const
+{
+    // Prefer a matching captured bank; otherwise use the selected monitor bank.
+    if (has_last_context && last_context.valid &&
+            last_context.pc == start_pc && last_context.live_cpu_port_valid) {
+        return (uint8_t)(last_context.live_cpu_port & 0x07);
+    }
+    if (has_resume_context && resume_context.valid &&
+            resume_context.pc == start_pc && resume_context.live_cpu_port_valid) {
+        return (uint8_t)(resume_context.live_cpu_port & 0x07);
     }
     return current_cpu_port();
 }
@@ -1449,16 +1469,68 @@ DebugSession::Result BrkDebugSession :: perform_run(const DebugContext *from,
     return DBG_OK;
 }
 
+DebugSession::Result BrkDebugSession :: step_linear_via_trampoline(
+    const DebugContext *from, uint16_t start_pc,
+    const DebugPredictResult &pred, DebugContext *out, uint8_t cpu_port,
+    const uint8_t *instruction_bytes)
+{
+    // Execute one linear ROM instruction from RAM, then report its ROM fall-through.
+    if (pred.length == 0 || pred.length > 3) {
+        return DBG_REFUSED;
+    }
+    bool stopped = begin_stopped_session();
+    for (uint8_t i = 0; i < pred.length; i++) {
+        uint8_t byte = instruction_bytes ?
+            instruction_bytes[i] : peek_cpu((uint16_t)(start_pc + i), cpu_port);
+        poke_cpu((uint16_t)(INSN_TRAMPOLINE_ADDR + i),
+                 byte, cpu_port);
+    }
+    end_stopped_session(stopped);
+
+    PatchInstallResult patched = install_brk_at(
+        (uint16_t)(INSN_TRAMPOLINE_ADDR + pred.length), cpu_port);
+    if (patched != PATCH_INSTALL_OK) {
+        restore_patches();
+        return (patched == PATCH_INSTALL_NOT_SUPPORTED) ?
+            DBG_NOT_SUPPORTED : DBG_PATCH_FAILED;
+    }
+    // Prime the captured registers when available.
+    if (from && from->valid) {
+        last_context = *from;
+        has_last_context = true;
+    }
+    // Use the explicit launch path for the trampoline.
+    cpu_parked_in_spin = false;
+    Result result = perform_run(0, INSN_TRAMPOLINE_ADDR, true, out, cpu_port);
+    if (result == DBG_OK && out && out->valid) {
+        // Continue the debugger at the real ROM fall-through.
+        out->pc = pred.fall_through;
+        if (has_last_context) {
+            last_context.pc = pred.fall_through;
+        }
+    }
+    return result;
+}
+
 DebugSession::Result BrkDebugSession :: step_with_predict(
     const DebugContext *from, uint16_t start_pc,
     const DebugPredictResult &pred, bool prefer_jsr_target,
     DebugContext *out, uint8_t cpu_port,
     const MonitorBreakpoints *bps,
     uint16_t skip_breakpoint_address,
-    bool skip_breakpoint_address_valid)
+    bool skip_breakpoint_address_valid,
+    const uint8_t *linear_step_bytes)
 {
     if (pred.kind == DBG_PREDICT_UNSAFE || pred.kind == DBG_PREDICT_BRK) {
         return DBG_REFUSED;
+    }
+    // Avoid stale visible-ROM fetches by running linear instructions from RAM.
+    if (pred.kind == DBG_PREDICT_LINEAR && out &&
+            visible_rom_fetch_lags() && !debug_owner.remote &&
+            monitor_backing_store_is_visible_rom(
+                monitor_backing_store_for_cpu_port(start_pc, cpu_port))) {
+        return step_linear_via_trampoline(from, start_pc, pred, out, cpu_port,
+                                          linear_step_bytes);
     }
     uint16_t addrs[2];
     int n = 0;
@@ -1887,20 +1959,30 @@ DebugSession::Result BrkDebugSession :: run_to(const DebugContext &from,
     uint16_t run_pc = have_context ? from.pc : start_pc;
     uint8_t cpu_port = execution_cpu_port(have_context ? &from : 0);
 
-    if (run_pc == target_pc) {
+    // Step once to escape self-hits or stale visible-ROM launch fetches.
+    bool launch_site_lags = visible_rom_fetch_lags() && !debug_owner.remote &&
+        monitor_backing_store_is_visible_rom(
+            monitor_backing_store_for_cpu_port(run_pc, cpu_port));
+    if (run_pc == target_pc || launch_site_lags) {
         uint8_t bytes[3];
-        for (int i = 0; i < 3; i++) {
-            bytes[i] = read_patch_byte((uint16_t)(run_pc + i), cpu_port);
+        if (launch_site_lags) {
+            // Use the disassembly byte source for the trampoline copy.
+            if (!read_step_bytes(run_pc, bytes, 3)) {
+                return DBG_REFUSED;
+            }
+        } else {
+            for (int i = 0; i < 3; i++) {
+                bytes[i] = read_patch_byte((uint16_t)(run_pc + i), cpu_port);
+            }
         }
         DebugPredictResult pred;
         debug_predict(run_pc, bytes, false, &pred);
         DebugContext stepped;
-        // Escaping an immediate self-hit must execute the current instruction
-        // exactly once using real control flow. In particular, K Cursor on a
-        // current-row JSR must enter the callee before re-arming the transient
-        // cursor breakpoint, not step over to the fall-through address.
-        Result skip = step_with_predict(have_context ? &from : 0, run_pc, pred, true,
-                                        &stepped, cpu_port, bps, run_pc, true);
+        // Self-hit escape steps into; launch priming steps over.
+        bool into = (run_pc == target_pc);
+        Result skip = step_with_predict(have_context ? &from : 0, run_pc, pred, into,
+                                        &stepped, cpu_port, bps, run_pc, true,
+                                        launch_site_lags ? bytes : 0);
         if (skip != DBG_OK) {
             return skip;
         }

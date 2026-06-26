@@ -165,9 +165,19 @@ extern "C" bool machine_monitor_request_global_reset_cancel(void)
     if (!active_reset_monitor) {
         return false;
     }
+    // Reset makes any captured live-bank snapshot stale.
+    active_reset_monitor->invalidate_live_cpu_port_view();
     // Only cancel the in-flight debug wait. Do NOT call request_reopen_after_reset()
     // here: that would save stale monitor state and schedule a spurious reopen
     // on every REST/menu reset that happens to fire while the monitor is visible.
     active_reset_monitor->request_debug_reset_cancel();
     return true;
+}
+
+extern "C" bool machine_monitor_global_reset_sees_debug_session(void)
+{
+    if (!active_reset_monitor) {
+        return false;
+    }
+    return active_reset_monitor->is_debug_session_active();
 }

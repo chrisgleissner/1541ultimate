@@ -8,6 +8,7 @@ class U64MemoryBackend;
 
 static inline uint8_t u64_debug_step_cpu_port(MemoryBackend *backend)
 {
+    // Execute cursor-launched steps in the live CPU bank, not the view bank.
     return backend ? backend->get_live_cpu_port() : (uint8_t)0x07;
 }
 

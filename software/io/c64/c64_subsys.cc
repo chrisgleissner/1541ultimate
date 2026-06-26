@@ -220,7 +220,14 @@ SubsysResultCode_e C64_Subsys::executeCommand(SubsysCommand *cmd)
                 c64->client = 0;
             }
             c64->unfreeze();
-            c64->reset();
+            // Active debug sessions may leave $01 banked out; use the reboot
+            // path so the reset vector is fetched from KERNAL.
+            if (machine_monitor_global_reset_sees_debug_session &&
+                machine_monitor_global_reset_sees_debug_session()) {
+                c64->start_cartridge(NULL);
+            } else {
+                c64->reset();
+            }
             break;
 
         case MENU_C64_PAUSE:

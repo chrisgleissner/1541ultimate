@@ -486,6 +486,10 @@ public:
     void dispatch_deferred_debug_go(void);
     void request_reopen_after_reset(void);
     void request_debug_reset_cancel(void);
+    // Drop any cached live-bank snapshot after reset.
+    void invalidate_live_cpu_port_view(void);
+    // True while the debug engine still owns the live CPU.
+    bool is_debug_session_active(void) const;
     bool consume_reopen_after_reset(void);
     void init(Screen *screen, Keyboard *keyboard);
     void deinit(void);

@@ -676,6 +676,7 @@ public:
     bool allow_visible_rom_patching;
     bool force_raw_peek_brk;
     uint16_t force_raw_peek_brk_addr;
+    bool fetch_lags;
     int rom_patch_writes;
     uint16_t last_rom_patch_addr;
     int ram_patch_writes;
@@ -686,7 +687,8 @@ public:
     FakeVisibleRomMachine(bool start_frozen)
         : FakeFreezeMachine(start_frozen), cpu_port(0x07),
           allow_visible_rom_patching(false), force_raw_peek_brk(false),
-          force_raw_peek_brk_addr(0), rom_patch_writes(0), last_rom_patch_addr(0),
+          force_raw_peek_brk_addr(0), fetch_lags(false),
+          rom_patch_writes(0), last_rom_patch_addr(0),
           ram_patch_writes(0), last_ram_patch_addr(0),
           switch_cpu_port_on_delay(false), cpu_port_after_delay(0x07)
     {
@@ -718,6 +720,10 @@ protected:
     virtual bool supports_visible_rom_patching(void) const
     {
         return allow_visible_rom_patching;
+    }
+    virtual bool visible_rom_fetch_lags(void) const
+    {
+        return fetch_lags;
     }
     virtual uint8_t peek_cpu(uint16_t a, uint8_t patch_cpu_port)
     {
@@ -4623,16 +4629,16 @@ static int test_u64_debug_cpu_port_uses_live_cpu_bank()
     backend.set_monitor_cpu_port(0x07);
     backend.live_cpu_port = 0x05;
     if (expect(u64_debug_step_cpu_port(&backend) == 0x05,
-               "U64 Debug stepping must use the live CPU bank")) return 1;
+               "U64 Debug stepping must execute in the live CPU bank")) return 1;
     if (expect(backend.live_reads == 1,
-               "U64 Debug stepping must sample $0001 for the live CPU bank")) return 1;
+               "U64 Debug stepping must sample live $0001 (the read also settles the bus)")) return 1;
 
     backend.set_monitor_cpu_port(0x05);
     backend.live_cpu_port = 0x07;
     if (expect(u64_debug_step_cpu_port(&backend) == 0x07,
-               "U64 Debug stepping must ignore monitor-bank changes")) return 1;
+               "U64 Debug stepping must ignore monitor-bank changes (view decoupling is read-side)")) return 1;
     if (expect(backend.live_reads == 2,
-               "U64 Debug stepping must re-sample live bank changes")) return 1;
+               "U64 Debug stepping must re-sample the live bank each step")) return 1;
     if (expect(u64_debug_step_cpu_port(0) == 0x07,
                "U64 Debug stepping must default to all ROMs visible without a backend")) return 1;
 
@@ -5404,6 +5410,41 @@ static int test_run_to_current_visible_kernal_jsr_enters_callee_before_rearming_
                "K Cursor current-row JSR must re-arm the transient cursor breakpoint afterwards")) return 1;
     if (expect(!fake_recorded_brk_patch(m, 0xE003),
                "K Cursor current-row JSR must not step over to the fall-through address")) return 1;
+    return 0;
+}
+
+static int test_run_to_lagging_visible_rom_uses_step_bytes_for_trampoline()
+{
+    FakeVisibleRomMachine m(false);
+    m.allow_visible_rom_patching = true;
+    m.fetch_lags = true;
+    m.cpu_port = 0x07;
+    m.kernal_rom[0x0005] = 0xA5; // LDA $61 at $E005
+    m.kernal_rom[0x0006] = 0x61;
+    m.kernal_rom[0x0007] = 0xEA;
+    m.force_raw_peek_brk = true;
+    m.force_raw_peek_brk_addr = 0xE005;
+
+    DebugContext from;
+    debug_context_reset(&from);
+    from.valid = true;
+    from.pc = 0xE005;
+    from.sp = 0xF7;
+    from.sr = 0x24;
+    from.live_cpu_port_valid = true;
+    from.live_cpu_port = 0x07;
+
+    // The prime executes from the trampoline and reports the ROM fall-through.
+    m.arm_capture_context(0x0342, 0xF7, 0, 0, 0, 0x24);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.run_to(from, 0xE007, 0, 0xE005, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "Lagging visible-ROM run-to launch prime must complete")) return 1;
+    if (expect(ctx.valid && ctx.pc == 0xE007,
+               "Lagging visible-ROM run-to must report the real fall-through")) return 1;
+    if (expect(m.ram[0x0340] == 0xA5 && m.ram[0x0341] == 0x61,
+               "Run-to trampoline must copy coherent step bytes, not stale peek_cpu BRK")) return 1;
     return 0;
 }
 
@@ -6924,6 +6965,7 @@ int main()
     RUN(test_visible_kernal_hard_vector_installs_and_restores);
     RUN(test_stale_visible_kernal_hard_vector_is_recovered);
     RUN(test_run_to_current_visible_kernal_jsr_enters_callee_before_rearming_cursor_breakpoint);
+    RUN(test_run_to_lagging_visible_rom_uses_step_bytes_for_trampoline);
     RUN(test_overlay_step_over_never_freezes);
     RUN(test_overlay_accessible_unfrozen_step_over_does_not_unfreeze);
     RUN(test_overlay_render_target_disables_stale_frozen_unfreeze);

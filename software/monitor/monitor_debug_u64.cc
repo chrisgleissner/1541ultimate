@@ -254,6 +254,8 @@ protected:
     // ROM image buffers for BASIC/KERNAL/CHAR ranges so we can step KERNAL
     // code without copying ROMs into C64 RAM.
     virtual bool supports_visible_rom_patching(void) const { return true; }
+    // Visible-ROM fetches can lag monitor writes on the live U64 path.
+    virtual bool visible_rom_fetch_lags(void) const { return true; }
     virtual uint8_t read_patch_byte(uint16_t addr, uint8_t cpu_port)
     {
         volatile uint8_t *rom = rom_patch_ptr(addr, cpu_port);
@@ -272,6 +274,7 @@ protected:
         if (!dst) {
             return false;
         }
+        // Match the bank used by the step launch.
         uint8_t cpu_port = current_cpu_port();
         for (uint8_t i = 0; i < len; i++) {
             uint16_t current = (uint16_t)(address + i);
@@ -289,7 +292,8 @@ protected:
     {
         volatile uint8_t *rom = rom_patch_ptr(addr, cpu_port);
         if (rom) {
-            *rom = byte;
+            // Write through the served-image path, not a raw pointer store.
+            machine->poke_cpu_rom(rom, byte);
             if (u64_mark_rom_image_dirty) u64_mark_rom_image_dirty();
             remember_rom_patch_shadow(addr, byte, cpu_port);
             wait_for_cpu_visible_rom_byte(addr, cpu_port, byte);

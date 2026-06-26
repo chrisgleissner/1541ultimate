@@ -567,6 +567,7 @@ def wait_for_monitor_ready(host: str, port: int, password: Optional[str], timeou
             after_snapshot = session.send_char("O")
             after = after_snapshot.line(after_snapshot.find_status_line())
             if before != after:
+                session.send_key("CTRL_O")
                 return
         except (Failure, OSError, TimeoutError, urllib.error.URLError) as exc:
             last_error = exc

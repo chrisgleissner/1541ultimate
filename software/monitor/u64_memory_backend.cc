@@ -12,9 +12,10 @@ extern uint8_t _default_chars_bin_start[4096];
 
 namespace {
 
-static uint8_t monitor_basic_rom[8192];
-static uint8_t monitor_kernal_rom[8192];
-static uint8_t monitor_char_rom[4096];
+// FileManager may fill these through 32-bit stores.
+alignas(4) static uint8_t monitor_basic_rom[8192];
+alignas(4) static uint8_t monitor_kernal_rom[8192];
+alignas(4) static uint8_t monitor_char_rom[4096];
 
 static void snapshot_u64_rom(volatile uint8_t *src, uint8_t *dst, uint16_t len)
 {

@@ -120,6 +120,9 @@ public:
         return read(0x0001) & 0x07;
     }
 
+    // Drop any cached live-bank snapshot before the next read.
+    virtual void invalidate_live_cpu_port_cache(void) { }
+
     virtual MonitorBackingStore backing_store_for_cpu_port(uint16_t address, uint8_t cpu_port) const
     {
         return monitor_backing_store_for_cpu_port(address, cpu_port);
