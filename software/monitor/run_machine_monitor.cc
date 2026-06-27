@@ -55,6 +55,13 @@ void UserInterface :: run_machine_monitor(MemoryBackend *backend)
         int ret = 0;
         while(!ret && host->exists()) {
             ret = monitor->poll(0);
+            // A menu-button push (hardware or REST) while the monitor owns the
+            // loop closes the monitor; pollMenuButtonPush() re-arms the push so
+            // the outer run_once() loop also tears the menu down, landing the
+            // user back on the live machine instead of a dismissed-menu shell.
+            if (!ret && pollMenuButtonPush()) {
+                break;
+            }
         }
         bool exit_ui = ret == MENU_EXIT;
         // C=+I inside the monitor routes to swap_interface_type(), which toggles
