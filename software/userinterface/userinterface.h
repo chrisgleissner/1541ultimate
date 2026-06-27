@@ -135,6 +135,14 @@ public:
     void send_keystroke(int key);
     bool handle_global_reset_shortcut(void);
     static bool anyMenuActive(void);
+    enum {
+        ACTIVE_SCREEN_MATRIX_WIDTH = 40,
+        ACTIVE_SCREEN_MATRIX_HEIGHT = 25,
+        ACTIVE_SCREEN_MATRIX_CELLS = ACTIVE_SCREEN_MATRIX_WIDTH * ACTIVE_SCREEN_MATRIX_HEIGHT,
+        ACTIVE_SCREEN_MATRIX_PLANES = 2,
+        ACTIVE_SCREEN_MATRIX_BYTES = ACTIVE_SCREEN_MATRIX_CELLS * ACTIVE_SCREEN_MATRIX_PLANES
+    };
+    static bool copy_active_screen_matrix(uint8_t *dest, int dest_len);
 
     UIObject *get_root_object(void) { return ui_objects[0]; }
 
