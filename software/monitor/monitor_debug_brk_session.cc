@@ -1182,6 +1182,24 @@ void BrkDebugSession :: resume_from_parked_context(const DebugContext &from)
     uint8_t resume_ddr = from.cpu_port_registers_valid ? from.cpu_ddr : 0x37;
     uint8_t resume_port = from.cpu_port_registers_valid ?
         from.cpu_port_latch : (uint8_t)(from.live_cpu_port & 0x07);
+    // Handing the CPU back to free-running operation must re-enable interrupts so
+    // the C64 returns to a LIVE runtime. The debugger single-steps with interrupts
+    // masked (I=1) so a step is not interrupted; that mask is faithfully captured
+    // into ctx->sr (a program's own CLI/SEI is preserved - verified), but for a
+    // program that never re-enables interrupts (e.g. BASIC's idle loop) it leaks
+    // into the resume and the cursor/keyboard/jiffy stay dead until a reset. Clear
+    // I here so leaving Debug/closing the monitor resumes a live machine.
+    //
+    // ONLY when KERNAL is mapped (HIRAM, $01 bit 1, set): a program running with
+    // KERNAL banked out has no IRQ handler at $FFFE and legitimately requires
+    // I=1, so re-enabling interrupts there would wedge it worse than the freeze.
+    // Use the DDR-resolved effective bank when available.
+    uint8_t resume_effective_port = from.live_cpu_port_valid ?
+        (uint8_t)(from.live_cpu_port & 0x07) : (uint8_t)(resume_port & 0x07);
+    uint8_t resume_sr = from.sr;
+    if (resume_effective_port & 0x02) {
+        resume_sr &= (uint8_t)~0x04;
+    }
     poke_visible_preserving_freeze_restore(0x0000, resume_ddr);
     poke_visible_preserving_freeze_restore(0x0001, resume_port);
     const uint8_t bytes[] = {
@@ -1195,7 +1213,7 @@ void BrkDebugSession :: resume_from_parked_context(const DebugContext &from)
         0x48,
         0xA9, (uint8_t)(from.pc & 0xFF),
         0x48,
-        0xA9, from.sr,
+        0xA9, resume_sr,
         0x48,
         0xA0, from.y,
         0xA2, from.x,

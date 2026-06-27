@@ -673,6 +673,24 @@ def rom_step_cycle(rest_host: str, session: "mt.MonitorSession", label: str) -> 
     return validations
 
 
+def _soak_exit_liveness_cycle(rest_host: str, session: "mt.MonitorSession",
+                              context: str) -> None:
+    """One natural-exit liveness proof: step a normal ($01=$37) RAM loop, then
+    leave Debug + close the monitor (NO reset) and prove the C64 is still LIVE
+    (jiffy IRQ alive), then re-enter and prove Debug works again. Guards the
+    frozen-BASIC regression where leaving the monitor masked interrupts."""
+    dbg._reset_c64_core(rest_host)
+    dbg._reopen_monitor(session)
+    mt.write_rest_memory(rest_host, 0xC000, bytes.fromhex("EE20D04C00C0"))  # INC $D020;JMP
+    session.goto("C000")
+    session.send_char("A")
+    session.send_char("D")
+    dbg._step_and_assert_pc(session, "D", 0xC003, f"{context} step")
+    dbg.prove_monitor_exit_basic_liveness_and_reentry(
+        rest_host, session, context, require_jiffy=True,
+        progress_oracle=dbg._resumed_loop_oracle(rest_host, 0xD020))
+
+
 def run_soak(args: argparse.Namespace, rest_host: str, session: "mt.MonitorSession") -> None:
     original_port = mt.read_rest_memory(rest_host, 0x0001, 1)[0]
 
@@ -685,8 +703,10 @@ def run_soak(args: argparse.Namespace, rest_host: str, session: "mt.MonitorSessi
     rom_validations = 0
     step_out_validations = 0
     cleanup_validations = 0
+    exit_liveness_validations = 0
     trace_replay_validations = 0
     restarts = 0
+    last_exit_liveness_steps = 0
     mem = Memory(rest_host)
 
     try:
@@ -718,8 +738,29 @@ def run_soak(args: argparse.Namespace, rest_host: str, session: "mt.MonitorSessi
             cleanup_validations += 1
             mem.cache.clear()
 
+        with mt.check("Debug soak: natural-exit BASIC liveness + re-entry"):
+            _soak_exit_liveness_cycle(rest_host, session, "initial soak exit-liveness proof")
+            exit_liveness_validations += 1
+            mem.cache.clear()
+
         deadline = time.time() + args.duration
         while time.time() < deadline:
+            if (args.exit_liveness_every_entries > 0 and restarts > 0
+                    and restarts % args.exit_liveness_every_entries == 0):
+                _soak_exit_liveness_cycle(
+                    rest_host, session,
+                    f"periodic soak exit-liveness proof after {restarts} entries")
+                exit_liveness_validations += 1
+                mem.cache.clear()
+            elif (args.exit_liveness_every_validated_steps > 0 and validated_steps > 0
+                  and validated_steps - last_exit_liveness_steps
+                      >= args.exit_liveness_every_validated_steps):
+                last_exit_liveness_steps = validated_steps
+                _soak_exit_liveness_cycle(
+                    rest_host, session,
+                    f"periodic soak exit-liveness proof at {validated_steps} steps")
+                exit_liveness_validations += 1
+                mem.cache.clear()
             if restarts > 0 and restarts % 6 == 0:
                 rom_validations += rom_step_cycle(
                     rest_host, session, f"periodic ROM cycle after {restarts} entries")
@@ -792,6 +833,11 @@ def run_soak(args: argparse.Namespace, rest_host: str, session: "mt.MonitorSessi
     if cleanup_validations < 1:
         raise mt.Failure(
             f"Soak only validated {cleanup_validations} RAM cleanup cycles; expected at least 1")
+    if exit_liveness_validations < args.min_exit_liveness_validations:
+        raise mt.Failure(
+            f"Soak only ran {exit_liveness_validations} natural-exit BASIC-liveness "
+            f"validations; expected at least {args.min_exit_liveness_validations}. "
+            f"A soak that never proves the C64 survives leaving the monitor is not a pass.")
     if trace_replay_validations < args.autonomous_trace_runs:
         raise mt.Failure(
             f"Soak only validated {trace_replay_validations} autonomous-trace runs; "
@@ -800,6 +846,7 @@ def run_soak(args: argparse.Namespace, rest_host: str, session: "mt.MonitorSessi
           f"{rom_validations} ROM debug steps, "
           f"{step_out_validations} active-JSR Step Out cycles, "
           f"{cleanup_validations} cleanup cycles, "
+          f"{exit_liveness_validations} exit-liveness validations, "
           f"{trace_replay_validations} autonomous-trace runs across {restarts} entries)")
 
 
@@ -815,6 +862,19 @@ def main() -> int:
     parser.add_argument("--max-steps-per-entry", type=int, default=24)
     parser.add_argument("--min-validated-steps", type=int, default=50)
     parser.add_argument("--progress-every", type=int, default=100)
+    # Natural-exit BASIC-liveness cadence + floor. The soak periodically leaves
+    # the monitor, proves BASIC is alive (jiffy IRQ) and re-entry works, then
+    # continues. Failing once (frozen BASIC / reset required / re-entry failed)
+    # aborts the soak; running fewer than the floor also fails.
+    parser.add_argument("--exit-liveness-every-entries", type=int, default=8,
+                        help="Run a natural-exit liveness+re-entry proof every N "
+                             "routine entries (0 disables this cadence).")
+    parser.add_argument("--exit-liveness-every-validated-steps", type=int, default=0,
+                        help="Run a natural-exit liveness+re-entry proof every N "
+                             "validated steps (0 disables this cadence).")
+    parser.add_argument("--min-exit-liveness-validations", type=int, default=1,
+                        help="Minimum natural-exit liveness validations required "
+                             "for the soak to pass.")
     parser.add_argument("--autonomous-trace-runs", type=int, default=5)
     parser.add_argument("--autonomous-trace-steps", type=int, default=10)
     parser.add_argument("--autonomous-trace-settle", type=float, default=0.35)

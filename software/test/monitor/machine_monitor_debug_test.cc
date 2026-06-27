@@ -5917,13 +5917,18 @@ static int test_cleanup_resume_trampoline_restores_full_context()
                m.ram[FAKE_RESUME_TRAMP + 9] == 0xF9 &&
                m.ram[FAKE_RESUME_TRAMP + 10] == 0x9A,
                "Cleanup trampoline must restore SP before returning")) return 1;
+    // SR pushed for RTI is the captured 0xA4 with the I flag cleared (0xA0):
+    // KERNAL is mapped here ($01=$07), so the hand-back re-enables interrupts so
+    // the C64 returns to a live runtime instead of resuming with the cursor/
+    // keyboard/jiffy dead. See test_cleanup_resume_preserves_interrupts_when
+    // _kernal_banked_out for the complementary KERNAL-out (I preserved) case.
     if (expect(m.ram[FAKE_RESUME_TRAMP + 11] == 0xA9 &&
                m.ram[FAKE_RESUME_TRAMP + 12] == 0x20 &&
                m.ram[FAKE_RESUME_TRAMP + 14] == 0xA9 &&
                m.ram[FAKE_RESUME_TRAMP + 15] == 0x01 &&
                m.ram[FAKE_RESUME_TRAMP + 17] == 0xA9 &&
-               m.ram[FAKE_RESUME_TRAMP + 18] == 0xA4,
-               "Cleanup trampoline must push PCH, PCL, then SR for RTI")) return 1;
+               m.ram[FAKE_RESUME_TRAMP + 18] == 0xA0,
+               "Cleanup trampoline must push PCH, PCL, then SR (I re-enabled) for RTI")) return 1;
     if (expect(m.ram[FAKE_RESUME_TRAMP + 20] == 0xA0 &&
                m.ram[FAKE_RESUME_TRAMP + 21] == 0x99 &&
                m.ram[FAKE_RESUME_TRAMP + 22] == 0xA2 &&
@@ -5932,6 +5937,38 @@ static int test_cleanup_resume_trampoline_restores_full_context()
                m.ram[FAKE_RESUME_TRAMP + 25] == 0x42 &&
                m.ram[FAKE_RESUME_TRAMP + 26] == 0x40,
                "Cleanup trampoline must restore Y, X, A and finish with RTI")) return 1;
+    return 0;
+}
+
+// Complement of the test above: when KERNAL is banked OUT ($01 HIRAM clear) there
+// is no IRQ handler at $FFFE, so the resumed program legitimately runs with
+// interrupts masked. The hand-back must PRESERVE the captured I flag in that case
+// (clearing it would wedge the banked program worse than the freeze it avoids).
+static int test_cleanup_resume_preserves_interrupts_when_kernal_banked_out()
+{
+    FakeFreezeMachine m(false);
+    fake_seed_nop_run(m, 0x2000);
+    fake_seed_captured_context(m, 0x2001, 0xF9, 0x42, 0x17, 0x99, 0xA4);
+    // Override the seeded banking to KERNAL-out (HIRAM clear) before the step so
+    // the captured context resumes with KERNAL unmapped.
+    m.ram[FAKE_STORE_CPU_DDR] = 0x07;
+    m.ram[FAKE_STORE_CPU_PORT] = 0x05;   // %101: HIRAM clear -> KERNAL banked out
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext next;
+    if (expect(m.over_at(0x2000, pred, &next) == DebugSession::DBG_OK,
+               "Setup step must succeed before KERNAL-out cleanup")) return 1;
+
+    m.cleanup();
+
+    if (expect(m.ram[FAKE_RESUME_TRAMP + 5] == 0x05,
+               "KERNAL-out resume must restore the banked-out $01")) return 1;
+    if (expect(m.ram[FAKE_RESUME_TRAMP + 17] == 0xA9 &&
+               m.ram[FAKE_RESUME_TRAMP + 18] == 0xA4,
+               "KERNAL-out resume must PRESERVE the I flag (no $FFFE handler)")) return 1;
     return 0;
 }
 
@@ -7095,6 +7132,7 @@ int main()
     RUN(test_overlay_step_timeout_then_recovers);
     RUN(test_freeze_step_timeout_refreezes_and_recovers);
     RUN(test_cleanup_resume_trampoline_restores_full_context);
+    RUN(test_cleanup_resume_preserves_interrupts_when_kernal_banked_out);
     RUN(test_nmi_launch_trampoline_balances_stack);
     RUN(test_kernal_out_cold_nmi_launch_installs_hard_nmi_vector);
     RUN(test_kernal_out_cold_nmi_launch_restores_hard_nmi_vector_on_timeout);

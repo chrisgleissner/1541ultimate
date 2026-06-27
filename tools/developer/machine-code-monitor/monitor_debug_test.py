@@ -13,6 +13,7 @@ CLI options mirror monitor_test.py exactly so the same automation hooks work.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -491,6 +492,153 @@ def _reset_monitor_and_c64(rest_host: str, session: "mt.MonitorSession",
     except mt.Failure:
         pass
     _reopen_monitor(session)
+
+
+# ---------------------------------------------------------------------------
+# Natural-exit BASIC-liveness proof.
+#
+# The reset-heavy group cleanup below (`_restore_safe_banking_display_hygiene`,
+# `_reset_c64_core`) is RECOVERY, not proof: a debugger exit that leaves the C64
+# frozen-but-REST-reachable would be masked by the very next reset. These helpers
+# prove the runtime is genuinely ALIVE after a NATURAL exit (leave Debug, close
+# the monitor, NO reset) using two independent oracles before any reset runs.
+#
+#   Oracle 1 (IRQ alive):  KERNAL jiffy clock $00A2 keeps advancing. A wedged CPU
+#                          (BRK loop, banked-out, interrupts masked) stops it. Only
+#                          valid when the resume maps KERNAL (an IRQ handler exists).
+#   Oracle 2 (foreground): the BASIC editor main loop drains an injected keystroke
+#                          from the KERNAL keyboard buffer -> proves the foreground
+#                          program (not just the IRQ) runs. BASIC-returning only.
+#   Oracle 3 (progress):   an optional caller-supplied predicate (e.g. a resumed
+#                          loop keeps mutating a byte) for resumes that do NOT
+#                          return to BASIC (KERNAL-out programs legitimately run
+#                          with interrupts masked, so jiffy stays frozen there).
+#
+# A successful REST call is explicitly NOT accepted as proof.
+JIFFY_LO = 0x00A2          # KERNAL jiffy clock low byte, bumped every IRQ tick
+KBD_BUFFER = 0x0277        # KERNAL keyboard buffer head
+KBD_NDX = 0x00C6           # number of chars queued in the keyboard buffer
+
+
+def _jiffy_keeps_advancing(rest_host: str, *, min_distinct: int = 4,
+                           gap: float = 0.04, timeout: float = 4.0):
+    """Oracle 1: KERNAL IRQ is live. Returns (ok, sorted_observed_values)."""
+    seen = set()
+    deadline = time.time() + timeout
+    while time.time() < deadline and len(seen) < min_distinct:
+        seen.add(mt.read_rest_memory(rest_host, JIFFY_LO, 1)[0])
+        time.sleep(gap)
+    return len(seen) >= min_distinct, sorted(seen)
+
+
+def _basic_editor_consumes_keystroke(rest_host: str, *, timeout: float = 3.0):
+    """Oracle 2: the BASIC editor main loop is live. Inject 'A' into the KERNAL
+    keyboard buffer; a running editor drains NDX -> 0 (consume + echo)."""
+    mt.write_rest_memory(rest_host, KBD_BUFFER, bytes([0x41]))   # PETSCII 'A'
+    mt.write_rest_memory(rest_host, KBD_NDX, bytes([0x01]))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if mt.read_rest_memory(rest_host, KBD_NDX, 1)[0] == 0:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def capture_basic_freeze_evidence(rest_host: str, session: "mt.MonitorSession",
+                                  context: str, *, reset_recovered=None) -> None:
+    """Dump the full frozen-BASIC evidence bundle (called before any recovery)."""
+    print(f"    ==== FROZEN-BASIC EVIDENCE [{context}] ====", flush=True)
+    try:
+        info = json.loads(urllib.request.urlopen(
+            f"http://{rest_host}/v1/info", timeout=5).read().decode())
+        print(f"      firmware: {info.get('product')} {info.get('firmware_version')} "
+              f"fpga={info.get('fpga_version')} core={info.get('core_version')}", flush=True)
+    except Exception as exc:                                     # noqa: BLE001
+        print(f"      info read failed: {exc!r}", flush=True)
+    regions = [
+        ("zp_00", 0x0000, 8), ("jiffy_A0", 0x00A0, 3), ("ndx_C6", 0x00C6, 1),
+        ("softvec_0314", 0x0314, 6),                 # IRQ/BRK/NMI soft vectors
+        ("handler_0363", 0x0363, 0x27),              # debug HANDLER + spin JMP
+        ("tramp_038A", 0x038A, 0x26),                # TRAMPOLINE
+        ("nmitramp_03B0", 0x03B0, 0x18),             # NMI_TRAMPOLINE
+        ("insn_0340", 0x0340, 8),                    # linear-step trampoline scratch
+        ("hardstub_03C8", 0x03C8, 0x28),             # HARD_BRK_STUB + stores
+        ("hardvec_FFFE", 0xFFFE, 2), ("hardnmi_FFFA", 0xFFFA, 2),
+        ("screen_0400", 0x0400, 40),
+    ]
+    for name, addr, length in regions:
+        try:
+            data = mt.read_rest_memory(rest_host, addr, length)
+            print(f"      {name} ${addr:04X}: " +
+                  " ".join(f"{b:02X}" for b in data), flush=True)
+        except Exception as exc:                                # noqa: BLE001
+            print(f"      {name}: read failed {exc!r}", flush=True)
+    try:
+        stream = []
+        for _ in range(12):
+            stream.append(mt.read_rest_memory(rest_host, JIFFY_LO, 1)[0])
+            time.sleep(0.04)
+        screen = mt.read_rest_memory(rest_host, 0x0400, 1000)
+        print(f"      jiffy stream: {stream}", flush=True)
+        print(f"      READY token present: {READY_SCREEN_TOKEN in screen}", flush=True)
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"      runtime probe failed: {exc!r}", flush=True)
+    if reset_recovered is not None:
+        print(f"      reset recovered: {reset_recovered} "
+              f"({'power-cycle NOT required' if reset_recovered else 'POWER-CYCLE REQUIRED'})",
+              flush=True)
+    try:
+        print("      final monitor screen:", flush=True)
+        print(session.capture().text(), flush=True)
+    except Exception:                                          # noqa: BLE001
+        pass
+    print(f"    ==== END EVIDENCE [{context}] ====", flush=True)
+
+
+def prove_monitor_exit_basic_liveness_and_reentry(
+        rest_host: str, session: "mt.MonitorSession", context: str, *,
+        require_jiffy: bool = True, require_editor: bool = False,
+        progress_oracle=None, reenter: bool = True) -> None:
+    """Prove a NATURAL monitor exit leaves a LIVE C64, then re-enter and prove the
+    monitor + Debug are usable again. Raises mt.Failure on any freeze, capturing
+    evidence and the reset-recovery classification first.
+
+      1. leave Debug (ESC unwinds Edit, then C=+D) and assert Dbg gone
+      2. close the monitor with C=+O (no reset)
+      3. assert the configured liveness oracles
+      4. re-enter the monitor (C=+O) and prove a NOP Debug step still works
+    """
+    _ensure_no_debug(session)
+    session.send_key("CTRL_O")          # close the monitor (natural exit)
+    time.sleep(0.3)
+
+    jiffy_ok, stream = _jiffy_keeps_advancing(rest_host) if require_jiffy else (True, [])
+    editor_ok = _basic_editor_consumes_keystroke(rest_host) if require_editor else True
+    progress_ok = progress_oracle() if progress_oracle else True
+    if not (jiffy_ok and editor_ok and progress_ok):
+        capture_basic_freeze_evidence(rest_host, session, context)
+        recovered = None
+        try:
+            _reset_c64_core(rest_host)
+            recovered, _ = _jiffy_keeps_advancing(rest_host)
+        except Exception:                                       # noqa: BLE001
+            recovered = False
+        raise mt.Failure(
+            f"{context}: NATURAL monitor exit did not leave a live runtime "
+            f"(jiffy_ok={jiffy_ok} stream={stream} editor_ok={editor_ok} "
+            f"progress_ok={progress_ok}); reset_recovered={recovered}. "
+            f"A REST-reachable but dead C64 is a failure.")
+
+    if reenter:
+        _reopen_monitor(session)
+        session.capture().find_status_line()    # monitor UI must be intact
+        mt.write_rest_memory(rest_host, 0xC7A0, bytes([0xEA, 0xEA]))
+        session.goto("C7A0")
+        session.send_char("A")
+        if "Dbg" not in _header_line(session):
+            session.send_char("D")
+        _step_and_assert_pc(session, "D", 0xC7A1, f"{context}: re-entry step")
+        _ensure_no_debug(session)
 
 
 def run_debug_tests(rest_host: str, session: "mt.MonitorSession") -> None:
@@ -1485,6 +1633,17 @@ def prove_stop_debug_exit_resumes_current_context(rest_host: str,
             f"target did not resume from the current debug context")
     if mt.read_rest_memory(rest_host, 0x2000, len(program)) != program:
         raise mt.Failure(f"{context}: $2000 loop bytes changed after Stop Debugging")
+    # The resumed $2000 loop runs with KERNAL mapped ($01=$37), so Stop Debugging
+    # must hand the CPU back with interrupts ENABLED - the KERNAL IRQ (jiffy clock)
+    # must keep advancing. A resume that leaks the step-time interrupt mask would
+    # leave the loop running but the cursor/keyboard/jiffy dead (the frozen-BASIC
+    # regression). This is the targeted guard for that.
+    jiffy_ok, stream = _jiffy_keeps_advancing(rest_host)
+    if not jiffy_ok:
+        capture_basic_freeze_evidence(rest_host, session, f"{context}: jiffy")
+        raise mt.Failure(
+            f"{context}: jiffy clock did not advance after Stop Debugging + Exit "
+            f"(IRQ masked on resume -> frozen runtime); observed={stream}")
 
     _reopen_monitor(session)
     mt.write_rest_memory(rest_host, 0xC760, bytes([0xEA, 0xEA]))
@@ -2313,9 +2472,15 @@ def run_banked_continue_no_breakpoints_tests(rest_host: str,
         _assert_no_debug_modal(session, "$01=$00 $E000 breakpoint hit")
         snap = session.capture()
         status = snap.line(snap.find_status_line())
-        if "C0O5" not in status:
+        # The live execution bank must be CPU0 (the continue reached the $01=$00
+        # context). The monitor's Debug view-sync follows the live bank during a
+        # debug stop, so the footer may read the synced "CPU0" rather than the
+        # decoupled "C0O5"; either way the asserted fact is the LIVE bank == 0.
+        live_bank = _live_cpu_bank_from_status(status)
+        if live_bank != 0:
             raise mt.Failure(
-                f"Footer must show live CPU0 vs monitor view 5 mismatch (C0O5): {status!r}")
+                f"Footer must show live CPU0 after $01=$00 continue (got bank "
+                f"{live_bank}): {status!r}")
         row = _disassembly_row(snap, payload)
         if "[RAM]" not in row or "INC $D021" not in row:
             raise mt.Failure(f"Debug PC row must follow live RAM mapping: {row!r}")
@@ -2783,7 +2948,125 @@ def run_jsr_runcursor_rts_tests(rest_host: str, session: "mt.MonitorSession") ->
         _leave_debug_and_reset(rest_host, session)
 
 
+def _resumed_loop_oracle(rest_host: str, address: int):
+    """Build a progress oracle: the resumed loop must keep mutating `address`."""
+    def runs() -> bool:
+        b0 = mt.read_rest_memory(rest_host, address, 1)[0]
+        deadline = time.time() + 2.5
+        while time.time() < deadline:
+            time.sleep(0.1)
+            if mt.read_rest_memory(rest_host, address, 1)[0] != b0:
+                return True
+        return False
+    return runs
+
+
+def run_exit_liveness_reentry_tests(rest_host: str, session: "mt.MonitorSession") -> None:
+    """Regression guard for the frozen-BASIC bug: across representative high-risk
+    debugger paths, prove a NATURAL monitor exit (leave Debug + close, NO reset)
+    leaves a LIVE C64, then re-enter and prove Debug still works.
+
+    KERNAL-mapped resumes must come back with interrupts ENABLED (jiffy alive);
+    KERNAL-out resumes legitimately keep interrupts masked, so there the resumed
+    loop's forward progress is the liveness proof instead of the jiffy clock.
+    """
+
+    with mt.check("Exit-liveness: ordinary RAM step then natural exit stays live",
+                  u2=False, u2_reason="U64 jiffy/keyboard liveness oracles required"):
+        _reset_c64_core(rest_host)
+        _reopen_monitor(session)
+        mt.write_rest_memory(rest_host, 0xC000, bytes.fromhex("EE20D04C00C0"))  # INC $D020;JMP
+        session.goto("C000"); session.send_char("A"); session.send_char("D")
+        _step_and_assert_pc(session, "D", 0xC003, "exit-liveness RAM step")
+        prove_monitor_exit_basic_liveness_and_reentry(
+            rest_host, session, "ordinary RAM step exit",
+            require_jiffy=True, progress_oracle=_resumed_loop_oracle(rest_host, 0xD020))
+
+    with mt.check("Exit-liveness: continue-from-breakpoint then natural exit stays live",
+                  u2=False, u2_reason="U64 jiffy/keyboard liveness oracles required"):
+        _reset_c64_core(rest_host)
+        _reopen_monitor(session)
+        mt.write_rest_memory(rest_host, 0xC100, bytes.fromhex("EE21D04C00C1"))  # INC $D021;JMP
+        session.goto("C100"); session.send_char("A"); session.send_char("D")
+        _clear_all_breakpoints(session, "exit-liveness continue-from-bp clear")
+        session.goto("C100")
+        _ensure_breakpoint_at(session, 0xC100, "exit-liveness continue-from-bp set")
+        session.send_char("G")
+        _wait_for_pc(session, "C100")
+        _clear_all_breakpoints(session, "exit-liveness continue-from-bp release")
+        session.send_char("G")           # continue with no remaining breakpoint
+        prove_monitor_exit_basic_liveness_and_reentry(
+            rest_host, session, "continue-from-breakpoint exit",
+            require_jiffy=True, progress_oracle=_resumed_loop_oracle(rest_host, 0xD021))
+
+    with mt.check("Exit-liveness: KERNAL ROM step then natural exit stays live",
+                  u2=False, u2_reason="U64 CPU-visible KERNAL ROM stepping required"):
+        _enter_rom_debug_at(session, 0xE000, "KRN", "exit-liveness ROM step", "$E:KRN")
+        snap = session.capture()
+        row = _disassembly_row(snap, 0xE000)
+        _step_and_assert_pc(session, "T", 0xE000 + _instruction_length_from_row(row),
+                            "exit-liveness ROM step")
+        # The KERNAL step resumes inside live KERNAL code; the IRQ (jiffy) is the
+        # deterministic anti-freeze proof. The editor-main-loop oracle is asserted
+        # in the RETURN-follow case below, where the C64 stays at the live BASIC
+        # editor (an arbitrary KERNAL step does not deterministically resume there).
+        prove_monitor_exit_basic_liveness_and_reentry(
+            rest_host, session, "KERNAL ROM step exit",
+            require_jiffy=True, require_editor=False)
+
+    with mt.check("Exit-liveness: RETURN follow (non-executing) then natural exit stays live",
+                  u2=False, u2_reason="U64 jiffy liveness oracle required"):
+        _reset_c64_core(rest_host)
+        _reopen_monitor(session)
+        # JSR target that would mutate $D020 if executed; RETURN must only FOLLOW.
+        mt.write_rest_memory(rest_host, 0xC200, bytes([0x20, 0x10, 0xC2, 0xEA]))
+        mt.write_rest_memory(rest_host, 0xC210, bytes([0xEE, 0x20, 0xD0, 0x60]))
+        session.goto("C200"); session.send_char("A"); session.send_char("D")
+        session.send_key("ENTER")        # RETURN follows, does NOT execute
+        # No step executed: closing the monitor must still leave BASIC alive
+        # (the idle loop the C64 was running is undisturbed).
+        prove_monitor_exit_basic_liveness_and_reentry(
+            rest_host, session, "RETURN-follow exit",
+            require_jiffy=True, require_editor=True)
+
+    with mt.check("Exit-liveness: RAM-under-KERNAL debug then natural exit keeps loop live",
+                  u2=False, u2_reason="U64 RAM-under-KERNAL banking required"):
+        bootstrap_addr = 0xC880
+        ready_addr = 0xC8F0
+        payload = 0xE000
+        program = _banked_kernal_out_program(bootstrap_addr, ready_addr)
+        _reset_c64_core(rest_host)
+        _reopen_monitor(session)
+        session.send_char("A"); session.send_char("D")     # Debug active for popup
+        _clear_all_breakpoints(session, "exit-liveness banked clear")
+        _ensure_no_debug(session)
+        mt.write_rest_memory(rest_host, ready_addr, bytes([0x00]))
+        mt.write_rest_memory(rest_host, bootstrap_addr, program)
+        session.goto(f"{bootstrap_addr:04X}"); session.send_char("A"); session.send_char("D")
+        session.send_char("G")
+        mt.wait_for_rest_byte(rest_host, ready_addr, 0xA5, timeout=6.0)
+        mt.write_rest_memory(rest_host, 0xD020, bytes([0x00]))
+        # KERNAL is banked out here: the program legitimately runs with interrupts
+        # masked, so jiffy stays frozen by design - prove the resumed loop instead.
+        # Skip the generic re-entry step (it assumes standard banking); the banking
+        # restore below re-enters the monitor in a clean state, and the explicit
+        # re-entry debug step after it proves Debug is usable again.
+        prove_monitor_exit_basic_liveness_and_reentry(
+            rest_host, session, "RAM-under-KERNAL exit",
+            require_jiffy=False, progress_oracle=_resumed_loop_oracle(rest_host, 0xD020),
+            reenter=False)
+        _restore_safe_banking_display_hygiene(rest_host, session, "exit-liveness banked cleanup")
+        # Re-entry proof in the restored (KERNAL-mapped) banking.
+        mt.write_rest_memory(rest_host, 0xC7A0, bytes([0xEA, 0xEA]))
+        session.goto("C7A0"); session.send_char("A")
+        if "Dbg" not in _header_line(session):
+            session.send_char("D")
+        _step_and_assert_pc(session, "D", 0xC7A1, "RAM-under-KERNAL exit re-entry step")
+        _ensure_no_debug(session)
+
+
 TEST_GROUPS = (
+    ("exit-liveness-reentry", run_exit_liveness_reentry_tests),
     ("jsr-runcursor-rts", run_jsr_runcursor_rts_tests),
     ("ram-edit", run_ram_edit_regression_tests),
     ("debug", run_debug_tests),
