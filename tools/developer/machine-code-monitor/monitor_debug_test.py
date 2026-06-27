@@ -225,13 +225,13 @@ def _find_visible_jsr_row(snap: mt.Snapshot, marker: str) -> tuple[int, str]:
 
 
 def _dump_debug_scratch(rest_host: str, context: str) -> None:
-    """Print the RAM-resident BRK debug scratch + vectors for [43] diagnosis.
+    """Print the RAM-resident BRK debug scratch + vectors for diagnosis.
 
     All addresses are CPU-visible RAM read via REST DMA. The cassette buffer
     ($0363-$03FB) holds the debug HANDLER/TRAMPOLINE/NMI_TRAMPOLINE/HARD_BRK_STUB
     and register stores. Reset heals the FPGA ROM image but NOT this RAM, so a
     stale launch-trampoline JMP target or stale vector here is the prime suspect
-    for the second-pass "$0002" capture.
+    when a re-entered debug session captures the wrong address.
     """
     try:
         regions = [
@@ -954,10 +954,9 @@ def _parse_footer_values(values_line: str):
 def _wait_for_pc(session: "mt.MonitorSession", expected_pc: str,
                  timeout: float = 6.0) -> dict:
     """Poll the debug footer until PC matches `expected_pc`."""
-    import time as _time
-    deadline = _time.time() + timeout
+    deadline = time.time() + timeout
     last = None
-    while _time.time() < deadline:
+    while time.time() < deadline:
         snap = session.capture()
         _assert_no_debug_modal_snapshot(snap, f"Waiting for PC {expected_pc}")
         values = _footer_value_line(session)
@@ -965,7 +964,7 @@ def _wait_for_pc(session: "mt.MonitorSession", expected_pc: str,
         last = parsed
         if parsed["pc"].upper() == expected_pc.upper():
             return parsed
-        _time.sleep(0.1)
+        time.sleep(0.1)
     raise mt.Failure(f"PC did not reach {expected_pc}; last footer={last!r} ({values!r})")
 
 
@@ -973,11 +972,10 @@ def _wait_for_pc_register(session: "mt.MonitorSession", expected_pc: str,
                           register: str, expected_value: str,
                           timeout: float = 6.0) -> dict:
     """Poll until the footer reaches PC with a register value from the new stop."""
-    import time as _time
-    deadline = _time.time() + timeout
+    deadline = time.time() + timeout
     last = None
     register = register.lower()
-    while _time.time() < deadline:
+    while time.time() < deadline:
         snap = session.capture()
         _assert_no_debug_modal_snapshot(
             snap, f"Waiting for PC {expected_pc} {register.upper()}={expected_value}")
@@ -987,7 +985,7 @@ def _wait_for_pc_register(session: "mt.MonitorSession", expected_pc: str,
         if (parsed["pc"].upper() == expected_pc.upper() and
                 parsed.get(register, "").upper() == expected_value.upper()):
             return parsed
-        _time.sleep(0.1)
+        time.sleep(0.1)
     raise mt.Failure(
         f"PC/register did not reach {expected_pc} {register.upper()}={expected_value}; "
         f"last footer={last!r} ({values!r})")
@@ -995,10 +993,9 @@ def _wait_for_pc_register(session: "mt.MonitorSession", expected_pc: str,
 
 def _wait_for_pc_not(session: "mt.MonitorSession", previous_pc: str,
                      timeout: float = 6.0) -> dict:
-    import time as _time
-    deadline = _time.time() + timeout
+    deadline = time.time() + timeout
     last = None
-    while _time.time() < deadline:
+    while time.time() < deadline:
         snap = session.capture()
         _assert_no_debug_modal_snapshot(snap, f"Waiting for PC to leave {previous_pc}")
         values = _footer_value_line(session)
@@ -1006,7 +1003,7 @@ def _wait_for_pc_not(session: "mt.MonitorSession", previous_pc: str,
         last = parsed
         if parsed["pc"] and parsed["pc"].upper() != previous_pc.upper():
             return parsed
-        _time.sleep(0.1)
+        time.sleep(0.1)
     raise mt.Failure(f"PC did not advance from {previous_pc}; last footer={last!r}")
 
 
@@ -2208,11 +2205,6 @@ def _cancel_repeat_debug_and_reset(rest_host: str, session: "mt.MonitorSession",
     _reset_monitor_and_c64(rest_host, session)
 
 
-# Keep the former quarantine switch explicit and disabled so the repeated
-# RAM-under-KERNAL redebug check remains part of every full-suite pass.
-QUARANTINE_RAM_UNDER_KERNAL_REDEBUG_FLAKE = False
-
-
 def run_repeat_redebug_tests(rest_host: str, session: "mt.MonitorSession") -> None:
     """Repeat cancel/re-enter/step after Debug releases live looping code."""
 
@@ -2242,9 +2234,6 @@ def run_repeat_redebug_tests(rest_host: str, session: "mt.MonitorSession") -> No
     with mt.check("Debug: repeated cancel/redebug RAM-under-KERNAL loop keeps CPU5",
                   u2=False,
                   u2_reason="U64 RAM-under-KERNAL repeated live Debug re-entry is required"):
-        if QUARANTINE_RAM_UNDER_KERNAL_REDEBUG_FLAKE:
-            raise mt.SkipCheck(
-                "quarantined RAM-under-KERNAL repeated redebug check")
         _ensure_no_debug(session)
         _reset_c64_core(rest_host)
         _reopen_monitor(session)
@@ -2729,7 +2718,73 @@ def run_side_effect_step_tests(rest_host: str, session: "mt.MonitorSession") -> 
         _ensure_no_debug(session)
 
 
+def run_jsr_runcursor_rts_tests(rest_host: str, session: "mt.MonitorSession") -> None:
+    """Step into a visible-ROM JSR, run to the cursor at the subroutine's RTS,
+    then step the RTS. The live 6510 stack pointer must stay coherent across all
+    three operations so the RTS returns to the real caller. A regression here
+    (e.g. simulating the JSR by only moving the cached SP) leaves the live SP
+    un-decremented, so the RTS pulls the wrong slot and either returns to the
+    wrong address or never reaches its breakpoint (DEBUG TIMEOUT)."""
+
+    with mt.check("Debug: KERNAL JSR step-into + run-to-cursor at RTS + RTS keeps the stack coherent",
+                  u2=False,
+                  u2_reason="U64 CPU-visible KERNAL/BASIC ROM stepping is required"):
+        _reset_c64_core(rest_host)
+        # This pattern relies on the canonical C64 KERNAL: $E000 STA $56,
+        # $E002 JSR $BC0F (the subroutine at $BC0F ends with an RTS at $BC1A).
+        kernal = mt.read_rest_memory(rest_host, 0xE000, 5)
+        if kernal != bytes([0x85, 0x56, 0x20, 0x0F, 0xBC]):
+            print(f"[info] non-canonical KERNAL at $E000 ({kernal.hex()}); skipping pattern",
+                  flush=True)
+            return
+        _enter_rom_debug_at(session, 0xE000, "KRN", "JSR/run-cursor/RTS", "$E:KRN")
+
+        # E000 STA $56 -> E002
+        _step_and_assert_pc(session, "T", 0xE002, "step STA $56")
+        # E002 JSR $BC0F -> step INTO -> BC0F (the real JSR must run)
+        into = _step_and_assert_pc(session, "T", 0xBC0F, "step into JSR $BC0F")
+        sp_into = int(into["sp"], 16)
+        stack = mt.read_rest_memory(rest_host, 0x0100, 256)
+        ret = stack[(sp_into + 1) & 0xFF] | (stack[(sp_into + 2) & 0xFF] << 8)
+        if ret != 0xE004:
+            raise mt.Failure(
+                f"JSR return address not on the live stack at the SP slot RTS reads: "
+                f"got ${ret:04X}, SP=${sp_into:02X}")
+
+        # Park the cursor on the subroutine's RTS ($BC1A) and run-to-cursor (K).
+        session.goto("BC1A")
+        session.send_char("K")
+        at_rts = _wait_for_pc(session, "BC1A", timeout=10.0)
+        sp_rts = int(at_rts["sp"], 16)
+        if sp_rts != sp_into:
+            raise mt.Failure(
+                f"run-to-cursor through the subroutine must not move SP: "
+                f"${sp_into:02X} -> ${sp_rts:02X}")
+        stack = mt.read_rest_memory(rest_host, 0x0100, 256)
+        ret2 = stack[(sp_rts + 1) & 0xFF] | (stack[(sp_rts + 2) & 0xFF] << 8)
+        if ret2 != 0xE004:
+            raise mt.Failure(
+                f"run-to-cursor corrupted the stacked return address: ${ret2:04X}")
+
+        # Step the RTS: it must return to the real caller ($E005) and pop two
+        # bytes. A wrong SP would time out (BRK never hit) or return elsewhere.
+        out = _step_and_assert_pc(session, "T", 0xE005, "RTS returns to caller $E005")
+        sp_back = int(out["sp"], 16)
+        if ((sp_back - sp_into) & 0xFF) != 2:
+            raise mt.Failure(
+                f"RTS did not pop the 2-byte return address: SP ${sp_into:02X} -> ${sp_back:02X}")
+
+        # Leaving the monitor must not wedge the C64 (jiffy clock keeps running).
+        _ensure_no_debug(session)
+        _assert_rest_byte_changes(
+            rest_host, 0x00A2,
+            "C64 must stay live after JSR/run-to-cursor/RTS (no wedge)",
+            minimum_values=2)
+        _leave_debug_and_reset(rest_host, session)
+
+
 TEST_GROUPS = (
+    ("jsr-runcursor-rts", run_jsr_runcursor_rts_tests),
     ("ram-edit", run_ram_edit_regression_tests),
     ("debug", run_debug_tests),
     ("flags", run_flag_control_flow_tests),

@@ -50,7 +50,6 @@ void UserInterface :: run_machine_monitor(MemoryBackend *backend)
         monitor->set_debug_run_window_refreeze_enabled(false);
         monitor->set_reset_exits_monitor(false);
 #endif
-        active_machine_monitor = monitor;
         active_reset_monitor = monitor;
         monitor->init(screen, keyboard);
         int ret = 0;
@@ -71,7 +70,6 @@ void UserInterface :: run_machine_monitor(MemoryBackend *backend)
         bool deferred_debug_go = monitor->has_deferred_debug_go();
         reopen_after_reset = monitor->consume_reopen_after_reset();
         monitor->deinit();
-        active_machine_monitor = NULL;
         active_reset_monitor = NULL;
         if (deferred_debug_go && release_after_exit) {
 #if defined(U64) && (U64) && !defined(RUNS_ON_PC)
@@ -147,15 +145,6 @@ void UserInterface :: run_machine_monitor(MemoryBackend *backend)
     } while (reopen_after_reset && host->exists());
 }
 
-extern "C" bool machine_monitor_request_reset_reentry(void *monitor)
-{
-    if (!monitor) {
-        return false;
-    }
-    ((MachineMonitor *)monitor)->request_reopen_after_reset();
-    return true;
-}
-
 extern "C" bool machine_monitor_request_global_reset_cancel(void)
 {
     // On every C64 hardware reset, reset the saved CPU view to CPU7 so the
@@ -165,9 +154,19 @@ extern "C" bool machine_monitor_request_global_reset_cancel(void)
     if (!active_reset_monitor) {
         return false;
     }
+    // Reset makes any captured live-bank snapshot stale.
+    active_reset_monitor->invalidate_live_cpu_port_view();
     // Only cancel the in-flight debug wait. Do NOT call request_reopen_after_reset()
     // here: that would save stale monitor state and schedule a spurious reopen
     // on every REST/menu reset that happens to fire while the monitor is visible.
     active_reset_monitor->request_debug_reset_cancel();
     return true;
+}
+
+extern "C" bool machine_monitor_global_reset_sees_debug_session(void)
+{
+    if (!active_reset_monitor) {
+        return false;
+    }
+    return active_reset_monitor->is_debug_session_active();
 }

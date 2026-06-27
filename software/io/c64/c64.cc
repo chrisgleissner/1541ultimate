@@ -92,7 +92,12 @@ static void capture_pristine_rom_image(void)
 
 static void restore_pristine_rom_image(void)
 {
-    if (!s_pristine_rom_valid) {
+    // Only heal when the monitor's debug path actually patched the ROM image
+    // (u64_mark_rom_image_dirty sets the flag). Restoring unconditionally would
+    // clobber a runtime KERNAL/BASIC replacement (enable_kernal via cartridge,
+    // network upload, or the C64_SET_KERNAL subsys command) that writes the
+    // apertures directly without ever dirtying them.
+    if (!s_pristine_rom_valid || !g_u64_rom_image_dirty) {
         return;
     }
     copy_rom_aperture_out((volatile uint8_t *)U64_BASIC_BASE,   s_pristine_basic,  sizeof(s_pristine_basic));
@@ -1280,6 +1285,9 @@ void C64::enable_kernal(uint8_t *rom)
 
 #if U64
     memcpy((void *)U64_KERNAL_BASE, rom, 8192); // as simple as that
+    // Re-snapshot so a later reset heals to THIS kernal rather than the boot
+    // default, and so the dirty flag is cleared for the fresh image.
+    capture_pristine_rom_image();
 
 #else
     //  mem_addr_i <= g_kernal_base(27 downto 15) & slot_addr(1 downto 0) & slot_addr(12 downto 2) & "00";

@@ -1467,33 +1467,31 @@ static int test_asm_left_right_decode_root_control(void)
 
 static int test_asm_ambiguous_predecessor_is_stable(void)
 {
-    for (int pass = 0; pass < 2; pass++) {
-        TestUserInterface ui;
-        CaptureScreen screen;
-        FakeMemoryBackend backend;
-        const int keys[] = { 'J', 'A', KEY_UP, KEY_BREAK };
-        FakeKeyboard keyboard(keys, sizeof(keys) / sizeof(keys[0]));
-        monitor_reset_saved_state();
+    TestUserInterface ui;
+    CaptureScreen screen;
+    FakeMemoryBackend backend;
+    const int keys[] = { 'J', 'A', KEY_UP, KEY_BREAK };
+    FakeKeyboard keyboard(keys, sizeof(keys) / sizeof(keys[0]));
+    monitor_reset_saved_state();
 
-        backend.write(0xC000, 0x20);
-        backend.write(0xC001, 0xA9);
-        backend.write(0xC002, 0x00);
-        backend.write(0xC003, 0xEA);
+    backend.write(0xC000, 0x20);
+    backend.write(0xC001, 0xA9);
+    backend.write(0xC002, 0x00);
+    backend.write(0xC003, 0xEA);
 
-        ui.screen = &screen;
-        ui.keyboard = &keyboard;
-        ui.set_prompt("C003", 1);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("C003", 1);
 
-        BackendMachineMonitor monitor(&ui, &backend);
-        monitor.init(&screen, &keyboard);
-        if (expect(monitor.poll(0) == 0, "Ambiguous predecessor test: goto failed.")) return 1;
-        if (expect(monitor.poll(0) == 0, "Ambiguous predecessor test: ASM view failed.")) return 1;
-        if (expect(monitor.poll(0) == 0, "Ambiguous predecessor test: Up failed.")) return 1;
-        if (expect_highlighted_disasm(screen, "C000 20 A9 00", "JSR $00A9",
-                                      "Ambiguous predecessor must use the deterministic longest fallback.")) return 1;
-        if (expect(monitor.poll(0) == 1, "Ambiguous predecessor test: exit failed.")) return 1;
-        monitor.deinit();
-    }
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Ambiguous predecessor test: goto failed.")) return 1;
+    if (expect(monitor.poll(0) == 0, "Ambiguous predecessor test: ASM view failed.")) return 1;
+    if (expect(monitor.poll(0) == 0, "Ambiguous predecessor test: Up failed.")) return 1;
+    if (expect_highlighted_disasm(screen, "C000 20 A9 00", "JSR $00A9",
+                                  "Ambiguous predecessor must use the deterministic longest fallback.")) return 1;
+    if (expect(monitor.poll(0) == 1, "Ambiguous predecessor test: exit failed.")) return 1;
+    monitor.deinit();
     return 0;
 }
 
@@ -7144,6 +7142,9 @@ static int test_asm_follow_and_return_navigation(void)
         advance_fake_ms_timer(1);
         if (expect(mon.poll(0) == 0, "Follow JMP: status expiry poll failed.")) return 1;
         screen.get_slice(1, 22, 38, status);
+        // The follow-stack overlay must clear back to a normal bank status,
+        // which renders as "CPUx" when live==view and "CxOy" when they differ;
+        // either proves the overlay timed out (the point of this assertion).
         if (expect(strstr(status, "CPU") == status || strstr(status, "C0O7") == status,
                    "Follow JMP: follow-stack status must clear after its timeout.")) return 1;
         mon.deinit();

@@ -177,13 +177,13 @@ def check(label: str, *, u2: bool = True, u2_reason: str = ""):
 
 
 def _diagnostic_block(label: str, exc: BaseException) -> str:
-    """Render a verbose, LLM-friendly diagnostic block for a failed check.
+    """Render a verbose diagnostic block for a failed check.
 
     The block always includes the failing check label, the exception type, the
     full exception message, the last command sent to the device, and the final
     terminal snapshot (if any). The intent is that a remote operator can copy
-    the entire console output and an LLM can reason about each failure in
-    isolation without needing additional context.
+    the entire console output and diagnose each failure in isolation without
+    needing additional context.
     """
     lines: List[str] = []
     lines.append("    ---- FAILURE CONTEXT BEGIN ----")
@@ -467,7 +467,7 @@ class MonitorSession:
     def capture(self) -> Snapshot:
         try:
             self._drain_until_idle(timeout=self.timeout)
-        except TimeoutError:
+        except Failure:
             pass
         return self.screen.snapshot(self.last_command)
 
@@ -699,14 +699,6 @@ def rest_available(host: str, timeout: float = 1.0) -> bool:
     except Exception:  # noqa: BLE001 - any failure means unreachable
         _REST_UNAVAILABLE[host] = True
         return False
-
-
-def require_rest(host: str) -> None:
-    """Raise SkipCheck when REST is unavailable, so the current check is
-    cleanly skipped instead of producing a connection-error traceback.
-    """
-    if not rest_available(host):
-        raise SkipCheck(f"REST API not reachable on {host}")
 
 
 def read_rest_memory(host: str, address: int, length: int) -> bytes:
@@ -1988,9 +1980,10 @@ def main() -> int:
     args = parser.parse_args()
 
     TestConfig.target = args.target
-    # U2 hardware does not expose the REST API, and dozens of tests are
-    # REST-dependent. Default to keep-going so a remote operator captures
-    # every failure in a single console run instead of stopping at the first.
+    # U2/U2+ ship the REST API like the U64, but availability is determined at
+    # runtime by rest_available(); dozens of tests are REST-dependent. Default
+    # to keep-going so a remote operator captures every failure in a single
+    # console run instead of stopping at the first.
     TestConfig.keep_going = args.keep_going or args.target == "u2"
     TestConfig.failures = []
     TestConfig.skipped = []
@@ -2004,6 +1997,7 @@ def main() -> int:
                   f"U64-only checks (CPU/VIC banking, KERNAL snapshot) still SKIP", flush=True)
 
     redeployed = False
+    hard_error = False
     while True:
         session = None
         try:
@@ -2036,6 +2030,7 @@ def main() -> int:
                 redeployed = True
                 continue
             print(f"Connection failure: {format_exception(exc)}", file=sys.stderr)
+            hard_error = True
             break
         finally:
             if session is not None:
@@ -2043,7 +2038,7 @@ def main() -> int:
             TestConfig.session = None
 
     _print_summary()
-    if TestConfig.failures:
+    if TestConfig.failures or hard_error:
         return 1
     print(f"monitor_test: OK ({CHECK_COUNT} checks, "
           f"{len(TestConfig.skipped)} skipped)")
@@ -2053,7 +2048,7 @@ def main() -> int:
 def _print_summary() -> None:
     """End-of-run summary. Always prints skip+failure counts; lists every
     failure in compact form so the operator can scan the console capture
-    quickly and an LLM can attach each diagnostic block to a fix plan.
+    quickly and attach each diagnostic block to a fix plan.
     """
     passed = CHECK_COUNT - len(TestConfig.failures) - len(TestConfig.skipped)
     print("")

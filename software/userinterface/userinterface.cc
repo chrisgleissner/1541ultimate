@@ -148,7 +148,6 @@ UserInterface :: UserInterface(const char *title, bool use_logo) : title(title)
     host = NULL;
     keyboard = NULL;
     screen = NULL;
-    active_machine_monitor = NULL;
     doBreak = false;
     available = false;
     color_sel_bg = 0;

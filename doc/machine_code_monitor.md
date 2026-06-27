@@ -145,7 +145,7 @@ The highlighted address is the disassembly root: rows below it are decoded forwa
 
 It also allows you to assemble instructions inline (in `E`dit mode) as well as debug code (in `D`ebug mode).
 
-Please see the **Edit Mode** respectively **Debug Mode** chapters below for more information.
+See the **Edit Mode** and **Debug Mode** chapters below for more information.
 
 Example:
 
@@ -411,7 +411,7 @@ In the normal no-cartridge configuration, the `$A`, `$D`, and `$E` fields descri
 | `KRN` | KERNAL ROM                  |
 | `RAM` | RAM                         |
 
-Please note that cartridges can further affect the CPU-visible memory map through the expansion-port `GAME` and `EXROM` lines.
+Cartridges can further affect the CPU-visible memory map through the expansion-port `GAME` and `EXROM` lines.
 
 #### VIC Banking
 

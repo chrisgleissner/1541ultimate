@@ -4,8 +4,9 @@
 #include "integer.h"
 
 // Classification of a 6502 instruction for Debug-mode stepping.
-// Pure logic; no firmware/memory access. The caller supplies up to three
-// instruction bytes at the current PC.
+// Pure logic; no firmware/memory access. The caller must supply three readable
+// instruction bytes at the current PC (JSR/JMP/branch decoding reads bytes[1]
+// and bytes[2] unconditionally).
 enum DebugPredictKind {
     DBG_PREDICT_LINEAR,   // Falls through: install BRK at PC + length.
     DBG_PREDICT_JSR,      // Step-over target is PC + 3.

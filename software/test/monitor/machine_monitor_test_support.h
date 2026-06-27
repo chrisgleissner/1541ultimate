@@ -100,6 +100,8 @@ class FakeKeyboard : public Keyboard
     const int *keys;
     int count;
     int index;
+    // Mirrors a real Keyboard: production code (the debug session's cancel path,
+    // cancel_keyboard->push_head) re-injects a key, which getch must return next.
     bool pushed;
     int pushed_key;
 public:

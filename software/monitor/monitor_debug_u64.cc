@@ -29,14 +29,6 @@ class U64DebugSession : public BrkDebugSession
 {
     U64MemoryBackend *backend;
     U64Machine *machine;
-    struct RomPatchShadow {
-        bool used;
-        uint16_t address;
-        uint8_t cpu_port;
-        uint8_t byte;
-    };
-    RomPatchShadow rom_patch_shadow[16];
-    uint8_t rom_patch_shadow_next;
 
     // U64 BASIC/KERNAL/CHAR ROMs are served from volatile image buffers in
     // U64_BASIC_BASE/U64_KERNAL_BASE/U64_CHARROM_BASE. Patch those buffers
@@ -57,42 +49,6 @@ class U64DebugSession : public BrkDebugSession
             return (volatile uint8_t *)(U64_KERNAL_BASE + (addr - 0xE000));
         }
         return 0;
-    }
-
-    int find_rom_patch_shadow(uint16_t addr, uint8_t cpu_port) const
-    {
-        cpu_port &= 0x07;
-        for (int i = 0; i < (int)(sizeof(rom_patch_shadow) / sizeof(rom_patch_shadow[0])); i++) {
-            if (rom_patch_shadow[i].used &&
-                    rom_patch_shadow[i].address == addr &&
-                    rom_patch_shadow[i].cpu_port == cpu_port) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    void remember_rom_patch_shadow(uint16_t addr, uint8_t byte, uint8_t cpu_port)
-    {
-        cpu_port &= 0x07;
-        int slot = find_rom_patch_shadow(addr, cpu_port);
-        if (slot < 0) {
-            for (int i = 0; i < (int)(sizeof(rom_patch_shadow) / sizeof(rom_patch_shadow[0])); i++) {
-                if (!rom_patch_shadow[i].used) {
-                    slot = i;
-                    break;
-                }
-            }
-        }
-        if (slot < 0) {
-            slot = rom_patch_shadow_next;
-            rom_patch_shadow_next = (uint8_t)((rom_patch_shadow_next + 1) %
-                (sizeof(rom_patch_shadow) / sizeof(rom_patch_shadow[0])));
-        }
-        rom_patch_shadow[slot].used = true;
-        rom_patch_shadow[slot].address = addr;
-        rom_patch_shadow[slot].cpu_port = cpu_port;
-        rom_patch_shadow[slot].byte = byte;
     }
 
     void wait_for_cpu_visible_rom_byte(uint16_t addr, uint8_t cpu_port, uint8_t byte)
@@ -135,12 +91,12 @@ protected:
     }
     virtual void poke_cpu(uint16_t address, uint8_t byte, uint8_t cpu_port)
     {
-        volatile uint8_t *rom = rom_patch_ptr(address, cpu_port);
-        if (rom) {
-            *rom = byte;
-            if (u64_mark_rom_image_dirty) u64_mark_rom_image_dirty();
-            remember_rom_patch_shadow(address, byte, cpu_port);
-            wait_for_cpu_visible_rom_byte(address, cpu_port, byte);
+        if (rom_patch_ptr(address, cpu_port)) {
+            // The base never pokes a ROM-mapped address through poke_cpu (only
+            // RAM scratch: stack, vectors, trampolines). Route any future ROM
+            // write through the single patch path so it uses poke_cpu_rom's
+            // aligned store rather than a raw byte poke.
+            write_patch_byte(address, byte, cpu_port);
             return;
         }
         if (monitor_backing_store_for_cpu_port(address, cpu_port) == MONITOR_BACKING_IO) {
@@ -214,13 +170,10 @@ protected:
         //    responsive; a long continuous run here destabilises forward stepping.
         //  - Sustained (long): a RESTORED launch opcode that the live 6510 keeps
         //    re-trapping on. The CPU instruction-fetch ROM copy refreshes from
-        //    the image buffer only during sustained continuous core execution -
-        //    NOT from the image write alone, and NOT from fragmented brief
-        //    settles (six 500us settles across the relaunch budget failed
-        //    deterministically because each stop/start aborts the refresh). One
-        //    longer continuous run reliably lands the restored byte in the fetch
-        //    path. Used only on the re-trap relaunch, so the cost is paid only
-        //    when actually needed.
+        //    the image buffer only during one sustained continuous run, not from
+        //    the image write alone and not from fragmented brief settles (each
+        //    stop/start aborts the refresh). Used only on the re-trap relaunch,
+        //    so the cost is paid only when actually needed.
         if (!machine || machine->is_accessible()) {
             return;
         }
@@ -254,6 +207,8 @@ protected:
     // ROM image buffers for BASIC/KERNAL/CHAR ranges so we can step KERNAL
     // code without copying ROMs into C64 RAM.
     virtual bool supports_visible_rom_patching(void) const { return true; }
+    // Visible-ROM fetches can lag monitor writes on the live U64 path.
+    virtual bool visible_rom_fetch_lags(void) const { return true; }
     virtual uint8_t read_patch_byte(uint16_t addr, uint8_t cpu_port)
     {
         volatile uint8_t *rom = rom_patch_ptr(addr, cpu_port);
@@ -289,9 +244,8 @@ protected:
     {
         volatile uint8_t *rom = rom_patch_ptr(addr, cpu_port);
         if (rom) {
-            *rom = byte;
+            machine->poke_cpu_rom(rom, byte);
             if (u64_mark_rom_image_dirty) u64_mark_rom_image_dirty();
-            remember_rom_patch_shadow(addr, byte, cpu_port);
             wait_for_cpu_visible_rom_byte(addr, cpu_port, byte);
             return;
         }
@@ -307,13 +261,6 @@ public:
         : BrkDebugSession(), backend(b), machine(0)
     {
         machine = (U64Machine *)C64::getMachine();
-        rom_patch_shadow_next = 0;
-        for (int i = 0; i < (int)(sizeof(rom_patch_shadow) / sizeof(rom_patch_shadow[0])); i++) {
-            rom_patch_shadow[i].used = false;
-            rom_patch_shadow[i].address = 0;
-            rom_patch_shadow[i].cpu_port = 0;
-            rom_patch_shadow[i].byte = 0;
-        }
     }
 
     // Restore patches/handler while this subclass' hooks are still live. The

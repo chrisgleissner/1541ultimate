@@ -13,9 +13,8 @@ namespace {
 // buffer $033C-$03FB). The 4 "unused" bytes $03FC-$03FF are deliberately
 // left free so programs that rely on them are not disturbed. The
 // literal-referenced register stores ($03F0-$03FB) stay put; the code stubs are
-// packed contiguously up to them, and the two constant-referenced hard-vector
-// scratch bytes that previously spilled into $03FC-$03FE are relocated just
-// below the store block. Layout:
+// packed contiguously up to them, with the constant-referenced hard-vector
+// scratch bytes placed just below the store block. Layout:
 //   $0363-$0389  HANDLER       (39 bytes; ends with the spin JMP at $0387)
 //   $038A-$03AF  TRAMPOLINE    (38 bytes)
 //   $03B0-$03C7  NMI_TRAMPOLINE(24 bytes reserved)
@@ -42,6 +41,8 @@ static const uint16_t SPIN_OPERAND_LO = 0x0388;
 static const uint16_t SPIN_OPERAND_HI = 0x0389;
 static const uint16_t TRAMPOLINE_ADDR = 0x038A;
 static const uint16_t NMI_TRAMPOLINE_ADDR = 0x03B0;
+// Low-RAM scratch for a copied instruction plus trailing trap.
+static const uint16_t INSN_TRAMPOLINE_ADDR = 0x0340;
 static const uint16_t HARD_BRK_STUB_ADDR = 0x03C8;
 static const uint16_t HARD_BRK_ORIG_VECTOR_LO = 0x03EE;
 static const uint16_t BRK_VECTOR_LO   = 0x0316;
@@ -95,21 +96,17 @@ static const uint8_t TRAMPOLINE_BYTES[] = {
     0xAD, (uint8_t)(STORE_CPU_PORT & 0xFF),
           (uint8_t)(STORE_CPU_PORT >> 8),
     0x85, 0x01,
-    0x68,
-    0x68,
-    0x68,
-    0xBA,
-    0xA0, 0x00,
-    // Copy STORE_SR..STORE_PCHI to $0101,X..$0103,X for the final RTI.
-    0xB9, (uint8_t)(STORE_SR & 0xFF), (uint8_t)(STORE_SR >> 8),
-    0x9D, 0x01, 0x01,
-    0xE8,
-    0xC8,
-    0xC0, 0x03,
-    0xD0, 0xF4,
-    0xAE, 0xF1, 0x03,
-    0xAC, 0xF0, 0x03,
-    0xAD, 0xF2, 0x03,
+    0xAE, (uint8_t)(STORE_SP & 0xFF), (uint8_t)(STORE_SP >> 8),
+    0x9A,
+    0xAD, (uint8_t)(STORE_PCHI & 0xFF), (uint8_t)(STORE_PCHI >> 8),
+    0x48,
+    0xAD, (uint8_t)(STORE_PCLO & 0xFF), (uint8_t)(STORE_PCLO >> 8),
+    0x48,
+    0xAD, (uint8_t)(STORE_SR & 0xFF), (uint8_t)(STORE_SR >> 8),
+    0x48,
+    0xAC, (uint8_t)(STORE_Y & 0xFF), (uint8_t)(STORE_Y >> 8),
+    0xAE, (uint8_t)(STORE_X & 0xFF), (uint8_t)(STORE_X >> 8),
+    0xAD, (uint8_t)(STORE_A & 0xFF), (uint8_t)(STORE_A >> 8),
     0x40
 };
 
@@ -625,6 +622,10 @@ BrkDebugSession::PatchInstallResult BrkDebugSession :: install_brk_at(
         write_patch_byte(addr, 0x00, cpu_port);
     }
     bool verify = patch_verify_now(addr, current_cpu_port(), target);
+    if (verify && visible_rom_patch && machine_is_frozen()) {
+        // Frozen read-back sees the backup, not the served ROM image.
+        verify = false;
+    }
     if (verify && read_patch_byte(addr, cpu_port) != 0x00) {
         end_stopped_session(stopped_it);
         return PATCH_INSTALL_FAILED;
@@ -1127,6 +1128,7 @@ void BrkDebugSession :: release_to_run(const DebugContext *from,
         poke_visible(STORE_SR, from->sr);
         poke_visible(STORE_PCLO, (uint8_t)(from->pc & 0xFF));
         poke_visible(STORE_PCHI, (uint8_t)(from->pc >> 8));
+        poke_visible(STORE_SP, from->sp);
         poke_visible(SPIN_OPERAND_LO, (uint8_t)(TRAMPOLINE_ADDR & 0xFF));
         poke_visible(SPIN_OPERAND_HI, (uint8_t)(TRAMPOLINE_ADDR >> 8));
     }
@@ -1258,7 +1260,10 @@ void BrkDebugSession :: nmi_redirect_to(uint16_t target, uint8_t cpu_port,
     uint8_t old_nmi_hi = peek_visible(NMI_VECTOR_HI);
     uint8_t restore_nmi_lo = old_nmi_lo;
     uint8_t restore_nmi_hi = old_nmi_hi;
-    uint8_t bytes[24];
+    // Built up to exactly NMI_TRAMPOLINE_BYTES_LEN bytes (3 stack pulls + NMI
+    // vector restore + optional CPU-port force + JMP target). Sized off the
+    // constant so adding an instruction can never silently overflow.
+    uint8_t bytes[NMI_TRAMPOLINE_BYTES_LEN];
     int len = 0;
 
     if (nmi_trampoline_installed) {
@@ -1449,16 +1454,187 @@ DebugSession::Result BrkDebugSession :: perform_run(const DebugContext *from,
     return DBG_OK;
 }
 
+DebugSession::Result BrkDebugSession :: step_linear_via_trampoline(
+    const DebugContext *from, uint16_t start_pc,
+    const DebugPredictResult &pred, DebugContext *out, uint8_t cpu_port,
+    const uint8_t *instruction_bytes)
+{
+    if (pred.length == 0 || pred.length > 3) {
+        return DBG_REFUSED;
+    }
+    bool stopped = begin_stopped_session();
+    for (uint8_t i = 0; i < pred.length; i++) {
+        uint8_t byte = instruction_bytes ?
+            instruction_bytes[i] : peek_cpu((uint16_t)(start_pc + i), cpu_port);
+        poke_cpu((uint16_t)(INSN_TRAMPOLINE_ADDR + i),
+                 byte, cpu_port);
+    }
+    end_stopped_session(stopped);
+
+    PatchInstallResult patched = install_brk_at(
+        (uint16_t)(INSN_TRAMPOLINE_ADDR + pred.length), cpu_port);
+    if (patched != PATCH_INSTALL_OK) {
+        restore_patches();
+        return (patched == PATCH_INSTALL_NOT_SUPPORTED) ?
+            DBG_NOT_SUPPORTED : DBG_PATCH_FAILED;
+    }
+    save_and_install_visible_hard_vector();
+    Result result;
+    if (from && from->valid && cpu_parked_in_spin) {
+        DebugContext launch = *from;
+        launch.pc = INSN_TRAMPOLINE_ADDR;
+        result = perform_run(&launch, INSN_TRAMPOLINE_ADDR, false, out, cpu_port);
+    } else {
+        if (from && from->valid) {
+            last_context = *from;
+            has_last_context = true;
+        }
+        cpu_parked_in_spin = false;
+        result = perform_run(0, INSN_TRAMPOLINE_ADDR, true, out, cpu_port);
+    }
+    if (result == DBG_OK && out && out->valid) {
+        out->pc = pred.fall_through;
+        if (has_last_context) {
+            last_context.pc = pred.fall_through;
+        }
+    }
+    return result;
+}
+
+static void set_nz(uint8_t *sr, uint8_t value)
+{
+    *sr = (uint8_t)((*sr & (uint8_t)~0x82) |
+        (value == 0 ? 0x02 : 0x00) |
+        (value & 0x80));
+}
+
+DebugSession::Result BrkDebugSession :: interpret_simple_linear(
+    const DebugContext *from, uint16_t start_pc,
+    const DebugPredictResult &pred, DebugContext *out, uint8_t cpu_port,
+    const uint8_t *instruction_bytes)
+{
+    if (!from || !from->valid || !out || pred.kind != DBG_PREDICT_LINEAR) {
+        return DBG_NOT_SUPPORTED;
+    }
+    uint8_t bytes[3] = { 0, 0, 0 };
+    if (instruction_bytes) {
+        bytes[0] = instruction_bytes[0];
+        bytes[1] = instruction_bytes[1];
+        bytes[2] = instruction_bytes[2];
+    } else if (!read_step_bytes(start_pc, bytes, pred.length)) {
+        return DBG_NOT_SUPPORTED;
+    }
+
+    DebugContext next = *from;
+    switch (bytes[0]) {
+        case 0xEA:
+            if (pred.length != 1) return DBG_NOT_SUPPORTED;
+            break;
+        case 0xA9:
+            if (pred.length != 2) return DBG_NOT_SUPPORTED;
+            next.a = bytes[1];
+            set_nz(&next.sr, next.a);
+            break;
+        case 0xA2:
+            if (pred.length != 2) return DBG_NOT_SUPPORTED;
+            next.x = bytes[1];
+            set_nz(&next.sr, next.x);
+            break;
+        case 0xA5:
+            if (pred.length != 2) return DBG_NOT_SUPPORTED;
+            next.a = peek_cpu(bytes[1], cpu_port);
+            set_nz(&next.sr, next.a);
+            break;
+        case 0xB5:
+            if (pred.length != 2) return DBG_NOT_SUPPORTED;
+            next.a = peek_cpu((uint8_t)(bytes[1] + next.x), cpu_port);
+            set_nz(&next.sr, next.a);
+            break;
+        case 0x85:
+            if (pred.length != 2) return DBG_NOT_SUPPORTED;
+            poke_cpu(bytes[1], next.a, cpu_port);
+            break;
+        case 0x86:
+            if (pred.length != 2) return DBG_NOT_SUPPORTED;
+            poke_cpu(bytes[1], next.x, cpu_port);
+            break;
+        case 0x95:
+            if (pred.length != 2) return DBG_NOT_SUPPORTED;
+            poke_cpu((uint8_t)(bytes[1] + next.x), next.a, cpu_port);
+            break;
+        case 0x29:
+            if (pred.length != 2) return DBG_NOT_SUPPORTED;
+            next.a = (uint8_t)(next.a & bytes[1]);
+            set_nz(&next.sr, next.a);
+            break;
+        case 0x09:
+            if (pred.length != 2) return DBG_NOT_SUPPORTED;
+            next.a = (uint8_t)(next.a | bytes[1]);
+            set_nz(&next.sr, next.a);
+            break;
+        case 0xAA:
+            if (pred.length != 1) return DBG_NOT_SUPPORTED;
+            next.x = next.a;
+            set_nz(&next.sr, next.x);
+            break;
+        case 0xE8:
+            if (pred.length != 1) return DBG_NOT_SUPPORTED;
+            next.x = (uint8_t)(next.x + 1);
+            set_nz(&next.sr, next.x);
+            break;
+        case 0xCA:
+            if (pred.length != 1) return DBG_NOT_SUPPORTED;
+            next.x = (uint8_t)(next.x - 1);
+            set_nz(&next.sr, next.x);
+            break;
+        case 0xC8:
+            if (pred.length != 1) return DBG_NOT_SUPPORTED;
+            next.y = (uint8_t)(next.y + 1);
+            set_nz(&next.sr, next.y);
+            break;
+        default:
+            return DBG_NOT_SUPPORTED;
+    }
+    next.pc = pred.fall_through;
+    *out = next;
+    last_context = next;
+    has_last_context = true;
+    return DBG_OK;
+}
+
 DebugSession::Result BrkDebugSession :: step_with_predict(
     const DebugContext *from, uint16_t start_pc,
     const DebugPredictResult &pred, bool prefer_jsr_target,
     DebugContext *out, uint8_t cpu_port,
     const MonitorBreakpoints *bps,
     uint16_t skip_breakpoint_address,
-    bool skip_breakpoint_address_valid)
+    bool skip_breakpoint_address_valid,
+    const uint8_t *linear_step_bytes,
+    bool allow_linear_interpret)
 {
     if (pred.kind == DBG_PREDICT_UNSAFE || pred.kind == DBG_PREDICT_BRK) {
         return DBG_REFUSED;
+    }
+    // NOTE: stepping into a visible-ROM JSR must run the real 6510 so the JSR
+    // pushes its return address and decrements the real stack pointer. A pure
+    // context-simulation (which only moves the cached SP) leaves the live SP
+    // un-decremented, so a later RTS pulls the wrong slot and either returns to
+    // the wrong address or never reaches its breakpoint (DEBUG TIMEOUT). The
+    // linear fast-paths below are safe because they never change SP.
+    // Avoid stale visible-ROM fetches by running linear instructions from RAM.
+    if (pred.kind == DBG_PREDICT_LINEAR && out &&
+            visible_rom_fetch_lags() && !debug_owner.remote &&
+            monitor_backing_store_is_visible_rom(
+                monitor_backing_store_for_cpu_port(start_pc, cpu_port))) {
+        if (allow_linear_interpret) {
+            Result interpreted = interpret_simple_linear(from, start_pc, pred, out,
+                                                         cpu_port, linear_step_bytes);
+            if (interpreted == DBG_OK) {
+                return DBG_OK;
+            }
+        }
+        return step_linear_via_trampoline(from, start_pc, pred, out, cpu_port,
+                                          linear_step_bytes);
     }
     uint16_t addrs[2];
     int n = 0;
@@ -1633,6 +1809,9 @@ DebugSession::Result BrkDebugSession :: step_out(const DebugContext &from,
     if (!peek_return_target(&target)) {
         return DBG_NOT_IN_SUBROUTINE;
     }
+    // Run the real 6510 out to the caller (breakpoint at the return target)
+    // rather than simulating the RTS: a simulated RTS only adjusts the cached
+    // SP, leaving the live stack pointer wrong for the next real step.
     MonitorBackingStore from_target =
         monitor_backing_store_for_cpu_port(from.pc, cpu_port);
     PatchInstallResult bp_patched = install_breakpoints(bps, from.pc,
@@ -1887,20 +2066,31 @@ DebugSession::Result BrkDebugSession :: run_to(const DebugContext &from,
     uint16_t run_pc = have_context ? from.pc : start_pc;
     uint8_t cpu_port = execution_cpu_port(have_context ? &from : 0);
 
-    if (run_pc == target_pc) {
+    // Step once to escape self-hits or stale visible-ROM launch fetches.
+    bool launch_site_lags = visible_rom_fetch_lags() && !debug_owner.remote &&
+        monitor_backing_store_is_visible_rom(
+            monitor_backing_store_for_cpu_port(run_pc, cpu_port));
+    if (run_pc == target_pc || launch_site_lags) {
         uint8_t bytes[3];
-        for (int i = 0; i < 3; i++) {
-            bytes[i] = read_patch_byte((uint16_t)(run_pc + i), cpu_port);
+        if (launch_site_lags) {
+            // Use the disassembly byte source for the trampoline copy.
+            if (!read_step_bytes(run_pc, bytes, 3)) {
+                return DBG_REFUSED;
+            }
+        } else {
+            for (int i = 0; i < 3; i++) {
+                bytes[i] = read_patch_byte((uint16_t)(run_pc + i), cpu_port);
+            }
         }
         DebugPredictResult pred;
         debug_predict(run_pc, bytes, false, &pred);
         DebugContext stepped;
-        // Escaping an immediate self-hit must execute the current instruction
-        // exactly once using real control flow. In particular, K Cursor on a
-        // current-row JSR must enter the callee before re-arming the transient
-        // cursor breakpoint, not step over to the fall-through address.
-        Result skip = step_with_predict(have_context ? &from : 0, run_pc, pred, true,
-                                        &stepped, cpu_port, bps, run_pc, true);
+        // Self-hit escape steps into; launch priming steps over.
+        bool into = (run_pc == target_pc);
+        Result skip = step_with_predict(have_context ? &from : 0, run_pc, pred, into,
+                                        &stepped, cpu_port, bps, run_pc, true,
+                                        launch_site_lags ? bytes : 0,
+                                        !launch_site_lags);
         if (skip != DBG_OK) {
             return skip;
         }

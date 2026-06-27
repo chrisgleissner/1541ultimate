@@ -48,12 +48,13 @@ protected:
     // it. Only meaningful when the machine is running (overlay/Telnet); the
     // freeze path already restarts the CPU cleanly on unfreeze. Default no-op.
     virtual void settle_visible_rom_for_live_fetch(bool sustained = false) { (void)sustained; }
+    // True when visible-ROM opcode fetches can lag monitor writes.
+    virtual bool visible_rom_fetch_lags(void) const { return false; }
     virtual void delay_ms(int ms) = 0;
     virtual bool free_run_no_breakpoint(uint16_t address);
     virtual uint8_t read_patch_byte(uint16_t address, uint8_t cpu_port);
     virtual void write_patch_byte(uint16_t address, uint8_t byte, uint8_t cpu_port);
     virtual void note_captured_cpu_port(uint8_t) { }
-
 public:
     BrkDebugSession();
     virtual ~BrkDebugSession();
@@ -62,6 +63,10 @@ public:
     virtual void set_run_window_refreeze_enabled(bool enabled);
     virtual void request_reset_cancel(void);
     virtual Result snapshot(DebugContext *ctx);
+    // True while the BRK handler or spin loop owns the CPU.
+    virtual bool is_debug_session_active(void) const {
+        return handler_installed || cpu_parked_in_spin;
+    }
     virtual Result over(const DebugContext &from,
                         const DebugPredictResult &pred,
                         DebugContext *ctx);
@@ -235,7 +240,19 @@ private:
                              DebugContext *out, uint8_t cpu_port,
                              const MonitorBreakpoints *breakpoints = 0,
                              uint16_t skip_breakpoint_address = 0,
-                             bool skip_breakpoint_address_valid = false);
+                             bool skip_breakpoint_address_valid = false,
+                             const uint8_t *linear_step_bytes = 0,
+                             bool allow_linear_interpret = true);
+    Result step_linear_via_trampoline(const DebugContext *from,
+                                      uint16_t start_pc,
+                                      const DebugPredictResult &pred,
+                                      DebugContext *out, uint8_t cpu_port,
+                                      const uint8_t *instruction_bytes = 0);
+    Result interpret_simple_linear(const DebugContext *from,
+                                   uint16_t start_pc,
+                                   const DebugPredictResult &pred,
+                                   DebugContext *out, uint8_t cpu_port,
+                                   const uint8_t *instruction_bytes = 0);
 };
 
 #endif

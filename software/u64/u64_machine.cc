@@ -97,9 +97,7 @@ static uint8_t read_cpu_mapped_byte(volatile uint8_t *ram, bool freezerMenu, uin
         if ((cpu_port & 0x03) == 0x00) {
             return raw;
         }
-        if (cpu_port & 0x04) {
-            return read_visible_byte(ram, freezerMenu, address, screen_backup, ram_backup);
-        }
+        // Character ROM or I/O both resolve through the live visible aperture.
         return read_visible_byte(ram, freezerMenu, address, screen_backup, ram_backup);
     }
     if (address >= 0xE000) {
@@ -356,6 +354,22 @@ void U64Machine :: poke_raw(uint16_t address, uint8_t byte)
 
     C64_SERVE_CONTROL = saved_serve | SERVE_WHILE_STOPPED;
     write_frozen_byte(ram, freezerMenu, address, byte, screen_backup, ram_backup);
+    C64_SERVE_CONTROL = saved_serve;
+
+    after_memory_access(0, freezerMenu, stopped_it);
+}
+
+void U64Machine :: poke_cpu_rom(volatile uint8_t *image_ptr, uint8_t byte)
+{
+    if (!image_ptr) {
+        return;
+    }
+    bool stopped_it = false;
+    bool freezerMenu = before_memory_access(true, &stopped_it);
+    uint8_t saved_serve = C64_SERVE_CONTROL;
+
+    C64_SERVE_CONTROL = saved_serve | SERVE_WHILE_STOPPED;
+    *image_ptr = byte;
     C64_SERVE_CONTROL = saved_serve;
 
     after_memory_access(0, freezerMenu, stopped_it);

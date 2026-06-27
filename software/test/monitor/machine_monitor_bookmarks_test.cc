@@ -588,7 +588,6 @@ static int test_bookmark_popup_instruction_line(void)
     const char *expected = "0-9/RET:Jmp  S:Set  L:Label  DEL:Reset";
     if (expect((int)strlen(expected) == 38,
                "Instruction line must be 38 chars (within the 38-column popup).")) return 1;
-    if (expect((int)strlen(expected) <= 38, "Instruction line must fit in 38 columns.")) return 1;
     if (expect(strstr(expected, "Jmp") != NULL && strstr(expected, "Set") != NULL &&
                strstr(expected, "Label") != NULL && strstr(expected, "Reset") != NULL,
                "Instruction line must document Jmp/Set/Label/Reset.")) return 1;

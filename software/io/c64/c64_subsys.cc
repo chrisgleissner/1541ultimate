@@ -220,7 +220,13 @@ SubsysResultCode_e C64_Subsys::executeCommand(SubsysCommand *cmd)
                 c64->client = 0;
             }
             c64->unfreeze();
-            c64->reset();
+            // Cold-start if Debug may have left ROM banked out.
+            if (machine_monitor_global_reset_sees_debug_session &&
+                machine_monitor_global_reset_sees_debug_session()) {
+                c64->start_cartridge(NULL);
+            } else {
+                c64->reset();
+            }
             break;
 
         case MENU_C64_PAUSE:

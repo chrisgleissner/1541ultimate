@@ -24,6 +24,7 @@ public:
     virtual void write(uint16_t address, uint8_t value);
     virtual void read_block(uint16_t address, uint8_t *dst, uint16_t len);
     virtual uint8_t get_live_cpu_port(void);
+    virtual void invalidate_live_cpu_port_cache(void) { clear_observed_live_cpu_port(); }
     virtual uint8_t get_live_vic_bank(void);
     virtual uint8_t monitor_poll_hz(void) const;
     virtual void begin_session(void);

@@ -58,7 +58,6 @@ class Editor;
 class HexEditor;
 class MemoryBackend;
 class MachineMonitor;
-extern "C" bool machine_monitor_request_reset_reentry(void *) __attribute__((weak));
 class UserInterface : public ConfigurableObject, public HostClient
 {
 private:
@@ -71,8 +70,7 @@ private:
     mstring title;
     UIObject *ui_objects[MAX_UI_OBJECTS];
     UIStatusBox *status_box;
-    MachineMonitor *active_machine_monitor;
-    
+
     void set_available(bool enable);
     int  pollFocussed(void);
     void peel_off(void);
@@ -100,11 +98,6 @@ public:
 
     // from HostClient
     virtual void release_host();
-    virtual bool request_reset_reentry_after_c64_reset()
-    {
-        return machine_monitor_request_reset_reentry ?
-            machine_monitor_request_reset_reentry(active_machine_monitor) : false;
-    }
 
     virtual bool is_available(void);
     virtual void run();

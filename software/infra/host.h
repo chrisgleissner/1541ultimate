@@ -41,7 +41,6 @@ public:
 	virtual ~HostClient() { }
 
 	virtual void release_host() { }
-    virtual bool request_reset_reentry_after_c64_reset() { return false; }
 };
 
 #endif

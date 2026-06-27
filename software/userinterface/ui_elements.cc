@@ -508,7 +508,9 @@ int  UIChoiceBox :: poll(int)
 
     switch(c) {
         case -1: return 0; // nothing pressed
-        case -2: return -1; // error
+        case -2: return -1; // global accelerator consumed: cancel the picker
+                            // and return to the parent (unlike a UIPopup, which
+                            // is itself the modal context and returns MENU_EXIT)
         case KEY_UP:
             if (current > 0) {
                 current--;

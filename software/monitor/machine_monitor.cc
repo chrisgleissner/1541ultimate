@@ -1123,12 +1123,10 @@ void monitor_format_breakpoint_mismatch(char *out, int out_len,
     if (!out || out_len <= 0) {
         return;
     }
-    sprintf(out, "BRK %s, CPU %s; not mapped now",
-            monitor_backing_store_tag(target),
-            monitor_backing_store_tag(current));
-    if ((int)strlen(out) >= out_len) {
-        out[out_len - 1] = 0;
-    }
+    snprintf(out, out_len, "BRK %s, CPU %s; not mapped now",
+             monitor_backing_store_tag(target),
+             monitor_backing_store_tag(current));
+    out[out_len - 1] = 0;
 }
 
 const char *monitor_error_text(MonitorError error)
@@ -2038,6 +2036,21 @@ void MachineMonitor :: request_debug_reset_cancel(void)
     if (debug_session) {
         debug_session->request_reset_cancel();
     }
+}
+
+void MachineMonitor :: invalidate_live_cpu_port_view(void)
+{
+    if (backend) {
+        backend->invalidate_live_cpu_port_cache();
+    }
+}
+
+bool MachineMonitor :: is_debug_session_active(void) const
+{
+    if (!debug_session) {
+        return false;
+    }
+    return debug_session->is_debug_session_active();
 }
 
 bool MachineMonitor :: consume_reopen_after_reset(void)
@@ -3398,12 +3411,6 @@ bool MachineMonitor :: return_stack_pop(ReturnStackEntry *entry, uint8_t *index)
     return true;
 }
 
-bool MachineMonitor :: target_visible(uint16_t target) const
-{
-    int row = disasm_visible_row(target);
-    return row >= 0 && row < content_height;
-}
-
 void MachineMonitor :: follow_to_target(uint16_t target)
 {
     int row = disasm_visible_row(target);
@@ -3878,7 +3885,7 @@ void MachineMonitor :: disasm_visible_addresses(uint16_t *rows, uint8_t *lengths
             if (lengths) lengths[row] = asm_lane_lengths[index];
         } else {
             uint16_t addr = asm_lane_rows[asm_lane_count - 1];
-            for (int i = asm_lane_count - 1; i < index; i++) {
+            for (int i = asm_lane_count - 1; i < index && i < ASM_LANE_MAX_ROWS; i++) {
                 addr = disasm_lane_next_addr_at(i);
             }
             rows[row] = addr;
@@ -4027,25 +4034,6 @@ uint16_t MachineMonitor :: disasm_prev_addr(uint16_t address) const
     return (uint16_t)(address - 1);
 }
 
-uint16_t MachineMonitor :: disasm_prev_visible_addr(uint16_t address)
-{
-    uint16_t rows[32];
-    int count = content_height;
-
-    if (count > (int)(sizeof(rows) / sizeof(rows[0]))) {
-        count = (int)(sizeof(rows) / sizeof(rows[0]));
-    }
-    if (count > 0) {
-        disasm_visible_addresses(rows, NULL, count);
-        for (int row = 1; row < count; row++) {
-            if (rows[row] == address) {
-                return rows[row - 1];
-            }
-        }
-    }
-    return disasm_prev_addr(address);
-}
-
 int MachineMonitor :: disasm_visible_row(uint16_t address) const
 {
     uint16_t rows[32];
@@ -4065,24 +4053,6 @@ int MachineMonitor :: disasm_visible_row(uint16_t address) const
         }
     }
     return -1;
-}
-
-uint16_t MachineMonitor :: disasm_advance_rows(uint16_t address, int rows)
-{
-    while (rows > 0) {
-        address = disasm_next_addr(address);
-        rows--;
-    }
-    return address;
-}
-
-uint16_t MachineMonitor :: disasm_rewind_rows(uint16_t address, int rows)
-{
-    while (rows > 0) {
-        address = disasm_prev_addr(address);
-        rows--;
-    }
-    return address;
 }
 
 void MachineMonitor :: restore_disasm_cursor_row(int row)
@@ -4377,6 +4347,21 @@ void MachineMonitor :: draw_header()
     }
 }
 
+static bool monitor_step_bank_is_ram_under_rom(MemoryBackend *backend,
+                                               uint16_t pc, uint8_t cpu_port)
+{
+    if (!backend || !backend->supports_cpu_banking()) {
+        return false;
+    }
+    cpu_port &= 0x07;
+    if (cpu_port == 0x07) {
+        return false;   // all ROMs visible: nothing banked in under ROM
+    }
+    MonitorBackingStore here = backend->backing_store_for_cpu_port(pc, cpu_port);
+    MonitorBackingStore rom_view = backend->backing_store_for_cpu_port(pc, 0x07);
+    return (here == MONITOR_BACKING_RAM) && (rom_view != MONITOR_BACKING_RAM);
+}
+
 void MachineMonitor :: draw_status()
 {
     char line[40];
@@ -4395,6 +4380,29 @@ void MachineMonitor :: draw_status()
                     (int)strlen(bookmark_status_text));
         window->set_color(get_ui()->color_fg);
         return;
+    }
+
+    if (debug.is_active()) {
+        const DebugContext &dctx = debug.context();
+        uint16_t step_pc = dctx.valid ? dctx.pc : state.current_addr;
+        uint8_t exec_port = (dctx.valid && dctx.live_cpu_port_valid) ?
+            (uint8_t)(dctx.live_cpu_port & 0x07) : (uint8_t)(state.view_cpu_port & 0x07);
+        if (monitor_step_bank_is_ram_under_rom(backend, step_pc, exec_port)) {
+            uint8_t live = backend ? (uint8_t)(backend->get_live_cpu_port() & 0x07)
+                                   : exec_port;
+            uint8_t view = (uint8_t)(state.view_cpu_port & 0x07);
+            if (live == view) {
+                sprintf(line, "CPU%d ! RAM-under-ROM step VIC%d",
+                        view, current_vic_bank & 0x03);
+            } else {
+                sprintf(line, "C%dO%d ! RAM-under-ROM step VIC%d",
+                        live, view, current_vic_bank & 0x03);
+            }
+            window->set_color(MONITOR_UI_ACCENT_COLOR);
+            draw_padded(window, window->get_size_y() - 1, line, (int)strlen(line));
+            window->set_color(get_ui()->color_fg);
+            return;
+        }
     }
 
     if (backend && !backend->supports_cpu_banking() && !backend->supports_vic_bank()) {
@@ -5789,13 +5797,13 @@ void MachineMonitor :: opcode_picker_commit()
     uint8_t op = opcode_candidates[opcode_selected];
     // Capture the entire previous instruction (up to 3 bytes) so DEL can
     // restore the original line wholesale. Push in reverse memory order so
-    // popping replays the bytes back in low->high order — but order of
+    // popping replays the bytes back in low->high order, but order of
     // restoration does not matter since each entry is independent.
     uint8_t prev_len = disasm_length(state.current_addr);
     if (prev_len == 0) prev_len = 1;
     if (prev_len > 3) prev_len = 3;
     // Snapshot anchor part/pending only on the first entry; all subsequent
-    // bytes are tagged with part 0 / pending 0 — they're just memory restores
+    // bytes are tagged with part 0 / pending 0; they're just memory restores
     // and the cursor state will be set by the LAST popped (i.e., FIRST pushed)
     // entry, which is the highest-offset byte. To keep it simple: only the
     // first push (the opcode byte) carries the pre-commit cursor state.
@@ -6121,6 +6129,14 @@ void MachineMonitor :: debug_sync_cursor_to_context(void)
 
     if (!debug.is_active() || !debug.has_context()) {
         return;
+    }
+    if (backend && backend->supports_cpu_banking() &&
+            debug.context().live_cpu_port_valid) {
+        uint8_t cpu_bank = (uint8_t)(debug.context().live_cpu_port & 0x07);
+        if ((uint8_t)(state.view_cpu_port & 0x07) != cpu_bank) {
+            state.view_cpu_port = cpu_bank;
+            backend->set_monitor_cpu_port(cpu_bank);
+        }
     }
     old_addr = state.current_addr;
     pc = debug.context().pc;
@@ -7121,6 +7137,7 @@ void MachineMonitor :: init(Screen *scr, Keyboard *keyb)
     if (monitor_sync_view_to_live_on_open) {
         monitor_sync_view_to_live_on_open = false;
         if (!restore_debug_after_reset && backend->supports_cpu_banking()) {
+            backend->invalidate_live_cpu_port_cache();
             state.view_cpu_port = (uint8_t)(backend->get_live_cpu_port() & 0x07);
         }
     }

@@ -408,7 +408,6 @@ class MachineMonitor : public UIObject
     bool restore_bookmark(uint8_t slot);
     uint8_t return_stack_push_current(void);
     bool return_stack_pop(ReturnStackEntry *entry, uint8_t *index);
-    bool target_visible(uint16_t target) const;
     void follow_to_target(uint16_t target);
     bool follow_target(uint16_t *target);
     bool follow_current(void);
@@ -468,10 +467,7 @@ class MachineMonitor : public UIObject
     void disasm_position_current_at_row(int row);
     uint16_t disasm_next_addr(uint16_t address) const;
     uint16_t disasm_prev_addr(uint16_t address) const;
-    uint16_t disasm_prev_visible_addr(uint16_t address);
     int disasm_visible_row(uint16_t address) const;
-    uint16_t disasm_advance_rows(uint16_t address, int rows);
-    uint16_t disasm_rewind_rows(uint16_t address, int rows);
     void restore_disasm_cursor_row(int row);
     void step_disassembly(int lines);
     void page_disassembly(int lines);
@@ -488,6 +484,8 @@ public:
     void dispatch_deferred_debug_go(void);
     void request_reopen_after_reset(void);
     void request_debug_reset_cancel(void);
+    void invalidate_live_cpu_port_view(void);
+    bool is_debug_session_active(void) const;
     bool consume_reopen_after_reset(void);
     void init(Screen *screen, Keyboard *keyboard);
     void deinit(void);

@@ -676,6 +676,7 @@ public:
     bool allow_visible_rom_patching;
     bool force_raw_peek_brk;
     uint16_t force_raw_peek_brk_addr;
+    bool fetch_lags;
     int rom_patch_writes;
     uint16_t last_rom_patch_addr;
     int ram_patch_writes;
@@ -686,7 +687,8 @@ public:
     FakeVisibleRomMachine(bool start_frozen)
         : FakeFreezeMachine(start_frozen), cpu_port(0x07),
           allow_visible_rom_patching(false), force_raw_peek_brk(false),
-          force_raw_peek_brk_addr(0), rom_patch_writes(0), last_rom_patch_addr(0),
+          force_raw_peek_brk_addr(0), fetch_lags(false),
+          rom_patch_writes(0), last_rom_patch_addr(0),
           ram_patch_writes(0), last_ram_patch_addr(0),
           switch_cpu_port_on_delay(false), cpu_port_after_delay(0x07)
     {
@@ -718,6 +720,10 @@ protected:
     virtual bool supports_visible_rom_patching(void) const
     {
         return allow_visible_rom_patching;
+    }
+    virtual bool visible_rom_fetch_lags(void) const
+    {
+        return fetch_lags;
     }
     virtual uint8_t peek_cpu(uint16_t a, uint8_t patch_cpu_port)
     {
@@ -989,6 +995,9 @@ static bool mini_run(uint8_t *mem, Mini6510 &cpu, uint16_t stop_pc, int max_step
             case 0x98:
                 cpu.a = cpu.y;
                 mini_set_zn(cpu, cpu.a);
+                break;
+            case 0x9A:
+                cpu.sp = cpu.x;
                 break;
             case 0x99: {
                 uint16_t addr = (uint16_t)(mini_abs(mem, cpu.pc) + cpu.y);
@@ -4293,6 +4302,117 @@ static int test_step_out_refuses_stale_far_stack_frame()
     return 0;
 }
 
+static int test_visible_rom_simple_linear_interprets_without_breakpoint()
+{
+    FakeVisibleRomMachine m(false);
+    m.allow_visible_rom_patching = true;
+    m.fetch_lags = true;
+
+    m.kernal_rom[0x09E3] = 0xA5; // E9E3 LDA $AC
+    m.kernal_rom[0x09E4] = 0xAC;
+    m.ram[0x00AC] = 0x80;
+
+    DebugContext from;
+    debug_context_reset(&from);
+    from.valid = true;
+    from.pc = 0xE9E3;
+    from.sp = 0xCB;
+    from.sr = 0x24;
+    from.live_cpu_port_valid = true;
+    from.live_cpu_port = 0x07;
+
+    uint8_t bytes[3] = { 0xA5, 0xAC, 0x00 };
+    DebugPredictResult pred;
+    debug_predict(0xE9E3, bytes, false, &pred);
+
+    DebugContext out;
+    DebugSession::Result r = m.over(from, pred, &out);
+    if (expect(r == DebugSession::DBG_OK,
+               "Visible-ROM simple linear step must complete")) return 1;
+    if (expect(out.pc == 0xE9E5 && out.a == 0x80 && (out.sr & 0x82) == 0x80,
+               "Visible-ROM LDA zp must update PC, A, N, and Z")) return 1;
+    if (expect(m.brk_patch_writes == 0 && m.rom_patch_writes == 0,
+               "Visible-ROM simple linear step must not install a breakpoint")) return 1;
+    return 0;
+}
+
+static int test_visible_rom_basic_loop_interprets_index_register_and_flags()
+{
+    FakeVisibleRomMachine m(false);
+    m.allow_visible_rom_patching = true;
+    m.fetch_lags = true;
+
+    m.basic_rom[0x1C0F] = 0xA2; // BC0F LDX #$06
+    m.basic_rom[0x1C10] = 0x06;
+    m.basic_rom[0x1C11] = 0xB5; // BC11 LDA $60,X
+    m.basic_rom[0x1C12] = 0x60;
+    m.basic_rom[0x1C13] = 0x95; // BC13 STA $68,X
+    m.basic_rom[0x1C14] = 0x68;
+    m.basic_rom[0x1C15] = 0xCA; // BC15 DEX
+    m.basic_rom[0x1C16] = 0xD0; // BC16 BNE $BC11
+    m.basic_rom[0x1C17] = 0xF9;
+    m.basic_rom[0x1C18] = 0x86; // BC18 STX $70
+    m.basic_rom[0x1C19] = 0x70;
+
+    DebugContext ctx;
+    debug_context_reset(&ctx);
+    ctx.valid = true;
+    ctx.pc = 0xBC0F;
+    ctx.sp = 0xCB;
+    ctx.sr = 0x24;
+    ctx.live_cpu_port_valid = true;
+    ctx.live_cpu_port = 0x07;
+
+    uint8_t ldx[3] = { 0xA2, 0x06, 0x00 };
+    DebugPredictResult pred;
+    debug_predict(ctx.pc, ldx, false, &pred);
+    DebugSession::Result r = m.over(ctx, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK && ctx.pc == 0xBC11 &&
+               ctx.x == 0x06 && (ctx.sr & 0x02) == 0,
+               "Visible-ROM LDX immediate must update X and Z")) return 1;
+
+    for (int x = 6; x >= 0; x--) {
+        m.ram[(uint8_t)(0x60 + x)] = (uint8_t)(0x80 | x);
+        uint8_t lda[3] = { 0xB5, 0x60, 0x00 };
+        debug_predict(ctx.pc, lda, false, &pred);
+        r = m.over(ctx, pred, &ctx);
+        if (expect(r == DebugSession::DBG_OK && ctx.pc == 0xBC13 &&
+                   ctx.a == (uint8_t)(0x80 | x) && (ctx.sr & 0x80),
+                   "Visible-ROM LDA zp,X must update A and N")) return 1;
+
+        uint8_t sta[3] = { 0x95, 0x68, 0x00 };
+        debug_predict(ctx.pc, sta, false, &pred);
+        r = m.over(ctx, pred, &ctx);
+        if (expect(r == DebugSession::DBG_OK && ctx.pc == 0xBC15 &&
+                   m.ram[(uint8_t)(0x68 + x)] == (uint8_t)(0x80 | x),
+                   "Visible-ROM STA zp,X must write the indexed address")) return 1;
+
+        uint8_t dex[3] = { 0xCA, 0x00, 0x00 };
+        debug_predict(ctx.pc, dex, false, &pred);
+        r = m.over(ctx, pred, &ctx);
+        if (expect(r == DebugSession::DBG_OK && ctx.pc == 0xBC16,
+                   "Visible-ROM DEX must advance to the branch")) return 1;
+        if (expect(ctx.x == (uint8_t)(x - 1),
+                   "Visible-ROM DEX must update X")) return 1;
+        if (expect(((ctx.sr & 0x02) != 0) == (x == 1),
+                   "Visible-ROM DEX must update Z for the following BNE")) return 1;
+
+        uint16_t expected_pc = (x == 1) ? 0xBC18 : 0xBC11;
+        ctx.pc = expected_pc;
+        if (x == 1) {
+            break;
+        }
+    }
+
+    uint8_t stx[3] = { 0x86, 0x70, 0x00 };
+    debug_predict(ctx.pc, stx, false, &pred);
+    r = m.over(ctx, pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK && ctx.pc == 0xBC1A &&
+               m.ram[0x70] == 0,
+               "Visible-ROM STX zp must store the final X")) return 1;
+    return 0;
+}
+
 static int test_over_rts_refuses_non_jsr_stack_target()
 {
     FakeFreezeMachine m(false);
@@ -4623,16 +4743,16 @@ static int test_u64_debug_cpu_port_uses_live_cpu_bank()
     backend.set_monitor_cpu_port(0x07);
     backend.live_cpu_port = 0x05;
     if (expect(u64_debug_step_cpu_port(&backend) == 0x05,
-               "U64 Debug stepping must use the live CPU bank")) return 1;
+               "U64 Debug stepping must execute in the live CPU bank")) return 1;
     if (expect(backend.live_reads == 1,
-               "U64 Debug stepping must sample $0001 for the live CPU bank")) return 1;
+               "U64 Debug stepping must sample live $0001 (the read also settles the bus)")) return 1;
 
     backend.set_monitor_cpu_port(0x05);
     backend.live_cpu_port = 0x07;
     if (expect(u64_debug_step_cpu_port(&backend) == 0x07,
-               "U64 Debug stepping must ignore monitor-bank changes")) return 1;
+               "U64 Debug stepping must ignore monitor-bank changes (view decoupling is read-side)")) return 1;
     if (expect(backend.live_reads == 2,
-               "U64 Debug stepping must re-sample live bank changes")) return 1;
+               "U64 Debug stepping must re-sample the live bank each step")) return 1;
     if (expect(u64_debug_step_cpu_port(0) == 0x07,
                "U64 Debug stepping must default to all ROMs visible without a backend")) return 1;
 
@@ -4723,24 +4843,29 @@ static int test_brk_trampoline_bytes_preserve_rti_restore_semantics()
     m.ram[FAKE_STORE_SR] = 0xA5;
     m.ram[FAKE_STORE_PCLO] = 0x78;
     m.ram[FAKE_STORE_PCHI] = 0x56;
+    m.ram[FAKE_STORE_SP] = 0xE8;
     m.ram[FAKE_STORE_Y] = 0x44;
     m.ram[FAKE_STORE_X] = 0x55;
     m.ram[FAKE_STORE_A] = 0x66;
 
     Mini6510 cpu = { 0x10, 0x20, 0x30, 0xF0, 0x00, FAKE_TRAMPOLINE, false, false };
-    m.ram[0x01F1] = 0xDE;
-    m.ram[0x01F2] = 0xAD;
-    m.ram[0x01F3] = 0xBE;
+    m.ram[0x01E9] = 0xDE;
+    m.ram[0x01EA] = 0xAD;
+    m.ram[0x01EB] = 0xBE;
     if (expect(mini_run(m.ram, cpu, 0, 100),
                "Optimized trampoline bytes must reach RTI")) return 1;
     if (expect(cpu.rti && cpu.pc == 0x5678 && cpu.sr == 0xA5,
                "Optimized trampoline must rebuild the RTI frame from stored SR/PC")) return 1;
-    if (expect(m.ram[0x01F4] == 0xA5 &&
-               m.ram[0x01F5] == 0x78 &&
-               m.ram[0x01F6] == 0x56,
-               "Optimized trampoline loop must write $0101,X..$0103,X after discarding the NMI frame")) return 1;
-    if (expect(cpu.sp == 0xF6,
-               "Optimized trampoline RTI must leave SP after the rebuilt frame")) return 1;
+    if (expect(m.ram[0x01E6] == 0xA5 &&
+               m.ram[0x01E7] == 0x78 &&
+               m.ram[0x01E8] == 0x56,
+               "Optimized trampoline must build the RTI frame below the stored SP")) return 1;
+    if (expect(m.ram[0x01E9] == 0xDE &&
+               m.ram[0x01EA] == 0xAD &&
+               m.ram[0x01EB] == 0xBE,
+               "Optimized trampoline must not overwrite bytes above the stored SP")) return 1;
+    if (expect(cpu.sp == 0xE8,
+               "Optimized trampoline RTI must restore the stored SP")) return 1;
     if (expect(m.ram[0x0000] == 0x37 && m.ram[0x0001] == 0x35,
                "Optimized trampoline must restore $00/$01 before RTI")) return 1;
     if (expect(cpu.a == 0x66 && cpu.x == 0x55 && cpu.y == 0x44,
@@ -5407,6 +5532,40 @@ static int test_run_to_current_visible_kernal_jsr_enters_callee_before_rearming_
     return 0;
 }
 
+static int test_run_to_lagging_visible_rom_uses_step_bytes_for_trampoline()
+{
+    FakeVisibleRomMachine m(false);
+    m.allow_visible_rom_patching = true;
+    m.fetch_lags = true;
+    m.cpu_port = 0x07;
+    m.kernal_rom[0x0005] = 0xA5; // LDA $61 at $E005
+    m.kernal_rom[0x0006] = 0x61;
+    m.kernal_rom[0x0007] = 0xEA;
+    m.force_raw_peek_brk = true;
+    m.force_raw_peek_brk_addr = 0xE005;
+
+    DebugContext from;
+    debug_context_reset(&from);
+    from.valid = true;
+    from.pc = 0xE005;
+    from.sp = 0xF7;
+    from.sr = 0x24;
+    from.live_cpu_port_valid = true;
+    from.live_cpu_port = 0x07;
+
+    m.arm_capture_context(0x0342, 0xF7, 0, 0, 0, 0x24);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.run_to(from, 0xE007, 0, 0xE005, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "Lagging visible-ROM run-to launch prime must complete")) return 1;
+    if (expect(ctx.valid && ctx.pc == 0xE007,
+               "Lagging visible-ROM run-to must report the real fall-through")) return 1;
+    if (expect(m.ram[0x0340] == 0xA5 && m.ram[0x0341] == 0x61,
+               "Run-to trampoline must copy coherent step bytes, not stale peek_cpu BRK")) return 1;
+    return 0;
+}
+
 static int test_overlay_step_over_never_freezes()
 {
     // Overlay-mode non-regression: the machine is never frozen, so the engine
@@ -5765,9 +5924,6 @@ static int test_cleanup_resume_trampoline_restores_full_context()
                m.ram[FAKE_RESUME_TRAMP + 17] == 0xA9 &&
                m.ram[FAKE_RESUME_TRAMP + 18] == 0xA4,
                "Cleanup trampoline must push PCH, PCL, then SR for RTI")) return 1;
-    if (expect(m.ram[FAKE_RESUME_TRAMP + 14] == 0xA9 &&
-               m.ram[FAKE_RESUME_TRAMP + 15] == 0x01,
-               "Cleanup trampoline must include the captured PC low byte")) return 1;
     if (expect(m.ram[FAKE_RESUME_TRAMP + 20] == 0xA0 &&
                m.ram[FAKE_RESUME_TRAMP + 21] == 0x99 &&
                m.ram[FAKE_RESUME_TRAMP + 22] == 0xA2 &&
@@ -6893,6 +7049,8 @@ int main()
     RUN(test_step_out_uses_traced_jsr_target_even_when_target_is_above_pc);
     RUN(test_step_out_ignores_nearby_rts_and_patches_after_traced_jsr);
     RUN(test_step_out_refuses_stale_far_stack_frame);
+    RUN(test_visible_rom_simple_linear_interprets_without_breakpoint);
+    RUN(test_visible_rom_basic_loop_interprets_index_register_and_flags);
     RUN(test_over_rts_refuses_non_jsr_stack_target);
     RUN(test_traced_rts_uses_recorded_return_target_when_stack_is_unreliable);
     RUN(test_traced_kernal_to_basic_step_out_patches_kernal_return);
@@ -6924,6 +7082,7 @@ int main()
     RUN(test_visible_kernal_hard_vector_installs_and_restores);
     RUN(test_stale_visible_kernal_hard_vector_is_recovered);
     RUN(test_run_to_current_visible_kernal_jsr_enters_callee_before_rearming_cursor_breakpoint);
+    RUN(test_run_to_lagging_visible_rom_uses_step_bytes_for_trampoline);
     RUN(test_overlay_step_over_never_freezes);
     RUN(test_overlay_accessible_unfrozen_step_over_does_not_unfreeze);
     RUN(test_overlay_render_target_disables_stale_frozen_unfreeze);
