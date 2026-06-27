@@ -126,7 +126,11 @@ private:
 
     enum {
         MAX_PATCHES = 16,
-        MAX_RETURN_TARGETS = 8
+        // Step Out walks this stack of Step-Into return targets. The 6510 hardware
+        // stack ($0100-$01FF) holds at most 128 return addresses, so sizing this to
+        // 128 means the cap can never drop a real frame and falsely report
+        // NOT IN SUBROUTINE - which an 8-entry cap did once nesting passed depth 8.
+        MAX_RETURN_TARGETS = 128
     };
 
     Keyboard *cancel_keyboard;

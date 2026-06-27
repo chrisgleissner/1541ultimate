@@ -4302,6 +4302,63 @@ static int test_step_out_refuses_stale_far_stack_frame()
     return 0;
 }
 
+static int test_step_out_unwinds_past_eight_nested_traces()
+{
+    // Regression: Step Out walks the traced return-target stack. An 8-entry cap
+    // silently dropped the oldest frames, so after tracing >8 nested JSRs a deep
+    // Step Out falsely reported NOT IN SUBROUTINE even though the live 6510 stack
+    // still held valid frames. Found on real hardware at depth 16 (the 9th Step
+    // Out). The cap is now the 6510 physical nesting limit (128).
+    FakeFreezeMachine m(false);
+    const int N = 12;  // exceeds the historical 8-entry cap
+    for (int i = 0; i <= N; i++) {
+        uint16_t li = (uint16_t)(0xC000 + i * 0x10);
+        if (i < N) {
+            uint16_t lnext = (uint16_t)(0xC000 + (i + 1) * 0x10);
+            m.ram[li] = 0x20;
+            m.ram[li + 1] = (uint8_t)(lnext & 0xFF);
+            m.ram[li + 2] = (uint8_t)(lnext >> 8);
+        }
+        m.ram[li + 3] = 0xEA;
+    }
+
+    DebugContext from;
+    debug_context_reset(&from);
+    from.valid = true;
+    from.pc = 0xC000;
+    from.sp = 0xF8;
+    from.sr = 0x24;
+
+    uint8_t sp = 0xF8;
+    for (int i = 0; i < N; i++) {
+        uint16_t jsr_pc = (uint16_t)(0xC000 + i * 0x10);
+        uint16_t callee = (uint16_t)(0xC000 + (i + 1) * 0x10);
+        uint8_t jsr[3] = { 0x20, (uint8_t)(callee & 0xFF), (uint8_t)(callee >> 8) };
+        DebugPredictResult pred;
+        debug_predict(jsr_pc, jsr, false, &pred);
+        sp = (uint8_t)(sp - 2);
+        m.arm_capture_context(callee, sp, 0, 0, 0, 0x24);
+        DebugContext out;
+        if (expect(m.trace_at(jsr_pc, pred, &out) == DebugSession::DBG_OK,
+                   "deep Step Into of a JSR must succeed")) return 1;
+        from = out;
+    }
+
+    for (int i = N - 1; i >= 0; i--) {
+        uint16_t return_site = (uint16_t)((0xC000 + i * 0x10) + 3);
+        sp = (uint8_t)(sp + 2);
+        m.arm_capture_context(return_site, sp, 0, 0, 0, 0x24);
+        DebugContext out;
+        DebugSession::Result r = m.step_out(from, &out);
+        if (expect(r == DebugSession::DBG_OK,
+                   "Step Out must unwind every traced level past depth 8")) return 1;
+        if (expect(out.pc == return_site,
+                   "Step Out must land on the traced caller return site")) return 1;
+        from = out;
+    }
+    return 0;
+}
+
 static int test_visible_rom_simple_linear_interprets_without_breakpoint()
 {
     FakeVisibleRomMachine m(false);
@@ -7086,6 +7143,7 @@ int main()
     RUN(test_step_out_uses_traced_jsr_target_even_when_target_is_above_pc);
     RUN(test_step_out_ignores_nearby_rts_and_patches_after_traced_jsr);
     RUN(test_step_out_refuses_stale_far_stack_frame);
+    RUN(test_step_out_unwinds_past_eight_nested_traces);
     RUN(test_visible_rom_simple_linear_interprets_without_breakpoint);
     RUN(test_visible_rom_basic_loop_interprets_index_register_and_flags);
     RUN(test_over_rts_refuses_non_jsr_stack_target);

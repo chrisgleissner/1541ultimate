@@ -733,6 +733,73 @@ There are 10 breakpoint slots:
 | `DEL` | Reset the selected slot (`Res`) |
 | `RUN/STOP` | Close the popup |
 
+### Stepping and resume semantics
+
+The debugger is a measurement instrument: each step lands on the
+architecturally correct instruction with the correct registers, flags, stack
+pointer, and memory side effects, and leaving Debug always hands the CPU back to
+a live runtime. The rules below make the guarantees and their one documented
+boundary explicit.
+
+**Memory source follows the live CPU.** During an active Debug stop the
+current-PC row, the instruction bytes, the disassembly source tag (`[RAM]`,
+`[BAS]`, `[KRN]`, `[CHR]`, `[I/O]`), and the temporary step breakpoints all
+follow the live CPU bank from `$0001`, not the inspection view selected by `O`.
+`O` still cycles the view bank, but it never changes which instruction stream the
+CPU will execute, so the executing row is never ambiguous.
+
+**Stack-pointer coherence.** Step Into, Step Out, and Step Over run the real
+6510, so the live stack pointer after any sequence equals an undebugged run's
+stack pointer. A real `JSR` moves SP down by exactly 2 and the matching `RTS` up
+by 2; Step Over of a `JSR` executes the whole subroutine and returns with SP net
+unchanged; Step Out follows the active call frame, not a nearby `RTS` opcode. The
+return chain therefore always returns to the correct caller, verified through a
+full 16-level nested descend and unwind.
+
+Step Out follows subroutines you entered with Step Into; it deliberately does not
+act on arbitrary-looking stack data so it can never break at a stale frame. It
+tracks the full hardware call depth (up to the 128-frame limit of the `$0100`
+stack), so deep nesting is supported. If you reached a point inside a subroutine
+with Go (a breakpoint hit) rather than Step Into, Step Out reports `NOT IN
+SUBROUTINE`; the disassembler still shows the live `RTS` target for that row, so
+set a breakpoint there and Go to leave the routine.
+
+**Interrupt state on resume.** The BRK single-stepper runs each step with
+interrupts masked so a step cannot be interrupted. When the CPU is handed back
+(Exit Debug, Go with no remaining breakpoints, or closing the monitor) the
+debugger restores an interrupt state that keeps the machine live:
+
+- A program running with KERNAL mapped resumes with interrupts ENABLED, so the
+  jiffy clock, cursor, and keyboard stay alive. This is the fix for the
+  "frozen BASIC after leaving the monitor" failure.
+- A program running with KERNAL banked out (`$01` HIRAM clear) resumes with
+  interrupts left masked, because there is no KERNAL IRQ handler at `$FFFE` and
+  forcing interrupts on would wedge it. Liveness for such a program is proven by
+  program progress, not by the jiffy clock.
+
+Documented boundary: a program that runs with KERNAL mapped and intentionally
+keeps interrupts disabled (for example a raster effect that has executed `SEI`
+and has not yet reached its `CLI`) is resumed with interrupts ENABLED when you
+leave the debugger inside that window. This is the conservative "resume to a live
+machine" choice; the machine is never wedged and never needs a power cycle. To
+preserve a disabled-interrupt state across a resume, set a breakpoint past the
+critical section and use Go rather than leaving the debugger inside it.
+
+**Banked single-step.** Breakpoint plus Go is the reliable execution path in
+every banking configuration. Single-step is coherent for RAM, visible BASIC ROM,
+visible KERNAL ROM, character ROM, and I/O. RAM-under-ROM single-step is limited
+by the U64 FPGA fetch aperture: when the live CPU bank serves RAM beneath a ROM
+window the footer replaces the banking detail with a deterministic, visible
+warning, `CPUn ! RAM-under-ROM step VICm`, and you should prefer a breakpoint
+plus Go. The warning is never silent; the debugger never steps the wrong source
+and never leaves a hidden breakpoint patch behind.
+
+**Hygiene.** Every Debug session restores what it touched: BRK opcode patches in
+RAM and in the volatile U64 ROM image, the BRK/IRQ/NMI vectors, the `$00/$01`
+banking registers, and the cassette-buffer scratch region the trampolines use.
+Breakpoint slots survive a `C=+X` reset and a monitor close/reopen by design, but
+not a power cycle.
+
 ### Help screen
 
 `F3` or `?` shows the Debug help screen while Debug is active.
