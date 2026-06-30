@@ -2230,20 +2230,16 @@ def run_banked_breakpoint_tests(rest_host: str, session: "mt.MonitorSession") ->
         if "[RAM]" not in row or "INC $D020" not in row:
             raise mt.Failure(f"Debug PC row must follow live RAM mapping: {row!r}")
 
-        # The breakpoint+Go hit above is the reliable path in RAM under ROM. A
-        # direct Step Over here is gated in normal Dbg: it stops with a clear
-        # one-line alert and points at breakpoint+Go instead of stepping the
-        # flaky U64 fetch aperture. Nothing executes, so the CPU stays at $E000
-        # and the machine remains clean.
+        # In RAM under ROM a direct single step is flaky, so normal Dbg Step Over
+        # runs to the predicted fall-through ($E003) via breakpoint+Go
+        # automatically - no user-placed breakpoint required. It advances the PC.
         session.send_char("D")
         snap = session.capture()
-        _assert_no_debug_modal(session, "$E000 RAM-under-KERNAL gated step")
-        if "RAM under ROM: use breakpoint+Go" not in snap.text():
+        _assert_no_debug_modal(session, "$E000 RAM-under-KERNAL Step Over")
+        parsed = _wait_for_pc(session, "E003")
+        if parsed["pc"].upper() != "E003":
             raise mt.Failure(
-                f"RAM-under-KERNAL Step Over must be gated to breakpoint+Go:\n{snap.text()}")
-        parsed = _wait_for_pc(session, "E000")
-        if parsed["pc"].upper() != "E000":
-            raise mt.Failure(f"Gated Step Over must not advance the PC: {parsed!r}")
+                f"RAM-under-KERNAL Step Over must advance to $E003 via breakpoint+Go: {parsed!r}")
 
     with mt.check("Debug: mixed $E000 breakpoint cleanup restores both stores", u2=False,
                   u2_reason="U64 visible-ROM and hidden-RAM patch restoration are required"):
@@ -2327,8 +2323,7 @@ def _repeat_cancel_redebug_cycles(rest_host: str, session: "mt.MonitorSession",
                                   mapped_status: str, evidence_addr: int,
                                   evidence_len: int, first_pc: int,
                                   second_pc: int, row_tokens: tuple[str, ...],
-                                  cycles: int = 3,
-                                  gated_single_step: bool = False) -> None:
+                                  cycles: int = 3) -> None:
     for cycle in range(1, cycles + 1):
         _send_ctrl_d(session)
         snap = session.capture()
@@ -2348,23 +2343,9 @@ def _repeat_cancel_redebug_cycles(rest_host: str, session: "mt.MonitorSession",
         else:
             mt.ensure_status(session, mapped_status)
 
-        if gated_single_step:
-            # RAM-under-ROM direct single-step is gated in normal Dbg: a Step
-            # Over stops with a clear one-line alert and points at breakpoint+Go
-            # instead of stepping the flaky U64 fetch aperture. Nothing executes,
-            # so the machine stays clean and the next cancel/re-debug cycle still
-            # works. The breakpoint+Go path itself is exercised by the
-            # _arm_loop_breakpoint_and_hit hit above.
-            session.send_char("D")
-            snap = session.capture()
-            _assert_no_debug_modal_snapshot(
-                snap, f"{label} cycle {cycle}: gated RAM-under-ROM Step Over")
-            if "RAM under ROM: use breakpoint+Go" not in snap.text():
-                raise mt.Failure(
-                    f"{label} cycle {cycle}: RAM-under-ROM Step Over must be gated "
-                    f"to breakpoint+Go\n{snap.text()}")
-            continue
-
+        # RAM under ROM Step Over runs to the predicted fall-through via
+        # breakpoint+Go automatically in normal Dbg (no user breakpoint needed),
+        # so the cancel/re-debug cycle advances the PC like any other bank.
         session.send_char("D")
         _wait_for_pc(session, f"{first_pc:04X}")
         session.send_char("D")
@@ -2434,8 +2415,7 @@ def run_repeat_redebug_tests(rest_host: str, session: "mt.MonitorSession") -> No
         _repeat_cancel_redebug_cycles(
             rest_host, session, "RAM-under-KERNAL repeat redebug",
             0xE000, 5, "CPU5 $A:RAM $D:I/O $E:RAM VIC",
-            0x0400, 0x0200, 0xE003, 0xE006, ("[RAM]", "INX"),
-            gated_single_step=True)
+            0x0400, 0x0200, 0xE003, 0xE006, ("[RAM]", "INX"))
         _cancel_repeat_debug_and_reset(
             rest_host, session, "RAM-under-KERNAL repeat redebug final cleanup",
             0x0400, 0x0200)

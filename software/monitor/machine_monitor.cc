@@ -6500,31 +6500,36 @@ DebugStepDecision debug_classify_step(DebugStepOp op, DebugStepSource src,
         return d;
     }
 
-    // RAM under ROM: direct single-step is flaky on the U64 fetch aperture.
-    // Normal Dbg stops and points at breakpoint+Go; DbX may run the test step.
-    if (single_step_op && src == DEBUG_SRC_RAM_UNDER_ROM) {
+    // RAM-under-ROM, and visible ROM while the UI Freeze screen is up, are the
+    // "unsafe" launch banks: the U64 instruction-fetch aperture can serve a
+    // stale byte, so a direct single step there is flaky.
+    bool unsafe_src = (src == DEBUG_SRC_RAM_UNDER_ROM) ||
+                      (src == DEBUG_SRC_VISIBLE_ROM && ui_freeze);
+    if (single_step_op && unsafe_src) {
+        // Step Over does NOT single-step the unsafe instruction. It plants a
+        // breakpoint at the predicted fall-through / return and free-runs the
+        // region to it (linear ops in ROM run from a RAM trampoline). That is
+        // reliable for a call/return back into RAM and best-effort otherwise,
+        // so normal Dbg runs it automatically - the user never has to place a
+        // breakpoint at a future location.
+        if (op == DEBUG_OP_OVER) {
+            d.plan = dbx ? DEBUG_PLAN_DBX_TEST : DEBUG_PLAN_BREAKPOINT_GO;
+            d.alert = dbx ? "DbX: test-only stepping"
+                          : "Dbg: Over uses breakpoint+Go";
+            d.reason = "unsafe_over_breakpoint_go";
+            return d;
+        }
+        // Step Into has to single-step the unsafe instruction itself: there is
+        // no reliable landing breakpoint for "the next PC inside the routine".
+        // Normal Dbg declines and points at DbX; DbX runs it best-effort.
         if (dbx) {
             d.plan = DEBUG_PLAN_DBX_TEST;
             d.alert = "DbX: test-only stepping";
         } else {
             d.plan = DEBUG_PLAN_STOP;
-            d.alert = "RAM under ROM: use breakpoint+Go";
+            d.alert = "Step Into here needs DbX";
         }
-        d.reason = "ram_under_rom_direct_step";
-        return d;
-    }
-
-    // Visible ROM in UI Freeze mode: the freezer aperture can serve a stale
-    // fetch so the step BRK is not reliably caught. Normal Dbg stops; DbX runs.
-    if (single_step_op && src == DEBUG_SRC_VISIBLE_ROM && ui_freeze) {
-        if (dbx) {
-            d.plan = DEBUG_PLAN_DBX_TEST;
-            d.alert = "DbX: test-only stepping";
-        } else {
-            d.plan = DEBUG_PLAN_STOP;
-            d.alert = "Use DbX for this Step";
-        }
-        d.reason = "rom_freeze_direct_step_over";
+        d.reason = "unsafe_step_into";
         return d;
     }
 

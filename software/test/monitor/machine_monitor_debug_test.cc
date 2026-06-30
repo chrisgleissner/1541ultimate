@@ -7496,7 +7496,7 @@ static int test_dbx_resets_off_on_leave_and_reentry()
     return 0;
 }
 
-static int test_normal_dbg_visible_rom_freeze_step_over_stops()
+static int test_normal_dbg_visible_rom_freeze_step_over_runs_via_breakpoint_go()
 {
     TestUserInterface ui;
     CaptureScreen screen;
@@ -7519,14 +7519,12 @@ static int test_normal_dbg_visible_rom_freeze_step_over_stops()
     if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
     dbx_set_predict_bytes(backend.last_session, 0xEA, 0xEA, 0xEA);
     if (expect(monitor.poll(0) == 0, "Step Over must stay in monitor")) return 1;
-    int over = backend.last_session->over_at_calls +
-               backend.last_session->over_at_breakpoint_calls +
-               backend.last_session->over_calls;
-    if (expect(over == 0,
-               "Normal Dbg visible-ROM Freeze Step Over must not run the direct step")) return 1;
-    if (expect(strcmp(monitor.debug_status_message(), "Use DbX for this Step") == 0,
-               "Stop alert must point the user at DbX")) return 1;
-    if (dbx_alert_shape_ok(monitor.debug_status_message(), "stop alert shape")) return 1;
+    if (expect(backend.last_session->over_at_breakpoint_calls == 1,
+               "Normal Dbg visible-ROM Freeze Step Over runs via breakpoint+Go")) return 1;
+    if (expect(strcmp(monitor.debug_status_message(),
+                      "Dbg: Over uses breakpoint+Go") == 0,
+               "Status must note breakpoint+Go")) return 1;
+    if (dbx_alert_shape_ok(monitor.debug_status_message(), "status shape")) return 1;
     monitor.poll(0);
     monitor.poll(0);
     monitor.deinit();
@@ -7599,10 +7597,10 @@ static int test_normal_dbg_ram_under_rom_single_step_stops()
     if (expect(monitor.poll(0) == 0, "Trace must stay in monitor")) return 1;
     int traces = backend.last_session->trace_calls + backend.last_session->trace_at_calls;
     if (expect(traces == 0,
-               "Normal Dbg RAM-under-ROM single-step must not run the direct step")) return 1;
+               "Normal Dbg RAM-under-ROM Step Into must not run the direct step")) return 1;
     if (expect(strcmp(monitor.debug_status_message(),
-                      "RAM under ROM: use breakpoint+Go") == 0,
-               "Stop alert must point at breakpoint+Go")) return 1;
+                      "Step Into here needs DbX") == 0,
+               "Stop alert must point Step Into at DbX")) return 1;
     if (dbx_alert_shape_ok(monitor.debug_status_message(), "RAM-under-ROM alert shape")) return 1;
     monitor.poll(0);
     monitor.poll(0);
@@ -7900,20 +7898,31 @@ static int test_debug_classify_step_alerts_are_plain_and_fit()
                    "Every decision must carry a reason code")) return 1;
     }
     // Exact alert strings and plans for the load-bearing cells.
+    // Step Over on the unsafe banks now runs automatically via breakpoint+Go in
+    // normal Dbg (no user-placed breakpoint required); Step Into still needs DbX.
     DebugStepDecision rom_freeze = debug_classify_step(DEBUG_OP_OVER,
         DEBUG_SRC_VISIBLE_ROM, true, false, false, false);
-    if (expect(rom_freeze.plan == DEBUG_PLAN_STOP &&
-               strcmp(rom_freeze.alert, "Use DbX for this Step") == 0,
-               "Visible-ROM Freeze Step Over stops in Dbg")) return 1;
+    if (expect(rom_freeze.plan == DEBUG_PLAN_BREAKPOINT_GO &&
+               strcmp(rom_freeze.alert, "Dbg: Over uses breakpoint+Go") == 0,
+               "Visible-ROM Freeze Step Over runs via breakpoint+Go in Dbg")) return 1;
     DebugStepDecision rom_freeze_dbx = debug_classify_step(DEBUG_OP_OVER,
         DEBUG_SRC_VISIBLE_ROM, true, true, false, false);
     if (expect(rom_freeze_dbx.plan == DEBUG_PLAN_DBX_TEST,
                "Visible-ROM Freeze Step Over runs in DbX")) return 1;
+    DebugStepDecision rur_over = debug_classify_step(DEBUG_OP_OVER,
+        DEBUG_SRC_RAM_UNDER_ROM, false, false, false, false);
+    if (expect(rur_over.plan == DEBUG_PLAN_BREAKPOINT_GO &&
+               strcmp(rur_over.alert, "Dbg: Over uses breakpoint+Go") == 0,
+               "RAM-under-ROM Step Over runs via breakpoint+Go in Dbg")) return 1;
     DebugStepDecision rur = debug_classify_step(DEBUG_OP_TRACE,
         DEBUG_SRC_RAM_UNDER_ROM, false, false, false, false);
     if (expect(rur.plan == DEBUG_PLAN_STOP &&
-               strcmp(rur.alert, "RAM under ROM: use breakpoint+Go") == 0,
-               "RAM-under-ROM single-step stops in Dbg")) return 1;
+               strcmp(rur.alert, "Step Into here needs DbX") == 0,
+               "RAM-under-ROM Step Into stops in Dbg")) return 1;
+    DebugStepDecision rur_dbx = debug_classify_step(DEBUG_OP_TRACE,
+        DEBUG_SRC_RAM_UNDER_ROM, false, true, false, false);
+    if (expect(rur_dbx.plan == DEBUG_PLAN_DBX_TEST,
+               "RAM-under-ROM Step Into runs in DbX")) return 1;
     DebugStepDecision changed = debug_classify_step(DEBUG_OP_OVER,
         DEBUG_SRC_VISIBLE_ROM, false, false, true, false);
     if (expect(changed.plan == DEBUG_PLAN_STOP &&
@@ -8108,7 +8117,7 @@ int main()
     RUN(test_ctrl_x_reset_not_shadowed_by_x);
     RUN(test_d_then_x_enters_debug_and_enables_dbx);
     RUN(test_dbx_resets_off_on_leave_and_reentry);
-    RUN(test_normal_dbg_visible_rom_freeze_step_over_stops);
+    RUN(test_normal_dbg_visible_rom_freeze_step_over_runs_via_breakpoint_go);
     RUN(test_dbx_visible_rom_freeze_step_over_runs_and_marks_dbx);
     RUN(test_normal_dbg_ram_under_rom_single_step_stops);
     RUN(test_dbx_ram_under_rom_single_step_runs);

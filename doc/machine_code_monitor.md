@@ -669,9 +669,11 @@ Entering Debug does not execute CPU instructions by itself; execution only happe
 Use `Dbg` for normal work. Use `DbX` only to try Debug steps that are not trusted
 yet.
 
-`Dbg` uses direct Step, Trace, Out, and Go where those are known to work. `Dbg`
-may use breakpoint+Go to complete a Step Over when a direct step into the called
-routine is not safe. `DbX` lets you try extra banked, ROM, and Freeze steps for
+`Dbg` uses direct Step, Trace, Out, and Go where those are known to work, and
+completes a Step Over with breakpoint+Go wherever a direct single step would be
+flaky (RAM under ROM in any mode, visible ROM in UI Freeze) so Step Over is
+always available. Step Into of those flaky banks is declined in `Dbg`. `DbX`
+lets you try the direct Step Over, Step Into, and Step Out in those banks for
 testing.
 
 Press `X` while Debug is active to toggle between `Dbg` and `DbX`. The header
@@ -718,11 +720,11 @@ This table shows what normal `Dbg` does and what `DbX` adds for each path.
 | RAM + Overlay | Direct step | Direct test step | Reliable | none needed |
 | RAM + Freeze | Direct step | Direct test step | Reliable | none needed |
 | Visible KERNAL ROM + Telnet | Direct step | Direct test step | Reliable | breakpoint+Go |
-| Visible KERNAL ROM + Freeze | Stops; use DbX | Direct test step | Freezer aperture can miss the step breakpoint | breakpoint+Go |
+| Visible KERNAL ROM + Freeze | Step Over: breakpoint+Go; Step Into: stops, use DbX | Direct test step | Freezer aperture can miss a direct single step | DbX for Step Into |
 | Step Over from RAM into KERNAL/BASIC | breakpoint+Go | Direct test step | Return breakpoint is in RAM and reliable | breakpoint+Go |
 | Step Over from RAM into RAM under ROM | breakpoint+Go | Direct test step | Return breakpoint is in RAM and reliable | breakpoint+Go |
-| RAM under ROM direct single-step | Stops; use breakpoint+Go | Direct test step | Direct single-step is intermittent on the U64 | breakpoint+Go |
-| Visible BASIC ROM | Direct in Telnet/Overlay; DbX in Freeze | Direct test step | Same family as visible KERNAL | breakpoint+Go |
+| RAM under ROM | Step Over: breakpoint+Go; Step Into: stops, use DbX | Direct test step | Direct single-step is intermittent on the U64 | DbX for Step Into |
+| Visible BASIC ROM | Direct in Telnet/Overlay; in Freeze Step Over uses breakpoint+Go, Step Into uses DbX | Direct test step | Same family as visible KERNAL | DbX for Step Into in Freeze |
 | Character ROM | Not checked | Direct test step, DbX visible | Not run as a distinct path | breakpoint+Go where it applies |
 | I/O | Not checked | Direct test step, DbX visible | Stepping I/O as code is unusual | breakpoint+Go where it applies |
 | Full $01 banking sweep | Per memory source | Direct test step, DbX visible | Gating follows the live `$01` source | breakpoint+Go |
@@ -731,17 +733,18 @@ This table shows what normal `Dbg` does and what `DbX` adds for each path.
 Key points:
 
 - Any Debug path that works in a specific mode is available in normal `Dbg`.
-- A Step Over may use breakpoint+Go in normal `Dbg` when a direct step into the
-  called routine is not safe. When it does, the status line shows
-  `Dbg: Over uses breakpoint+Go`.
-- Step Over from RAM into KERNAL or BASIC stays available in normal `Dbg` when
-  the return breakpoint is reliable.
-- Step Over from RAM into RAM under ROM stays available in normal `Dbg` when the
-  return breakpoint is reliable.
-- Visible KERNAL ROM + Freeze direct Step Over over a ROM `JSR` is `DbX` only
-  unless a clean normal `Dbg` breakpoint+Go path exists.
-- RAM under ROM direct single-step is `DbX` only unless it is proven reliable in
-  the current mode.
+- **Step Over works in every bank.** Where a direct single step is reliable it
+  steps directly; where it would be flaky (RAM under ROM in any mode, visible ROM
+  in Freeze) normal `Dbg` completes it with breakpoint+Go to the predicted
+  fall-through / return and shows `Dbg: Over uses breakpoint+Go`. No user-placed
+  breakpoint is required.
+- **Step Into** of the flaky banks (RAM under ROM, visible ROM in Freeze) is
+  `DbX` only; normal `Dbg` declines with `Step Into here needs DbX`. Use Step
+  Over instead, or switch to `DbX`.
+- Step Out, Go, and Run to cursor are breakpoint+Go primitives and work in every
+  bank.
+- `DbX` adds direct, best-effort Step Over, Step Into, and Step Out everywhere -
+  including the flaky banks - for testing.
 - Breakpoint+Go is the preferred way past banked or ROM-sensitive code where it
   is supported.
 - `DbX` is visibly marked as `DbX`. `DbX` does not mean the step result is
@@ -855,28 +858,41 @@ machine" choice; the machine is never wedged and never needs a power cycle. To
 preserve a disabled-interrupt state across a resume, set a breakpoint past the
 critical section and use Go rather than leaving the debugger inside it.
 
-**Banked single-step.** Breakpoint plus Go is the reliable execution path in
-every banking configuration. Single-step is coherent for RAM, visible BASIC ROM,
-visible KERNAL ROM, character ROM, and I/O in Telnet and Overlay modes.
-RAM under ROM direct single-step is limited by the U64 FPGA fetch aperture: when the
-live CPU bank serves RAM beneath a ROM window, normal `Dbg` stops the direct single
--step and shows `RAM under ROM: use breakpoint+Go`. `DbX` may run the direct test
-step. The footer also shows a deterministic banking warning, `CPUn ! RAM-under-ROM
-step VICm`. The debugger never steps the wrong source and never leaves a hidden
-breakpoint patch behind.
+**What is supported.** Breakpoint plus Go is the reliable execution path in every
+banking configuration, and normal `Dbg` now uses it automatically so you never
+have to place a breakpoint by hand to get past an unsafe region:
 
-**Known limitation - visible-ROM stepping in UI Freeze mode.** Stepping *over* a
-ROM `JSR` from visible KERNAL/BASIC ROM while in UI Freeze mode is not reliable on
-the U64: the freezer's memory aperture can serve a stale instruction fetch, so the
-breakpoint the debugger installs at the return address is not always seen by the
-live CPU, which then runs past it. The same operation is reliable in Telnet and
-Overlay modes. In UI Freeze mode, normal `Dbg` stops this direct Step Over and shows
-`Use DbX for this Step`; switch to `DbX` to try it. Prefer a breakpoint plus Go to
-step past a ROM subroutine. A `DbX` visible-ROM step that fails this way can leave a
-stale BRK byte in the volatile U64 ROM image; the monitor then marks the ROM image
-changed, stops further visible-ROM Debug with `ROM image changed: reload ROM`, and
-asks you to reload ROM. This does not touch flash and is cleared by a ROM reload
-(firmware redeploy or device reboot); a plain C64 reset (`C=+X`) does not clear it.
+- **Step Over** is supported in every bank - RAM, visible BASIC/KERNAL/CHAR ROM,
+  RAM under ROM, and I/O - in Telnet, Overlay, and UI Freeze modes. Where a
+  direct single step is reliable (RAM everywhere; visible ROM in Telnet/Overlay)
+  it steps directly. Where it would be flaky on the U64 FPGA fetch aperture (RAM
+  under ROM in any mode, and visible ROM in UI Freeze) normal `Dbg` instead
+  plants a breakpoint at the predicted fall-through / return and free-runs the
+  region to it, following the live CPU banking. So you can Step Over a call or
+  jump from RAM into RAM under ROM or ROM and the debugger runs the entire unsafe
+  region and stops at the next instruction - no manual breakpoint required. The
+  footer notes `Dbg: Over uses breakpoint+Go` when it takes that path.
+- **Step Out**, **Go**, and **Run to cursor** are breakpoint-plus-Go primitives
+  and work in every bank.
+- **Step Into** (Trace) has to single-step the unsafe instruction itself. That is
+  reliable for RAM and for visible ROM in Telnet/Overlay, but flaky for RAM under
+  ROM and for visible ROM in UI Freeze. Normal `Dbg` declines it in those cases
+  and shows `Step Into here needs DbX`; use Step Over, or switch to `DbX`.
+
+The debugger never steps the wrong source and never leaves a hidden breakpoint
+patch behind.
+
+**`DbX` (experimental Debug).** `X` toggles between normal `Dbg` and `DbX` while
+debugging; the top-right marker shows the active mode. `DbX` runs the full set of
+steps - Step Over, Step Into, and Step Out - directly and best-effort in every
+bank, including the RAM-under-ROM and visible-ROM-in-Freeze cases that normal
+`Dbg` declines. Use it to inspect those genuinely flaky cases. `DbX` is never
+sticky: it resets to off on every fresh Debug entry and on cold start. A `DbX`
+visible-ROM step that fails can leave a stale BRK byte in the volatile U64 ROM
+image; the monitor then marks the ROM image changed, stops further visible-ROM
+Debug with `ROM image changed: reload ROM`, and asks you to reload ROM. This
+never touches flash and is cleared by a ROM reload (firmware redeploy or device
+reboot); a plain C64 reset (`C=+X`) does not clear it.
 
 **Hygiene.** Every Debug session restores what it touched: BRK opcode patches in
 RAM and in the volatile U64 ROM image, the BRK/IRQ/NMI vectors, the `$00/$01`
