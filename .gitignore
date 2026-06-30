@@ -293,3 +293,19 @@ tools/64tass/*.o
 python/grab*
 fpga/cpu_unit/rvlite/vhdl_source/bootrom_pkg_u2.vhd
 fpga/cpu_unit/rvlite/vhdl_source/bootrom_pkg_u2_loader.vhd
+
+# Python bytecode cache
+__pycache__/
+
+# Local developer validation harnesses (kept local; not part of the firmware).
+# The committed monitor test suite is monitor_test.py / monitor_debug_test.py /
+# monitor_debug_soak.py; the heavier matrix/oracle/stress tooling below is
+# developer-only and nothing in the tree depends on it.
+/scripts/
+tools/developer/machine-code-monitor/mcm6502.py
+tools/developer/machine-code-monitor/mcm_localui.py
+tools/developer/machine-code-monitor/monitor_debug_matrix_gate.py
+tools/developer/machine-code-monitor/monitor_debug_stress.py
+tools/developer/machine-code-monitor/test_monitor_debug_matrix_gate.py
+tools/developer/machine-code-monitor/freeze_thrash_repro.py
+tools/developer/machine-code-monitor/run_rest_*.sh
