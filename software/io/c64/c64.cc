@@ -894,12 +894,10 @@ void C64::freeze(void)
     if (!phi2_present())
         return;
 
-    // Idempotent: if the machine is already frozen, a second freeze would call
-    // backup_io() a second time, which (a) trips configASSERT(!backupIsValid) and
-    // hard-halts the Nios, and (b) overwrites the saved pre-freeze state with the
-    // already-frozen state, corrupting the eventual restore. Re-opening / toggling
-    // the local-UI monitor over REST could reach freeze() twice without an
-    // intervening unfreeze(); this guard matches the invariant refreeze() relies on.
+    // Idempotent: a second freeze would call backup_io() again, which trips
+    // configASSERT(!backupIsValid) (a Nios hard-halt) and overwrites the saved
+    // pre-freeze state, corrupting the eventual restore. The local-UI monitor
+    // can reach freeze() twice over REST without an intervening unfreeze().
     if (isFrozen)
         return;
 
@@ -1031,12 +1029,10 @@ void C64::unfreeze()
         return;
 
     // Only restore when a valid backup exists. isFrozen and backupIsValid can
-    // desync if a reset path (e.g. machine:reset -> MENU_C64_RESET, which itself
-    // calls unfreeze() then reset()) races the freeze state. Calling restore_io()
-    // without a valid backup would trip its configASSERT(backupIsValid) and
-    // hard-halt the Nios (a power-cycle wedge), violating the debugger's
-    // never-wedge guarantee. With no backup there is nothing to restore; just
-    // resume the C64 to a live state and resync the flag.
+    // desync if a reset path (machine:reset -> MENU_C64_RESET calls unfreeze()
+    // then reset()) races the freeze state; restore_io() with no backup trips
+    // configASSERT(backupIsValid) (a Nios hard-halt). With nothing to restore,
+    // just resume and resync the flag.
     if (backupIsValid)
         restore_io();
     // resume C64

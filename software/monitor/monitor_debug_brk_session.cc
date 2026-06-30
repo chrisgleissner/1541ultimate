@@ -86,6 +86,9 @@ static const uint8_t HANDLER_BYTES[] = {
           (uint8_t)(SPIN_OPERAND_LO >> 8),
     0x8D, (uint8_t)(SENTINEL_ADDR & 0xFF),
           (uint8_t)(SENTINEL_ADDR >> 8),
+    // Six NOP slots delay spin entry a few 6510 cycles after the SENTINEL store
+    // to settle the visible-ROM fetch path; HANDLER_ADDR is lowered by 6 so this
+    // spin JMP stays at the fixed SPIN_JMP ($0387), whose operand is self-modified.
     0xEA,
     0xEA,
     0xEA,
@@ -332,9 +335,13 @@ void BrkDebugSession :: begin_run_window(void)
     // share the single unfreeze/refreeze pair.
     if (run_window_depth++ == 0) {
         screen_was_clobbered = false;
-        // The policy bit means this monitor is rendering through the freeze
-        // screen. Even if isFrozen was stale/false at launch, end the window by
-        // re-taking freeze ownership so menu_screen/input remain attached.
+        // run_window_refreeze_enabled is set (in run_machine_monitor) only when
+        // the monitor renders through the C64 freeze screen -- host == the C64
+        // and frozen at launch -- never on the telnet/overlay path. So re-taking
+        // freeze ownership at end_run_window() only ever re-freezes a machine
+        // that belongs frozen (even if isFrozen went stale/false mid-session);
+        // C64::refreeze() is idempotent, so it never double-freezes a live one.
+        // This keeps menu_screen/input attached across the run window.
         run_window_unfroze = run_window_refreeze_enabled;
         if (run_window_refreeze_enabled && machine_is_frozen()) {
             unfreeze_if_accessible();

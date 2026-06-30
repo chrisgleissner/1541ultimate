@@ -92,8 +92,6 @@ MonitorDebug :: MonitorDebug()
 void MonitorDebug :: enter(void)
 {
     active = true;
-    // A fresh Debug entry always starts in normal Dbg. DbX is opt-in per
-    // session via the X key and is never carried over from a previous session.
     experimental = false;
 }
 
@@ -101,8 +99,7 @@ void MonitorDebug :: leave(void)
 {
     active = false;
     // Leaving Debug mode does not invalidate the cached context: returning to
-    // Debug should show the same numbers until execution resumes. DbX, however,
-    // is always cleared so the next session starts in normal Dbg.
+    // Debug should show the same numbers until execution resumes.
     experimental = false;
 }
 

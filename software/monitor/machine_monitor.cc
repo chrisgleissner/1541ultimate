@@ -6458,12 +6458,18 @@ const char *monitor_debug_result_message(int result)
 // ROM image changed latch (process lifetime).
 //
 // Set when a DbX visible-ROM step fails in a way that may have left a stale BRK
-// in the volatile U64 ROM image. While set, normal Dbg refuses visible-ROM
-// Debug and asks the user to reload ROM. It survives a C=+X reset and a monitor
-// close/re-entry (neither path clears it). A ROM reload (firmware redeploy or
-// device reboot) re-initialises this static to false; the firmware never writes
-// a ROM-changed state to flash. monitor_clear_rom_image_changed() models a
-// verified clean ROM-image check.
+// in the volatile U64 ROM image; while set, normal Dbg refuses visible-ROM
+// single stepping and asks the user to reload ROM.
+//
+// A warm C=+X reset heals BASIC/KERNAL via restore_pristine_rom_image() (gated
+// on g_u64_rom_image_dirty), but the latch is kept set deliberately: the
+// firmware does not verify which ROM held the stale BRK (the heal skips
+// CHAR-ROM) and requires an explicit known-clean reload before trusting
+// visible-ROM Dbg again. So neither a C=+X reset nor a monitor close/re-entry
+// clears it; only a full ROM reload (firmware redeploy or device reboot)
+// re-initialises this static. The firmware never writes ROM-changed state to
+// flash. monitor_clear_rom_image_changed() models that clean-reload check and
+// is exercised by the host tests.
 // ---------------------------------------------------------------------------
 static bool monitor_rom_image_changed_flag = false;
 

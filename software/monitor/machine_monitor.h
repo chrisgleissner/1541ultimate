@@ -67,11 +67,8 @@ DebugStepDecision debug_classify_step(DebugStepOp op, DebugStepSource src,
                                       bool ui_freeze, bool dbx,
                                       bool rom_image_changed, bool over_target_flaky);
 
-// Process-lifetime "ROM image changed" latch. Set when a DbX visible-ROM step
-// fails in a way that may have left a stale BRK in the volatile U64 ROM image.
-// While set, normal Dbg refuses visible-ROM Debug and asks the user to reload
-// ROM. It survives a C=+X reset and a monitor close/re-entry by design; a ROM
-// reload (firmware redeploy or device reboot) clears it.
+// Process-lifetime "ROM image changed" latch (see machine_monitor.cc for the
+// full rationale). While set, normal Dbg refuses visible-ROM single stepping.
 bool monitor_rom_image_changed(void);
 void monitor_set_rom_image_changed(void);
 void monitor_clear_rom_image_changed(void);

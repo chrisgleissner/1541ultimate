@@ -57,7 +57,6 @@ typedef enum {
 class Editor;
 class HexEditor;
 class MemoryBackend;
-class MachineMonitor;
 class UserInterface : public ConfigurableObject, public HostClient
 {
 private:

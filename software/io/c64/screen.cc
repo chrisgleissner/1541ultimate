@@ -99,7 +99,11 @@ void Screen_MemMappedCharMatrix :: restore(void)
 	memcpy(char_base, backup_chars, backup_size);
 	memcpy(color_base, backup_color, backup_size);
     resize_cell_colour_codes();
-	memcpy(cell_colour_codes, backup_color, backup_size);
+	// Clamp to the freshly-resized shadow: if the screen shrank between
+	// backup() and restore(), backup_size exceeds cell_colour_codes_size.
+	int restore_bytes = (backup_size < cell_colour_codes_size) ?
+	                        backup_size : cell_colour_codes_size;
+	memcpy(cell_colour_codes, backup_color, restore_bytes);
 	move_cursor(backup_x, backup_y);
 	delete[] backup_chars;
 	delete[] backup_color;

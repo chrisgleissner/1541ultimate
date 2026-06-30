@@ -225,6 +225,15 @@ void U64MemoryBackend :: read_block(uint16_t address, uint8_t *dst, uint16_t len
 
 uint8_t U64MemoryBackend :: get_live_cpu_port(void)
 {
+    // The cpu_port currently in effect for the live machine, in priority order:
+    //  1. the port captured at the last debug stop, while one is held;
+    //  2. when frozen, the monitor's view bank -- the freezer serves memory
+    //     through it and the 6510 is halted, so there is no live fetch and a
+    //     DMA $01 read would add nothing;
+    //  3. otherwise a live DMA read of $00/$01, whose bus access also settles
+    //     the visible-ROM fetch path before a single-step BRK is placed. A
+    //     running single step always lands here, because begin_run_window()
+    //     unfreezes before the step, so the bus-settle behaviour is preserved.
     if (observed_live_cpu_port_valid) {
         return observed_live_cpu_port & 0x07;
     }

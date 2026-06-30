@@ -243,10 +243,9 @@ def verify_binary_contract(status: int, headers: Dict[str, str], body: bytes) ->
 
 
 def verify_menu_content(body: bytes) -> None:
-    # Resilience over prescription: confirm the snapshot looks like a real
-    # rendered menu (readable text in a small, deliberate palette) without
-    # asserting any specific menu text, layout, or colours. This survives future
-    # menu changes yet still rejects blank screens and random/garbage data.
+    # Confirm the snapshot looks like a real rendered menu (readable text in a
+    # small palette) without asserting specific text, layout, or colours, so it
+    # survives menu changes yet still rejects blank screens and garbage data.
     chars = body[:SCREEN_CELLS]
     colours = body[SCREEN_CELLS:]
 

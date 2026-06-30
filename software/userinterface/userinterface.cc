@@ -540,6 +540,9 @@ static bool active_screen_read_safe(UserInterface *ui)
     if (!ui || !ui->screen) {
         return false;
     }
+    // A C64-screen-hosted menu shares the running machine's screen RAM, so
+    // it is only read once the CPU is halted (frozen); an overlay-hosted
+    // menu (U64) renders into independent overlay RAM and bypasses this gate.
 #if !defined(RUNS_ON_PC) && !defined(RECOVERYAPP)
     C64 *machine = C64::getMachine();
     if (machine && ui->host == (GenericHost *)machine && !machine->is_accessible()) {
@@ -559,6 +562,9 @@ bool UserInterface :: copy_active_screen_matrix(uint8_t *dest, int dest_len)
     IndexedList<UserInterface *> *interfaces = get_user_interfaces();
     // Keep the UI pointer stable while walking the shared list and making the
     // bounded matrix copy; IndexedList mutations use the same critical section.
+    // The ~2 KB copy runs with interrupts masked: accepted because this REST
+    // snapshot is low-frequency and copying outside the lock would race the
+    // UI task mutating the screen.
     portENTER_CRITICAL();
     for (int i = 0; i < interfaces->get_elements(); i++) {
         UserInterface *ui = (*interfaces)[i];
