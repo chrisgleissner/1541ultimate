@@ -59,7 +59,7 @@ void UserInterface :: run_machine_monitor(MemoryBackend *backend)
             // loop closes the monitor; pollMenuButtonPush() re-arms the push so
             // the outer run_once() loop also tears the menu down, landing the
             // user back on the live machine instead of a dismissed-menu shell.
-            if (!ret && pollMenuButtonPush()) {
+            if (!ret && !monitor->is_debug_session_active() && pollMenuButtonPush()) {
                 break;
             }
         }

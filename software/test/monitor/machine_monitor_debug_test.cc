@@ -65,6 +65,7 @@ struct StubDebugSession : public DebugSession
     int run_to_calls;
     int cleanup_calls;
     int cleanup_to_context_calls;
+    int reset_cancel_calls;
     int snapshot_calls;
     int claim_calls;
     int refresh_calls;
@@ -93,7 +94,7 @@ struct StubDebugSession : public DebugSession
           trace_calls(0), trace_at_calls(0),
           out_calls(0), out_breakpoint_calls(0),
           go_calls(0), run_to_calls(0), cleanup_calls(0),
-          cleanup_to_context_calls(0),
+          cleanup_to_context_calls(0), reset_cancel_calls(0),
           snapshot_calls(0), claim_calls(0),
           refresh_calls(0), release_calls(0),
           last_start_pc(0), last_run_to_target(0),
@@ -219,6 +220,9 @@ struct StubDebugSession : public DebugSession
         } else {
             debug_context_reset(&cleanup_target_ctx);
         }
+    }
+    virtual void request_reset_cancel(void) {
+        reset_cancel_calls++;
     }
     virtual bool has_parked_context_handoff(void) const {
         return parked_context_handoff_supported;
@@ -381,8 +385,8 @@ static const uint16_t FAKE_STORE_HARD_CPU_PORT = 0x03ED;
 static const uint16_t FAKE_HARD_BRK_ORIG_VECTOR_LO = 0x03EE;
 static const uint16_t FAKE_DEBUG_AREA_START = 0x033C;
 static const uint16_t FAKE_DEBUG_AREA_END = 0x03FB;
-static const uint16_t FAKE_HANDLER_ADDR   = 0x0363;
-static const uint16_t FAKE_HANDLER_LEN    = 39;
+static const uint16_t FAKE_HANDLER_ADDR   = 0x035D;
+static const uint16_t FAKE_HANDLER_LEN    = 45;
 static const uint16_t FAKE_SPIN_JMP      = 0x0387;
 static const uint16_t FAKE_SPIN_LO       = 0x0388;
 static const uint16_t FAKE_SPIN_HI       = 0x0389;
@@ -660,6 +664,10 @@ protected:
                 capture_override_hard_cpu_ddr = 0;
                 capture_override_hard_cpu_port = 0;
                 capture_override_armed = false;
+            } else if (brk_patch_writes > 0) {
+                uint16_t captured_pc = (uint16_t)(last_brk_patch_addr + 2);
+                ram[FAKE_STORE_PCLO] = (uint8_t)(captured_pc & 0xFF);
+                ram[FAKE_STORE_PCHI] = (uint8_t)(captured_pc >> 8);
             }
             ram[FAKE_SENTINEL_ADDR] = 0xFF;
         }
@@ -681,6 +689,11 @@ public:
     uint16_t last_rom_patch_addr;
     int ram_patch_writes;
     uint16_t last_ram_patch_addr;
+    int settle_calls;
+    bool last_settle_sustained;
+    bool saw_sustained_settle;
+    uint8_t settle_spin_lo;
+    uint8_t settle_spin_hi;
     bool switch_cpu_port_on_delay;
     uint8_t cpu_port_after_delay;
 
@@ -690,11 +703,19 @@ public:
           force_raw_peek_brk_addr(0), fetch_lags(false),
           rom_patch_writes(0), last_rom_patch_addr(0),
           ram_patch_writes(0), last_ram_patch_addr(0),
+          settle_calls(0), last_settle_sustained(false),
+          saw_sustained_settle(false),
+          settle_spin_lo(0), settle_spin_hi(0),
           switch_cpu_port_on_delay(false), cpu_port_after_delay(0x07)
     {
         memset(basic_rom, 0, sizeof(basic_rom));
         memset(kernal_rom, 0, sizeof(kernal_rom));
         memset(char_rom, 0, sizeof(char_rom));
+    }
+
+    void mark_visible_rom_hit_for_test(uint16_t pc)
+    {
+        test_mark_visible_rom_breakpoint_hit(pc);
     }
 
 protected:
@@ -724,6 +745,16 @@ protected:
     virtual bool visible_rom_fetch_lags(void) const
     {
         return fetch_lags;
+    }
+    virtual void settle_visible_rom_for_live_fetch(bool sustained)
+    {
+        settle_calls++;
+        last_settle_sustained = sustained;
+        if (sustained) {
+            saw_sustained_settle = true;
+            settle_spin_lo = ram[FAKE_SPIN_LO];
+            settle_spin_hi = ram[FAKE_SPIN_HI];
+        }
     }
     virtual uint8_t peek_cpu(uint16_t a, uint8_t patch_cpu_port)
     {
@@ -778,6 +809,11 @@ protected:
             return;
         }
         if (b == 0x00) {
+            if (brk_patch_writes < MAX_RECORDED_BRK_PATCHES) {
+                brk_patch_addrs[brk_patch_writes] = a;
+            }
+            brk_patch_writes++;
+            last_brk_patch_addr = a;
             ram_patch_writes++;
             last_ram_patch_addr = a;
         }
@@ -1091,6 +1127,8 @@ static bool mini_run(uint8_t *mem, Mini6510 &cpu, uint16_t stop_pc, int max_step
                 mini_set_zn(cpu, mem[addr]);
                 break;
             }
+            case 0xEA:
+                break;
             default:
                 return false;
         }
@@ -2450,6 +2488,41 @@ static int test_external_reset_during_debug_wait_exits_without_reopen()
     return 0;
 }
 
+static int test_external_reset_cancel_exits_direct_monitor_without_next_key()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+    backend.write(0x0801, 0xEA);
+
+    const int keys[] = { 'A', 'D' };
+    FakeKeyboard keyboard(keys, 2);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_reset_exits_monitor(true);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM view ok")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug ok")) return 1;
+    if (expect(backend.last_session != NULL,
+               "Debug entry must create a session before external reset cancel")) return 1;
+
+    monitor.request_debug_reset_cancel();
+
+    if (expect(backend.last_session->reset_cancel_calls == 1,
+               "External reset cancel must be forwarded to the active debug session")) return 1;
+    if (expect(monitor.poll(0) == MENU_EXIT,
+               "External reset cancel must exit a direct-render monitor without waiting for another key")) return 1;
+    if (expect(!monitor.consume_reopen_after_reset(),
+               "External reset cancel must not request monitor re-entry")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
 static void seed_kernal_out_reset_decode_bytes(SourceLabelDebugBackend &backend)
 {
     backend.write(0xDFFE, 0x21);
@@ -3665,6 +3738,7 @@ static int test_help_screen_shows_debug_commands()
         "D Step Over  T Step Into  U Step Out",
         "G Continue   K Cont Crsr  RET Follow",
         "R Breakpt    C=+R Brkpts  C=+X Reset",
+        "X Dbg/DbX    DbX is experimental",
         "",
         "M Memory     I ASCII      V Screen",
         "A Assembly   B Binary     O CPU Bank",
@@ -4033,6 +4107,32 @@ static int test_freeze_step_over_refreezes_and_preserves_screen()
     return 0;
 }
 
+static int test_freeze_step_over_refreezes_when_start_predicate_is_stale()
+{
+    FakeFreezeMachine m(false);
+    m.set_run_window_refreeze_enabled(true);
+    fake_seed_nop_run(m, 0x2000);
+
+    uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, bytes, false, &pred);
+
+    DebugContext ctx;
+    DebugSession::Result r = m.over_at(0x2000, pred, &ctx);
+
+    if (expect(r == DebugSession::DBG_OK,
+               "freeze stale-predicate step-over must complete")) return 1;
+    if (expect(m.unfreeze_attempts == 0,
+               "freeze stale-predicate step-over must not unfreeze an already-live C64")) return 1;
+    if (expect(m.refreeze_calls == 1,
+               "freeze stale-predicate step-over must re-take freeze ownership")) return 1;
+    if (expect(m.frozen,
+               "freeze stale-predicate step-over must leave menu_screen readable")) return 1;
+    if (expect(m.screen_render_target_invalidated(),
+               "freeze stale-predicate step-over must request direct-screen redraw")) return 1;
+    return 0;
+}
+
 // Regression for the sporadic freeze-mode runaway-stepping loop seen around the
 // BASIC FAC multiply loop at $B9A6. The freeze-mode run window unfreezes the
 // whole machine, so the live CPU free-runs from its frozen PC before the
@@ -4093,10 +4193,13 @@ static int test_freeze_step_over_with_context_refreezes()
     uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
     DebugPredictResult pred;
     debug_predict(0x2000, bytes, false, &pred);
+    m.arm_capture_context(0x2001, 0xFF, 0, 0, 0, 0x24);
 
     DebugContext ctx;
     DebugSession::Result r = m.over(from, pred, &ctx);
     if (expect(r == DebugSession::DBG_OK, "freeze step-over (with context) must complete")) return 1;
+    if (expect(ctx.valid && ctx.pc == 0x2001,
+               "freeze step-over (with context) must capture the installed BRK")) return 1;
     if (expect(m.frozen, "freeze step-over (with context) must re-freeze")) return 1;
     if (expect(m.screen_sentinel_intact(0x41, 40),
                "freeze step-over (with context) must not touch C64 screen RAM")) return 1;
@@ -4597,6 +4700,7 @@ static int test_freeze_go_breakpoint_refreezes()
     from.valid = true;
     from.pc = 0x2000;
     from.sp = 0xFF;
+    m.arm_capture_context(0x2005, 0xFF, 0, 0, 0, 0x24);
 
     DebugSession::Result r = m.go(from, &bps, 0x2000);
     if (expect(r == DebugSession::DBG_OK, "freeze Go-to-breakpoint must complete")) return 1;
@@ -4820,8 +4924,8 @@ static int test_brk_debug_cassette_layout_is_compact_and_top_aligned()
 {
     if (expect(FAKE_HANDLER_ADDR >= FAKE_DEBUG_AREA_START,
                "BRK debug handler must stay inside the cassette buffer")) return 1;
-    if (expect(FAKE_HANDLER_LEN == 39,
-               "BRK debug handler byte count must stay compact")) return 1;
+    if (expect(FAKE_HANDLER_LEN == 45,
+               "BRK debug handler byte count must include sentinel-tail padding")) return 1;
     if (expect(FAKE_TRAMPOLINE_LEN == 38,
                "BRK debug trampoline byte count must stay compact")) return 1;
     if (expect(FAKE_NMI_TRAMP_LEN == 24,
@@ -4882,6 +4986,14 @@ static int test_brk_handler_bytes_preserve_stack_and_port_capture_semantics()
     if (expect(m.ram[FAKE_STORE_CPU_DDR] == 0x37 &&
                m.ram[FAKE_STORE_CPU_PORT] == 0x35,
                "Optimized handler must capture $00/$01 through zero-page loads")) return 1;
+    if (expect(m.ram[FAKE_HANDLER_ADDR + 0x21] == 0x8D &&
+               m.ram[FAKE_HANDLER_ADDR + 0x22] == (uint8_t)(FAKE_SENTINEL_ADDR & 0xFF) &&
+               m.ram[FAKE_HANDLER_ADDR + 0x23] == (uint8_t)(FAKE_SENTINEL_ADDR >> 8),
+               "Optimized handler must publish the sentinel before the padded tail")) return 1;
+    if (expect(m.ram[FAKE_HANDLER_ADDR + 0x24] == 0xEA &&
+               m.ram[FAKE_HANDLER_ADDR + 0x29] == 0xEA &&
+               m.ram[FAKE_SPIN_JMP] == 0x4C,
+               "Optimized handler padding must keep the self-spin JMP at $0387")) return 1;
     if (expect(m.ram[FAKE_SENTINEL_ADDR] != 0x00 &&
                m.ram[FAKE_SPIN_LO] == (uint8_t)(FAKE_SPIN_JMP & 0xFF) &&
                m.ram[FAKE_SPIN_HI] == (uint8_t)(FAKE_SPIN_JMP >> 8),
@@ -5078,9 +5190,9 @@ static int test_parked_step_resume_restores_captured_cpu_port_registers()
 
     m.ram[0x0000] = 0x00;
     m.ram[0x0001] = 0x07;
-    fake_seed_captured_context(m, 0x2002, 0xF8, 0x11, 0x22, 0x33, 0x24);
     m.ram[FAKE_STORE_CPU_DDR] = 0x37;
     m.ram[FAKE_STORE_CPU_PORT] = 0x35;
+    m.arm_capture_context(0x2002, 0xF8, 0x11, 0x22, 0x33, 0x24);
     debug_predict(0x2001, bytes, false, &pred);
 
     DebugContext next;
@@ -5274,6 +5386,55 @@ static int test_visible_kernal_step_over_jsr_patches_fallthrough_rom()
     // recommit + restore = 4 (launch PC is visible ROM, so its byte recommits too).
     if (expect(m.rom_patch_writes == 4,
                "Visible KERNAL Step Over JSR must patch, recommit launch byte + BRK, and restore ROM")) return 1;
+    return 0;
+}
+
+static int test_visible_rom_sustained_settle_does_not_launch_before_sentinel_clear()
+{
+    FakeVisibleRomMachine m(false);
+    m.allow_visible_rom_patching = true;
+    m.cpu_port = 0x07;
+    m.kernal_rom[0] = 0x20;       // JSR $E100
+    m.kernal_rom[1] = 0x00;
+    m.kernal_rom[2] = 0xE1;
+    m.kernal_rom[0x100] = 0xEA;   // captured visible-ROM target
+    m.kernal_rom[0x101] = 0xEA;   // next Step Into fall-through
+
+    uint8_t first_bytes[3] = { 0x20, 0x00, 0xE1 };
+    DebugPredictResult first_pred;
+    debug_predict(0xE000, first_bytes, false, &first_pred);
+    m.arm_capture_context(0xE100, 0xF6, 0x37, 0x00, 0x00, 0x24);
+
+    DebugContext from;
+    DebugSession::Result r = m.trace_at(0xE000, first_pred, &from);
+    if (expect(r == DebugSession::DBG_OK && from.valid && from.pc == 0xE100,
+               "Setup visible-ROM JSR Step Into must park at the callee")) return 1;
+
+    m.settle_calls = 0;
+    m.last_settle_sustained = false;
+    m.saw_sustained_settle = false;
+    m.settle_spin_lo = 0;
+    m.settle_spin_hi = 0;
+    m.mark_visible_rom_hit_for_test(from.pc);
+
+    uint8_t next_bytes[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult next_pred;
+    debug_predict(0xE100, next_bytes, false, &next_pred);
+    m.arm_capture_context(0xE101, 0xF6, 0x37, 0x00, 0x00, 0x24);
+
+    DebugContext ctx;
+    r = m.trace(from, next_pred, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "Visible-ROM parked Step Into after a breakpoint hit must complete")) return 1;
+    if (expect(ctx.valid && ctx.pc == 0xE101,
+               "Visible-ROM parked Step Into must stop at fall-through")) return 1;
+    if (expect(m.settle_calls > 0,
+               "Visible-ROM breakpoint relaunch must call the settle hook")) return 1;
+    if (expect(m.saw_sustained_settle,
+               "Visible-ROM breakpoint relaunch must use the sustained settle")) return 1;
+    if (expect(m.settle_spin_lo == (uint8_t)(FAKE_SPIN_JMP & 0xFF) &&
+               m.settle_spin_hi == (uint8_t)(FAKE_SPIN_JMP >> 8),
+               "Sustained visible-ROM settle must not arm the restore trampoline early")) return 1;
     return 0;
 }
 
@@ -5628,6 +5789,7 @@ static int test_overlay_step_over_never_freezes()
     // Overlay-mode non-regression: the machine is never frozen, so the engine
     // must neither unfreeze nor re-freeze, and must still complete the step.
     FakeFreezeMachine m(false);
+    m.set_run_window_refreeze_enabled(false);
     fake_seed_nop_run(m, 0x2000);
 
     uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
@@ -5652,6 +5814,7 @@ static int test_overlay_accessible_unfrozen_step_over_does_not_unfreeze()
     // backend reports that an unfreeze operation would be "accessible", the
     // run-window must not invoke it unless machine_is_frozen() was true.
     FakeFreezeMachine m(false);
+    m.set_run_window_refreeze_enabled(false);
     m.accessible_when_unfrozen = true;
     m.break_on_unfrozen_unfreeze_attempt = true;
     fake_seed_nop_run(m, 0x2000);
@@ -5704,6 +5867,7 @@ static int test_overlay_render_target_disables_stale_frozen_unfreeze()
 static int test_overlay_step_into_never_freezes()
 {
     FakeFreezeMachine m(false);
+    m.set_run_window_refreeze_enabled(false);
     fake_seed_nop_run(m, 0x2000);
 
     uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
@@ -5727,6 +5891,7 @@ static int test_overlay_step_into_never_freezes()
 static int test_overlay_step_out_never_freezes()
 {
     FakeFreezeMachine m(false);
+    m.set_run_window_refreeze_enabled(false);
 
     m.ram[0x2001] = 0x20;
     m.ram[0x2002] = 0x00;
@@ -5761,6 +5926,7 @@ static int test_overlay_step_out_never_freezes()
 static int test_overlay_go_breakpoint_never_freezes()
 {
     FakeFreezeMachine m(false);
+    m.set_run_window_refreeze_enabled(false);
     fake_seed_nop_run(m, 0x2000);
 
     MonitorBreakpoints bps;
@@ -5787,6 +5953,7 @@ static int test_overlay_go_breakpoint_never_freezes()
 static int test_overlay_two_consecutive_steps_never_freeze()
 {
     FakeFreezeMachine m(false);
+    m.set_run_window_refreeze_enabled(false);
     fake_seed_nop_run(m, 0x2000);
 
     uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
@@ -5811,6 +5978,7 @@ static int test_overlay_two_consecutive_steps_never_freeze()
 static int test_overlay_cursor_step_from_parked_spin_uses_release_path()
 {
     FakeFreezeMachine m(false);
+    m.set_run_window_refreeze_enabled(false);
     m.nmi_from_spin_times_out = true;
     m.ram[0x2000] = 0xEE; // INC $D020
     m.ram[0x2001] = 0x20;
@@ -5879,6 +6047,7 @@ static int test_freeze_two_consecutive_steps_rebalance()
 static int test_overlay_step_timeout_then_recovers()
 {
     FakeFreezeMachine m(false);
+    m.set_run_window_refreeze_enabled(false);
     fake_seed_nop_run(m, 0x2000);
 
     uint8_t bytes[3] = { 0xEA, 0xEA, 0xEA };
@@ -7065,6 +7234,719 @@ static int test_debug_header_mode_and_address_use_foreground_color()
     return 0;
 }
 
+// ===========================================================================
+// DbX (experimental Debug), the central step chooser, and ROM-image-changed
+// protection. These drive the monitor (not the session directly) so the gate
+// decisions and the X shortcut are exercised end to end.
+// ===========================================================================
+
+static int dbx_alert_shape_ok(const char *s, const char *what)
+{
+    if (expect(s != NULL, what)) return 1;
+    if (expect((int)strlen(s) <= 38, what)) return 1;
+    if (expect(strchr(s, '\n') == NULL && strchr(s, '\r') == NULL, what)) return 1;
+    return 0;
+}
+
+static void dbx_set_predict_bytes(StubDebugSession *s, uint8_t b0, uint8_t b1,
+                                  uint8_t b2)
+{
+    if (!s) return;
+    s->predict_bytes_valid = true;
+    s->predict_bytes[0] = b0;
+    s->predict_bytes[1] = b1;
+    s->predict_bytes[2] = b2;
+}
+
+static int test_dbx_marker_defaults_to_dbg()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+
+    const int keys[] = { 'A', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 4);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    if (expect(monitor.debug_is_experimental() == false,
+               "DbX must default off after entering Debug")) return 1;
+    char header[40];
+    screen.get_slice(1, 3, 38, header);
+    if (expect(strstr(header, "Dbg") != NULL, "Header must show Dbg by default")) return 1;
+    if (expect(strstr(header, "DbX") == NULL, "Header must not show DbX by default")) return 1;
+    if (expect(strstr(header, "Db!") == NULL, "Db! must never appear")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_x_toggles_dbx_inside_debug()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+
+    const int keys[] = { 'A', 'D', 'X', 'X', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 6);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    if (expect(monitor.poll(0) == 0, "X must not exit the monitor")) return 1;
+    if (expect(monitor.debug_is_experimental() == true,
+               "X must enable DbX inside Debug")) return 1;
+    if (expect(strcmp(monitor.debug_status_message(), "DbX: test-only stepping") == 0,
+               "Enabling DbX must show the exact enable alert")) return 1;
+    char header[40];
+    screen.get_slice(1, 3, 38, header);
+    if (expect(strstr(header, "DbX") != NULL, "Header must show DbX when enabled")) return 1;
+    if (expect(strstr(header, "Db!") == NULL, "Db! must never appear")) return 1;
+    if (expect(monitor.poll(0) == 0, "Second X must not exit the monitor")) return 1;
+    if (expect(monitor.debug_is_experimental() == false, "Second X disables DbX")) return 1;
+    if (expect(strcmp(monitor.debug_status_message(), "Dbg: normal Debug") == 0,
+               "Disabling DbX must show the exact disable alert")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_x_outside_debug_is_inert()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+
+    const int keys[] = { 'A', 'X', KEY_BREAK };
+    FakeKeyboard keyboard(keys, 3);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0,
+               "X outside Debug must not exit the monitor")) return 1;
+    if (expect(monitor.debug_is_experimental() == false,
+               "X outside Debug must not toggle DbX")) return 1;
+    if (expect(monitor.poll(0) == 1, "RUN/STOP exits")) return 1;
+    monitor.deinit();
+    return 0;
+}
+
+static int test_x_in_edit_mode_does_not_toggle_dbx()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+
+    backend.write(0x2000, 0xEA);
+    // A: ASM, D: Debug, E: enter edit, X: must be edit input (no toggle).
+    const int keys[] = { 'A', 'D', 'E', 'X', KEY_BREAK, KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 7);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Edit")) return 1;
+    if (expect(monitor.poll(0) == 0, "X in edit must not exit")) return 1;
+    if (expect(monitor.debug_is_experimental() == false,
+               "X in Edit mode must not toggle DbX")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_x_over_debug_help_only_closes_help()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+
+    const int keys[] = { 'A', 'D', KEY_F3, 'X', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 6);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    if (expect(monitor.poll(0) == 0, "Open help")) return 1;
+    if (expect(monitor.poll(0) == 0, "X over help must not exit")) return 1;
+    if (expect(monitor.debug_is_experimental() == false,
+               "X over the Debug help must not toggle DbX")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_ctrl_x_reset_not_shadowed_by_x()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+
+    const int keys[] = { 'A', 'D', KEY_CTRL_X, KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 5);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_reset_exits_monitor(false);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    int resets_before = backend.reset_calls;
+    monitor.poll(0); // C=+X
+    if (expect(backend.reset_calls == resets_before + 1,
+               "C=+X must still reset the machine")) return 1;
+    if (expect(monitor.debug_is_experimental() == false,
+               "C=+X must not toggle DbX")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_d_then_x_enters_debug_and_enables_dbx()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+
+    // From Assembly view: D enters Debug (no execution), X enables DbX.
+    const int keys[] = { 'A', 'D', 'X', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 5);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    int over_before = backend.last_session ? backend.last_session->over_calls : 0;
+    if (expect(monitor.poll(0) == 0, "D enters Debug")) return 1;
+    if (expect(backend.last_session == NULL ||
+               backend.last_session->over_calls == over_before,
+               "D entry must not execute")) return 1;
+    if (expect(monitor.poll(0) == 0, "X enables DbX")) return 1;
+    if (expect(monitor.debug_is_experimental() == true,
+               "D then X must enable DbX")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_dbx_resets_off_on_leave_and_reentry()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+
+    const int keys[] = { 'A', 'D', 'X', KEY_BREAK, 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 7);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enable DbX")) return 1;
+    if (expect(monitor.debug_is_experimental() == true, "DbX enabled")) return 1;
+    if (expect(monitor.poll(0) == 0, "RUN/STOP leaves Debug")) return 1;
+    if (expect(monitor.poll(0) == 0, "Re-enter Debug")) return 1;
+    if (expect(monitor.debug_is_experimental() == false,
+               "DbX must default off after leave and re-entry")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_normal_dbg_visible_rom_freeze_step_over_stops()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+
+    const int keys[] = { 'J', 'A', 'D', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 6);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("E000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_debug_run_window_refreeze_enabled(true); // UI Freeze mode
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Jump to E000")) return 1;
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    dbx_set_predict_bytes(backend.last_session, 0xEA, 0xEA, 0xEA);
+    if (expect(monitor.poll(0) == 0, "Step Over must stay in monitor")) return 1;
+    int over = backend.last_session->over_at_calls +
+               backend.last_session->over_at_breakpoint_calls +
+               backend.last_session->over_calls;
+    if (expect(over == 0,
+               "Normal Dbg visible-ROM Freeze Step Over must not run the direct step")) return 1;
+    if (expect(strcmp(monitor.debug_status_message(), "Use DbX for this Step") == 0,
+               "Stop alert must point the user at DbX")) return 1;
+    if (dbx_alert_shape_ok(monitor.debug_status_message(), "stop alert shape")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_dbx_visible_rom_freeze_step_over_runs_and_marks_dbx()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+
+    const int keys[] = { 'J', 'A', 'D', 'X', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 7);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("E000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_debug_run_window_refreeze_enabled(true);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Jump to E000")) return 1;
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    dbx_set_predict_bytes(backend.last_session, 0xEA, 0xEA, 0xEA);
+    if (expect(monitor.poll(0) == 0, "Enable DbX")) return 1;
+    if (expect(monitor.poll(0) == 0, "DbX Step Over runs")) return 1;
+    if (expect(backend.last_session->over_at_breakpoint_calls == 1,
+               "DbX must run the direct visible-ROM Freeze Step Over")) return 1;
+    if (expect(monitor.debug_is_experimental() == true, "Marker must stay DbX")) return 1;
+    char header[40];
+    screen.get_slice(1, 3, 38, header);
+    if (expect(strstr(header, "DbX") != NULL, "Header must show DbX during the test step")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_normal_dbg_ram_under_rom_single_step_stops()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+
+    backend.canned_snapshot_set = true;
+    debug_context_reset(&backend.canned_snapshot);
+    backend.canned_snapshot.valid = true;
+    backend.canned_snapshot.pc = 0xE000;
+    backend.canned_snapshot.sp = 0xF8;
+    backend.canned_snapshot.sr = 0x24;
+    backend.canned_snapshot.live_cpu_port_valid = true;
+    backend.canned_snapshot.live_cpu_port = 0x05; // KERNAL banked out: RAM under ROM
+
+    const int keys[] = { 'A', 'D', 'T', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 5);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    dbx_set_predict_bytes(backend.last_session, 0xEA, 0xEA, 0xEA);
+    if (expect(monitor.poll(0) == 0, "Trace must stay in monitor")) return 1;
+    int traces = backend.last_session->trace_calls + backend.last_session->trace_at_calls;
+    if (expect(traces == 0,
+               "Normal Dbg RAM-under-ROM single-step must not run the direct step")) return 1;
+    if (expect(strcmp(monitor.debug_status_message(),
+                      "RAM under ROM: use breakpoint+Go") == 0,
+               "Stop alert must point at breakpoint+Go")) return 1;
+    if (dbx_alert_shape_ok(monitor.debug_status_message(), "RAM-under-ROM alert shape")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_dbx_ram_under_rom_single_step_runs()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+
+    backend.canned_snapshot_set = true;
+    debug_context_reset(&backend.canned_snapshot);
+    backend.canned_snapshot.valid = true;
+    backend.canned_snapshot.pc = 0xE000;
+    backend.canned_snapshot.sp = 0xF8;
+    backend.canned_snapshot.sr = 0x24;
+    backend.canned_snapshot.live_cpu_port_valid = true;
+    backend.canned_snapshot.live_cpu_port = 0x05;
+
+    const int keys[] = { 'A', 'D', 'X', 'T', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 6);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    dbx_set_predict_bytes(backend.last_session, 0xEA, 0xEA, 0xEA);
+    if (expect(monitor.poll(0) == 0, "Enable DbX")) return 1;
+    if (expect(monitor.poll(0) == 0, "DbX Trace runs")) return 1;
+    int traces = backend.last_session->trace_calls + backend.last_session->trace_at_calls;
+    if (expect(traces == 1, "DbX must run the direct RAM-under-ROM single-step")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_normal_dbg_step_over_into_kernal_uses_breakpoint_go()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+
+    const int keys[] = { 'J', 'A', 'D', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 6);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("2000", 1); // RAM caller
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Jump to 2000")) return 1;
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    dbx_set_predict_bytes(backend.last_session, 0x20, 0x00, 0xE0); // JSR $E000 (KERNAL)
+    if (expect(monitor.poll(0) == 0, "Step Over runs")) return 1;
+    if (expect(backend.last_session->over_at_breakpoint_calls == 1,
+               "Step Over from RAM into KERNAL must complete via breakpoint+Go")) return 1;
+    if (expect(monitor.debug_is_experimental() == false,
+               "breakpoint+Go must stay in normal Dbg, not DbX")) return 1;
+    if (expect(strcmp(monitor.debug_status_message(),
+                      "Dbg: Over uses breakpoint+Go") == 0,
+               "breakpoint+Go note must be shown")) return 1;
+    if (dbx_alert_shape_ok(monitor.debug_status_message(), "breakpoint+Go note shape")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_normal_dbg_ram_step_over_is_direct()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+
+    const int keys[] = { 'J', 'A', 'D', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 6);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("2000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Jump to 2000")) return 1;
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    dbx_set_predict_bytes(backend.last_session, 0xEA, 0xEA, 0xEA);
+    if (expect(monitor.poll(0) == 0, "Step Over runs")) return 1;
+    if (expect(backend.last_session->over_at_breakpoint_calls == 1,
+               "RAM Step Over must run directly")) return 1;
+    if (expect(strcmp(monitor.debug_status_message(), "") == 0,
+               "Plain RAM Step Over needs no alert")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_dbx_visible_rom_failure_marks_rom_image_changed()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+
+    const int keys[] = { 'J', 'A', 'D', 'X', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 7);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("E000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_debug_run_window_refreeze_enabled(true);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Jump to E000")) return 1;
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    dbx_set_predict_bytes(backend.last_session, 0xEA, 0xEA, 0xEA);
+    backend.last_session->over_result = DebugSession::DBG_TIMEOUT;
+    if (expect(monitor.poll(0) == 0, "Enable DbX")) return 1;
+    if (expect(monitor.poll(0) == 0, "DbX Step Over (will fail)")) return 1;
+    if (expect(monitor_rom_image_changed() == true,
+               "A failed DbX visible-ROM step must latch ROM image changed")) return 1;
+    if (expect(strcmp(monitor.debug_status_message(),
+                      "ROM image changed: reload ROM") == 0,
+               "ROM image changed alert must be shown")) return 1;
+    if (dbx_alert_shape_ok(monitor.debug_status_message(), "ROM-changed alert shape")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    monitor_clear_rom_image_changed();
+    return 0;
+}
+
+static int test_rom_image_changed_blocks_then_reload_reenables()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+
+    // Visible KERNAL in Overlay/Telnet (not Freeze): direct step is reliable,
+    // so the only reason to stop is the ROM-image-changed latch.
+    const int keys[] = { 'J', 'A', 'D', 'D', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 7);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("E000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_debug_run_window_refreeze_enabled(false);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Jump to E000")) return 1;
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    dbx_set_predict_bytes(backend.last_session, 0xEA, 0xEA, 0xEA);
+
+    monitor_set_rom_image_changed();
+    if (expect(monitor.poll(0) == 0, "Step Over while ROM changed stays in monitor")) return 1;
+    if (expect(backend.last_session->over_at_breakpoint_calls == 0,
+               "Normal Dbg visible-ROM Debug must stop while ROM image is changed")) return 1;
+    if (expect(strcmp(monitor.debug_status_message(),
+                      "ROM image changed: reload ROM") == 0,
+               "Blocked step must show the ROM-changed alert")) return 1;
+
+    monitor_clear_rom_image_changed(); // model a ROM reload / clean check
+    if (expect(monitor.poll(0) == 0, "Step Over after reload stays in monitor")) return 1;
+    if (expect(backend.last_session->over_at_breakpoint_calls == 1,
+               "Reloading ROM must re-enable visible-ROM Debug")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_breakpoint_go_fallback_does_not_mark_rom_changed()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+
+    const int keys[] = { 'J', 'A', 'D', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 6);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("2000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Jump to 2000")) return 1;
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    dbx_set_predict_bytes(backend.last_session, 0x20, 0x00, 0xE0); // JSR $E000
+    if (expect(monitor.poll(0) == 0, "Step Over via breakpoint+Go")) return 1;
+    if (expect(monitor_rom_image_changed() == false,
+               "A clean breakpoint+Go fallback must not mark the ROM image changed")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_ctrl_x_reset_does_not_clear_rom_image_changed()
+{
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    monitor_clear_rom_image_changed();
+    monitor_set_rom_image_changed();
+
+    const int keys[] = { 'A', 'D', KEY_CTRL_X, KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 5);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_reset_exits_monitor(false);
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    monitor.poll(0); // C=+X reset
+    if (expect(monitor_rom_image_changed() == true,
+               "C=+X reset must not clear the ROM image changed state")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    // Close/re-open also must not clear it.
+    if (expect(monitor_rom_image_changed() == true,
+               "Monitor close must not clear the ROM image changed state")) return 1;
+    monitor_clear_rom_image_changed();
+    return 0;
+}
+
+static int test_debug_classify_step_alerts_are_plain_and_fit()
+{
+    struct Cell {
+        DebugStepOp op;
+        DebugStepSource src;
+        bool freeze;
+        bool dbx;
+        bool changed;
+        bool flaky;
+    };
+    static const Cell cells[] = {
+        { DEBUG_OP_OVER,  DEBUG_SRC_RAM,            false, false, false, false },
+        { DEBUG_OP_OVER,  DEBUG_SRC_RAM,            false, false, false, true  },
+        { DEBUG_OP_OVER,  DEBUG_SRC_VISIBLE_ROM,    false, false, false, false },
+        { DEBUG_OP_OVER,  DEBUG_SRC_VISIBLE_ROM,    true,  false, false, false },
+        { DEBUG_OP_OVER,  DEBUG_SRC_VISIBLE_ROM,    true,  true,  false, false },
+        { DEBUG_OP_TRACE, DEBUG_SRC_RAM_UNDER_ROM,  false, false, false, false },
+        { DEBUG_OP_TRACE, DEBUG_SRC_RAM_UNDER_ROM,  false, true,  false, false },
+        { DEBUG_OP_OVER,  DEBUG_SRC_VISIBLE_ROM,    false, false, true,  false },
+        { DEBUG_OP_GO,    DEBUG_SRC_RAM_UNDER_ROM,  true,  false, false, false },
+        { DEBUG_OP_OUT,   DEBUG_SRC_VISIBLE_ROM,    true,  false, false, false },
+    };
+    static const char *const banned[] = {
+        "production", "capability", "unsupported", "qualified", "Db!", "enterprise",
+        "certified", "uncharacterized"
+    };
+    int n = (int)(sizeof(cells) / sizeof(cells[0]));
+    for (int i = 0; i < n; i++) {
+        DebugStepDecision d = debug_classify_step(cells[i].op, cells[i].src,
+                                                  cells[i].freeze, cells[i].dbx,
+                                                  cells[i].changed, cells[i].flaky);
+        if (d.alert) {
+            if (dbx_alert_shape_ok(d.alert, "classifier alert shape")) return 1;
+            for (int b = 0; b < (int)(sizeof(banned) / sizeof(banned[0])); b++) {
+                if (expect(strstr(d.alert, banned[b]) == NULL,
+                           "Classifier alert must use plain monitor wording")) return 1;
+            }
+        }
+        if (expect(d.reason != NULL && strlen(d.reason) > 0,
+                   "Every decision must carry a reason code")) return 1;
+    }
+    // Exact alert strings and plans for the load-bearing cells.
+    DebugStepDecision rom_freeze = debug_classify_step(DEBUG_OP_OVER,
+        DEBUG_SRC_VISIBLE_ROM, true, false, false, false);
+    if (expect(rom_freeze.plan == DEBUG_PLAN_STOP &&
+               strcmp(rom_freeze.alert, "Use DbX for this Step") == 0,
+               "Visible-ROM Freeze Step Over stops in Dbg")) return 1;
+    DebugStepDecision rom_freeze_dbx = debug_classify_step(DEBUG_OP_OVER,
+        DEBUG_SRC_VISIBLE_ROM, true, true, false, false);
+    if (expect(rom_freeze_dbx.plan == DEBUG_PLAN_DBX_TEST,
+               "Visible-ROM Freeze Step Over runs in DbX")) return 1;
+    DebugStepDecision rur = debug_classify_step(DEBUG_OP_TRACE,
+        DEBUG_SRC_RAM_UNDER_ROM, false, false, false, false);
+    if (expect(rur.plan == DEBUG_PLAN_STOP &&
+               strcmp(rur.alert, "RAM under ROM: use breakpoint+Go") == 0,
+               "RAM-under-ROM single-step stops in Dbg")) return 1;
+    DebugStepDecision changed = debug_classify_step(DEBUG_OP_OVER,
+        DEBUG_SRC_VISIBLE_ROM, false, false, true, false);
+    if (expect(changed.plan == DEBUG_PLAN_STOP &&
+               strcmp(changed.alert, "ROM image changed: reload ROM") == 0,
+               "Changed ROM image stops visible-ROM Debug")) return 1;
+    DebugStepDecision bpgo = debug_classify_step(DEBUG_OP_OVER,
+        DEBUG_SRC_RAM, false, false, false, true);
+    if (expect(bpgo.plan == DEBUG_PLAN_BREAKPOINT_GO &&
+               strcmp(bpgo.alert, "Dbg: Over uses breakpoint+Go") == 0,
+               "Step Over of a flaky callee uses breakpoint+Go")) return 1;
+    DebugStepDecision go_rur = debug_classify_step(DEBUG_OP_GO,
+        DEBUG_SRC_RAM_UNDER_ROM, true, false, false, false);
+    if (expect(go_rur.plan == DEBUG_PLAN_DIRECT,
+               "Go stays available as the reliable breakpoint+Go primitive")) return 1;
+    return 0;
+}
+
+static int test_debug_help_contains_dbx_hint_and_no_db_bang()
+{
+    const char *lines[24];
+    int n = MonitorDebug::format_help_lines(lines, 24);
+    bool found = false;
+    for (int i = 0; i < n; i++) {
+        if (expect((int)strlen(lines[i]) <= 38, "Help line must fit 38 columns")) return 1;
+        if (expect(strstr(lines[i], "Db!") == NULL, "Help must not use Db!")) return 1;
+        if (strstr(lines[i], "X Dbg/DbX") != NULL) {
+            found = true;
+        }
+    }
+    if (expect(found, "Debug help must contain the compact X Dbg/DbX hint")) return 1;
+    return 0;
+}
+
 } // namespace
 
 #define RUN(name) do { fprintf(stderr, "RUN " #name "\n"); if (name()) { fprintf(stderr, "FAIL " #name "\n"); return 1; } } while(0)
@@ -7101,6 +7983,7 @@ int main()
     RUN(test_ctrl_x_resets_and_keeps_debug_open);
     RUN(test_ctrl_x_local_reset_exits_monitor);
     RUN(test_external_reset_during_debug_wait_exits_without_reopen);
+    RUN(test_external_reset_cancel_exits_direct_monitor_without_next_key);
     RUN(test_ctrl_x_reset_reentry_anchors_asm_at_source_boundary);
     RUN(test_ctrl_x_reenters_monitor_without_debug_when_not_debugging);
     RUN(test_breakpoints_survive_ctrl_x_reset_reentry);
@@ -7135,6 +8018,7 @@ int main()
     RUN(test_jump_rejects_non_hex_input_and_uppercases);
     RUN(test_edit_and_debug_compose_in_header);
     RUN(test_freeze_step_over_refreezes_and_preserves_screen);
+    RUN(test_freeze_step_over_refreezes_when_start_predicate_is_stale);
     RUN(test_freeze_nmi_step_ignores_stale_sentinel);
     RUN(test_freeze_step_over_with_context_refreezes);
     RUN(test_cleanup_to_context_without_entry_context_never_resets);
@@ -7167,6 +8051,7 @@ int main()
     RUN(test_cursor_visible_rom_step_sets_monitor_cpu_port_before_jump);
     RUN(test_visible_kernal_step_into_uses_rom_patch_support);
     RUN(test_visible_kernal_step_over_jsr_patches_fallthrough_rom);
+    RUN(test_visible_rom_sustained_settle_does_not_launch_before_sentinel_clear);
     RUN(test_visible_kernal_step_without_rom_patch_support_refuses_cleanly);
     RUN(test_visible_rom_breakpoint_go_uses_same_capability_gate);
     RUN(test_visible_rom_breakpoint_go_patches_rom_not_underlying_ram);
@@ -7213,6 +8098,28 @@ int main()
     RUN(test_debug_next_opcode_bracket_markers);
     RUN(test_debug_footer_value_highlight_policy);
     RUN(test_debug_header_mode_and_address_use_foreground_color);
+
+    // DbX (experimental Debug), step chooser, ROM-image-changed protection.
+    RUN(test_dbx_marker_defaults_to_dbg);
+    RUN(test_x_toggles_dbx_inside_debug);
+    RUN(test_x_outside_debug_is_inert);
+    RUN(test_x_in_edit_mode_does_not_toggle_dbx);
+    RUN(test_x_over_debug_help_only_closes_help);
+    RUN(test_ctrl_x_reset_not_shadowed_by_x);
+    RUN(test_d_then_x_enters_debug_and_enables_dbx);
+    RUN(test_dbx_resets_off_on_leave_and_reentry);
+    RUN(test_normal_dbg_visible_rom_freeze_step_over_stops);
+    RUN(test_dbx_visible_rom_freeze_step_over_runs_and_marks_dbx);
+    RUN(test_normal_dbg_ram_under_rom_single_step_stops);
+    RUN(test_dbx_ram_under_rom_single_step_runs);
+    RUN(test_normal_dbg_step_over_into_kernal_uses_breakpoint_go);
+    RUN(test_normal_dbg_ram_step_over_is_direct);
+    RUN(test_dbx_visible_rom_failure_marks_rom_image_changed);
+    RUN(test_rom_image_changed_blocks_then_reload_reenables);
+    RUN(test_breakpoint_go_fallback_does_not_mark_rom_changed);
+    RUN(test_ctrl_x_reset_does_not_clear_rom_image_changed);
+    RUN(test_debug_classify_step_alerts_are_plain_and_fit);
+    RUN(test_debug_help_contains_dbx_hint_and_no_db_bang);
 
     puts("machine_monitor_debug_test: OK");
     return 0;

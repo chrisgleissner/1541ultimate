@@ -15,14 +15,14 @@ namespace {
 // literal-referenced register stores ($03F0-$03FB) stay put; the code stubs are
 // packed contiguously up to them, with the constant-referenced hard-vector
 // scratch bytes placed just below the store block. Layout:
-//   $0363-$0389  HANDLER       (39 bytes; ends with the spin JMP at $0387)
+//   $035D-$0389  HANDLER       (45 bytes; ends with the spin JMP at $0387)
 //   $038A-$03AF  TRAMPOLINE    (38 bytes)
 //   $03B0-$03C7  NMI_TRAMPOLINE(24 bytes reserved)
 //   $03C8-$03EC  HARD_BRK_STUB (37 bytes; 35 bytes code + 2 bytes padding)
 //   $03ED        STORE_HARD_CPU_PORT
 //   $03EE-$03EF  HARD_BRK_ORIG_VECTOR (lo/hi)
 //   $03F0-$03FB  STORE_Y .. STORE_HARD_CPU_DDR
-static const uint16_t HANDLER_ADDR    = 0x0363;
+static const uint16_t HANDLER_ADDR    = 0x035D;
 static const uint16_t STORE_Y         = 0x03F0;
 static const uint16_t STORE_X         = 0x03F1;
 static const uint16_t STORE_A         = 0x03F2;
@@ -86,6 +86,12 @@ static const uint8_t HANDLER_BYTES[] = {
           (uint8_t)(SPIN_OPERAND_LO >> 8),
     0x8D, (uint8_t)(SENTINEL_ADDR & 0xFF),
           (uint8_t)(SENTINEL_ADDR >> 8),
+    0xEA,
+    0xEA,
+    0xEA,
+    0xEA,
+    0xEA,
+    0xEA,
     0x4C, (uint8_t)(SPIN_JMP & 0xFF), (uint8_t)(SPIN_JMP >> 8)
 };
 
@@ -326,8 +332,11 @@ void BrkDebugSession :: begin_run_window(void)
     // share the single unfreeze/refreeze pair.
     if (run_window_depth++ == 0) {
         screen_was_clobbered = false;
-        run_window_unfroze = run_window_refreeze_enabled && machine_is_frozen();
-        if (run_window_unfroze) {
+        // The policy bit means this monitor is rendering through the freeze
+        // screen. Even if isFrozen was stale/false at launch, end the window by
+        // re-taking freeze ownership so menu_screen/input remain attached.
+        run_window_unfroze = run_window_refreeze_enabled;
+        if (run_window_refreeze_enabled && machine_is_frozen()) {
             unfreeze_if_accessible();
         }
     }
@@ -1129,8 +1138,6 @@ void BrkDebugSession :: release_to_run(const DebugContext *from,
         poke_visible(STORE_PCLO, (uint8_t)(from->pc & 0xFF));
         poke_visible(STORE_PCHI, (uint8_t)(from->pc >> 8));
         poke_visible(STORE_SP, from->sp);
-        poke_visible(SPIN_OPERAND_LO, (uint8_t)(TRAMPOLINE_ADDR & 0xFF));
-        poke_visible(SPIN_OPERAND_HI, (uint8_t)(TRAMPOLINE_ADDR >> 8));
     }
     // Final ROM-image commits before the parked CPU is released back into the
     // restore stub. Besides installed BRKs, re-commit the launch opcode itself
@@ -1164,6 +1171,10 @@ void BrkDebugSession :: release_to_run(const DebugContext *from,
     // recommit writes above already place the BRK in the stopped ROM image.
     if (visible_rom_recommitted && sustained_settle) {
         settle_visible_rom_for_live_fetch(sustained_settle);
+    }
+    if (from && from->valid) {
+        poke_visible(SPIN_OPERAND_LO, (uint8_t)(TRAMPOLINE_ADDR & 0xFF));
+        poke_visible(SPIN_OPERAND_HI, (uint8_t)(TRAMPOLINE_ADDR >> 8));
     }
     poke_visible(SENTINEL_ADDR, 0x00);
     poke_visible(STORE_TRAP_MODE, 0x00);
@@ -1468,6 +1479,16 @@ DebugSession::Result BrkDebugSession :: perform_run(const DebugContext *from,
     cpu_parked_in_spin = true;
     has_last_context = true;
     last_context = *out;
+    // A visible-ROM BRK capture can leave the live fetch path holding that BRK
+    // for the captured PC. The next launch from that exact PC needs the one-shot
+    // sustained ROM-fetch settle, regardless of whether the capture came from
+    // Go/breakpoint handling or a step operation.
+    if (out && out->valid &&
+            monitor_backing_store_is_visible_rom(
+                monitor_backing_store_for_cpu_port(out->pc, cpu_port))) {
+        rom_bp_hit_pc_valid = true;
+        rom_bp_hit_pc = out->pc;
+    }
     end_run_window();
     return DBG_OK;
 }

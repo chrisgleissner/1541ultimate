@@ -33,6 +33,10 @@ void debug_context_reset(DebugContext *ctx);
 class MonitorDebug
 {
     bool active;
+    // DbX (experimental Debug). Off after power-on and reset to off on every
+    // fresh Debug entry/leave, so the experimental marker is never sticky and
+    // never survives a cold start. Toggled with the X key while Debug is active.
+    bool experimental;
     DebugContext ctx;
 public:
     enum {
@@ -52,6 +56,10 @@ public:
     bool is_active(void) const { return active; }
     void enter(void);
     void leave(void);
+
+    // DbX = experimental Debug. Dbg is normal Debug.
+    bool is_experimental(void) const { return experimental; }
+    void set_experimental(bool value) { experimental = value; }
 
     void invalidate_context(void);
     void set_context(const DebugContext &c);

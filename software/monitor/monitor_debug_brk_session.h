@@ -109,6 +109,15 @@ public:
     virtual void refresh_debug_ownership(void);
     virtual void release_debug_ownership(void);
 
+#if defined(RUNS_ON_PC)
+protected:
+    void test_mark_visible_rom_breakpoint_hit(uint16_t pc)
+    {
+        rom_bp_hit_pc_valid = true;
+        rom_bp_hit_pc = pc;
+    }
+#endif
+
 private:
     enum PatchInstallResult {
         PATCH_INSTALL_OK = 0,

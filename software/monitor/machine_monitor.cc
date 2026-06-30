@@ -1975,6 +1975,8 @@ MachineMonitor :: MachineMonitor(UserInterface *ui, MemoryBackend *mem_backend) 
     breakpoints = monitor_saved_breakpoints;
     breakpoint_popup_active = false;
     breakpoint_selected = 0;
+    debug_status_text[0] = 0;
+    debug_status_visible = false;
     bookmark_popup_active = false;
     bookmark_selected = 0;
     bookmark_status_text[0] = 0;
@@ -2033,6 +2035,7 @@ void MachineMonitor :: request_debug_reset_cancel(void)
     reopen_on_debug_reset = false;
     monitor_reset_reopen_state_valid = false;
     monitor_reset_reopen_debug_active = false;
+    reset_exit_pending = reset_exits_monitor;
     if (debug_session) {
         debug_session->request_reset_cancel();
     }
@@ -4310,7 +4313,7 @@ void MachineMonitor :: draw_header()
             memcpy(fixed + poll_slot, poll_label, poll_label_len);
         }
         if (show_dbg && dbg_slot + 3 <= width) {
-            memcpy(fixed + dbg_slot, "Dbg", 3);
+            memcpy(fixed + dbg_slot, debug.is_experimental() ? "DbX" : "Dbg", 3);
         }
         memcpy(line, fixed, width + 1);
     }
@@ -4332,7 +4335,7 @@ void MachineMonitor :: draw_header()
             if (dbg_slot < 0) dbg_slot = 0;
             window->move_cursor(dbg_slot, 0);
             window->set_color(MONITOR_UI_ACCENT_COLOR);
-            window->output_length("Dbg", 3);
+            window->output_length(debug.is_experimental() ? "DbX" : "Dbg", 3);
             window->set_color(get_ui()->color_fg);
         }
         if (edit_mode) {
@@ -4371,6 +4374,17 @@ void MachineMonitor :: draw_status()
             monitor_debug_help_paging_line : monitor_help_paging_line;
         draw_padded(window, window->get_size_y() - 1, paging_line,
                     (int)strlen(paging_line));
+        return;
+    }
+
+    // A transient one-line Debug status/alert (DbX toggle, breakpoint+Go note,
+    // refusal) takes the bottom row while it is showing, ahead of the banking
+    // detail. It is single-line and within the 38-column alert budget.
+    if (debug.is_active() && debug_status_visible) {
+        window->set_color(MONITOR_UI_ACCENT_COLOR);
+        draw_padded(window, window->get_size_y() - 1, debug_status_text,
+                    (int)strlen(debug_status_text));
+        window->set_color(get_ui()->color_fg);
         return;
     }
 
@@ -6079,6 +6093,7 @@ void MachineMonitor :: debug_leave()
     }
     monitor_log("debug leave");
     clear_pending_go();
+    debug_clear_status();
     debug.leave();
     if (restore_debug_after_reset) {
         debug.invalidate_context();
@@ -6235,7 +6250,8 @@ void MachineMonitor :: dispatch_deferred_debug_go(void)
     }
     deferred_debug_go_pending = false;
     if (debug_session) {
-        debug_session->cleanup_to_context(&deferred_debug_go_context);
+        debug_session->cleanup_to_context(
+            deferred_debug_go_context.valid ? &deferred_debug_go_context : 0);
         delete debug_session;
         debug_session = NULL;
     }
@@ -6438,8 +6454,230 @@ const char *monitor_debug_result_message(int result)
 }
 }
 
+// ---------------------------------------------------------------------------
+// ROM image changed latch (process lifetime).
+//
+// Set when a DbX visible-ROM step fails in a way that may have left a stale BRK
+// in the volatile U64 ROM image. While set, normal Dbg refuses visible-ROM
+// Debug and asks the user to reload ROM. It survives a C=+X reset and a monitor
+// close/re-entry (neither path clears it). A ROM reload (firmware redeploy or
+// device reboot) re-initialises this static to false; the firmware never writes
+// a ROM-changed state to flash. monitor_clear_rom_image_changed() models a
+// verified clean ROM-image check.
+// ---------------------------------------------------------------------------
+static bool monitor_rom_image_changed_flag = false;
+
+bool monitor_rom_image_changed(void) { return monitor_rom_image_changed_flag; }
+void monitor_set_rom_image_changed(void) { monitor_rom_image_changed_flag = true; }
+void monitor_clear_rom_image_changed(void) { monitor_rom_image_changed_flag = false; }
+
+DebugStepDecision debug_classify_step(DebugStepOp op, DebugStepSource src,
+                                      bool ui_freeze, bool dbx,
+                                      bool rom_image_changed_now,
+                                      bool over_target_flaky)
+{
+    DebugStepDecision d;
+    d.plan = DEBUG_PLAN_DIRECT;
+    d.alert = 0;
+    d.reason = "direct_step";
+
+    // Step Over and Trace single-step the live CPU at the step site. Step Out,
+    // Go, and Go-to-cursor are breakpoint+Go primitives and stay available.
+    bool single_step_op = (op == DEBUG_OP_OVER || op == DEBUG_OP_TRACE);
+
+    // A changed ROM image blocks visible-ROM single stepping until ROM reload,
+    // in normal Dbg and in DbX alike: the ROM image can no longer be trusted.
+    if (rom_image_changed_now && src == DEBUG_SRC_VISIBLE_ROM && single_step_op) {
+        d.plan = DEBUG_PLAN_STOP;
+        d.alert = "ROM image changed: reload ROM";
+        d.reason = "rom_image_changed";
+        return d;
+    }
+
+    // RAM under ROM: direct single-step is flaky on the U64 fetch aperture.
+    // Normal Dbg stops and points at breakpoint+Go; DbX may run the test step.
+    if (single_step_op && src == DEBUG_SRC_RAM_UNDER_ROM) {
+        if (dbx) {
+            d.plan = DEBUG_PLAN_DBX_TEST;
+            d.alert = "DbX: test-only stepping";
+        } else {
+            d.plan = DEBUG_PLAN_STOP;
+            d.alert = "RAM under ROM: use breakpoint+Go";
+        }
+        d.reason = "ram_under_rom_direct_step";
+        return d;
+    }
+
+    // Visible ROM in UI Freeze mode: the freezer aperture can serve a stale
+    // fetch so the step BRK is not reliably caught. Normal Dbg stops; DbX runs.
+    if (single_step_op && src == DEBUG_SRC_VISIBLE_ROM && ui_freeze) {
+        if (dbx) {
+            d.plan = DEBUG_PLAN_DBX_TEST;
+            d.alert = "DbX: test-only stepping";
+        } else {
+            d.plan = DEBUG_PLAN_STOP;
+            d.alert = "Use DbX for this Step";
+        }
+        d.reason = "rom_freeze_direct_step_over";
+        return d;
+    }
+
+    // Reliable path. A Step Over of a JSR into a flaky callee is completed by a
+    // temporary breakpoint at the (reliable) caller return site plus Go; note
+    // that informationally without making the operation experimental.
+    if (op == DEBUG_OP_OVER && over_target_flaky) {
+        d.plan = DEBUG_PLAN_BREAKPOINT_GO;
+        d.alert = "Dbg: Over uses breakpoint+Go";
+        d.reason = "step_over_breakpoint_go";
+        return d;
+    }
+
+    return d;
+}
+
+uint8_t MachineMonitor :: debug_exec_cpu_port(const DebugContext *from) const
+{
+    // Mirror draw_status()'s RAM-under-ROM banking choice so the step chooser
+    // gates exactly when the footer shows the matching banking: prefer the live
+    // captured CPU port, and fall back to the monitor view bank (not a raw $01
+    // read) when there is no valid context yet.
+    if (from && from->valid && from->live_cpu_port_valid) {
+        return (uint8_t)(from->live_cpu_port & 0x07);
+    }
+    return (uint8_t)(state.view_cpu_port & 0x07);
+}
+
+DebugStepSource MachineMonitor :: debug_step_source(uint16_t pc, uint8_t cpu_port) const
+{
+    if (!backend) {
+        return DEBUG_SRC_RAM;
+    }
+    if (monitor_step_bank_is_ram_under_rom(backend, pc, cpu_port)) {
+        return DEBUG_SRC_RAM_UNDER_ROM;
+    }
+    MonitorBackingStore bs = backend->backing_store_for_cpu_port(pc, cpu_port & 0x07);
+    if (monitor_backing_store_is_visible_rom(bs)) {
+        return DEBUG_SRC_VISIBLE_ROM;
+    }
+    if (bs == MONITOR_BACKING_IO) {
+        return DEBUG_SRC_IO;
+    }
+    return DEBUG_SRC_RAM;
+}
+
+bool MachineMonitor :: debug_over_target_flaky(const DebugPredictResult &pred,
+                                               uint8_t cpu_port) const
+{
+    if (!backend) {
+        return false;
+    }
+    // Only a call into a flaky callee benefits from the breakpoint+Go note: the
+    // return BRK itself is placed in the (reliable) caller source.
+    if (pred.kind != DBG_PREDICT_JSR || !pred.has_target) {
+        return false;
+    }
+    if (monitor_step_bank_is_ram_under_rom(backend, pred.branch_target, cpu_port)) {
+        return true;
+    }
+    MonitorBackingStore bs =
+        backend->backing_store_for_cpu_port(pred.branch_target, cpu_port & 0x07);
+    return monitor_backing_store_is_visible_rom(bs);
+}
+
+void MachineMonitor :: debug_show_status(const char *message)
+{
+    if (!message) {
+        debug_clear_status();
+        return;
+    }
+    strncpy(debug_status_text, message, sizeof(debug_status_text) - 1);
+    debug_status_text[sizeof(debug_status_text) - 1] = 0;
+    debug_status_visible = true;
+}
+
+void MachineMonitor :: debug_clear_status(void)
+{
+    debug_status_visible = false;
+    debug_status_text[0] = 0;
+}
+
+void MachineMonitor :: debug_toggle_dbx(void)
+{
+    if (!debug.is_active()) {
+        return;
+    }
+    bool now = !debug.is_experimental();
+    debug.set_experimental(now);
+    // Exact one-line alerts; never a second line. DbX never executes CPU
+    // instructions, alters breakpoints, banks, or the machine.
+    debug_show_status(now ? "DbX: test-only stepping" : "Dbg: normal Debug");
+    printf("MCM debug mode %s\n", now ? "DbX" : "Dbg");
+}
+
+bool MachineMonitor :: debug_resolve_step(DebugStepOp op, uint16_t start_pc,
+                                          const DebugPredictResult &pred,
+                                          DebugContext *from, bool *is_dbx_test,
+                                          bool *info_breakpoint_go)
+{
+    if (is_dbx_test) {
+        *is_dbx_test = false;
+    }
+    if (info_breakpoint_go) {
+        *info_breakpoint_go = false;
+    }
+
+    uint8_t exec_port = debug_exec_cpu_port(from);
+    DebugStepSource src = debug_step_source(start_pc, exec_port);
+    bool ui_freeze = debug_run_window_refreeze_enabled;
+    bool tgt_flaky = (op == DEBUG_OP_OVER) ?
+        debug_over_target_flaky(pred, exec_port) : false;
+    DebugStepDecision dec = debug_classify_step(op, src, ui_freeze,
+                                                debug.is_experimental(),
+                                                monitor_rom_image_changed(),
+                                                tgt_flaky);
+    const char *op_name = "step";
+    switch (op) {
+        case DEBUG_OP_OVER:   op_name = "over"; break;
+        case DEBUG_OP_TRACE:  op_name = "trace"; break;
+        case DEBUG_OP_OUT:    op_name = "out"; break;
+        case DEBUG_OP_GO:     op_name = "go"; break;
+        case DEBUG_OP_CURSOR: op_name = "cursor"; break;
+    }
+
+    switch (dec.plan) {
+        case DEBUG_PLAN_STOP:
+            if (dec.alert) {
+                debug_show_status(dec.alert);
+            }
+            printf("MCM debug %s $%04X stop reason=%s\n", op_name, start_pc,
+                   dec.reason ? dec.reason : "");
+            return false;
+        case DEBUG_PLAN_DBX_TEST:
+            if (is_dbx_test) {
+                *is_dbx_test = true;
+            }
+            if (dec.alert) {
+                debug_show_status(dec.alert);
+            }
+            printf("MCM debug %s $%04X dbx=true reason=%s\n", op_name, start_pc,
+                   dec.reason ? dec.reason : "");
+            return true;
+        case DEBUG_PLAN_BREAKPOINT_GO:
+            if (info_breakpoint_go) {
+                *info_breakpoint_go = true;
+            }
+            printf("MCM debug %s $%04X breakpoint_go reason=%s\n", op_name,
+                   start_pc, dec.reason ? dec.reason : "");
+            return true;
+        case DEBUG_PLAN_DIRECT:
+        default:
+            return true;
+    }
+}
+
 void MachineMonitor :: debug_request_over()
 {
+    debug_clear_status();
     DebugContext from = debug.context();
     bool have_context = from.valid;
     uint16_t start_pc = have_context ? from.pc : state.current_addr;
@@ -6477,6 +6715,13 @@ void MachineMonitor :: debug_request_over()
         redraw_full();
         return;
     }
+    bool over_is_dbx = false;
+    bool over_info_bpgo = false;
+    if (!debug_resolve_step(DEBUG_OP_OVER, start_pc, pred, &from,
+                            &over_is_dbx, &over_info_bpgo)) {
+        draw();
+        return;
+    }
     DebugContext next;
     DebugSession::Result r = have_context ? session->over(from, pred, &breakpoints, &next)
                                           : session->over_at(start_pc, pred, &breakpoints, &next);
@@ -6488,8 +6733,23 @@ void MachineMonitor :: debug_request_over()
         }
         debug.set_context(next);
         debug_sync_cursor_to_context();
+        if (over_info_bpgo) {
+            debug_show_status("Dbg: Over uses breakpoint+Go");
+        }
     } else {
         if (debug_handle_terminal_result(r)) {
+            return;
+        }
+        if (over_is_dbx &&
+                debug_step_source(start_pc, debug_exec_cpu_port(&from)) ==
+                    DEBUG_SRC_VISIBLE_ROM) {
+            // A failed DbX visible-ROM step may have left a stale BRK in the
+            // volatile ROM image. Latch it so normal Dbg stops visible-ROM
+            // Debug until ROM is reloaded.
+            monitor_set_rom_image_changed();
+            debug_show_status("ROM image changed: reload ROM");
+            printf("MCM debug over $%04X rom-image-changed\n", start_pc);
+            draw();
             return;
         }
         const char *msg = monitor_debug_result_message(r);
@@ -6502,6 +6762,7 @@ void MachineMonitor :: debug_request_over()
 
 void MachineMonitor :: debug_request_trace()
 {
+    debug_clear_status();
     DebugContext from = debug.context();
     bool have_context = from.valid;
     uint16_t start_pc = have_context ? from.pc : state.current_addr;
@@ -6538,6 +6799,12 @@ void MachineMonitor :: debug_request_trace()
         redraw_full();
         return;
     }
+    bool trace_is_dbx = false;
+    if (!debug_resolve_step(DEBUG_OP_TRACE, start_pc, pred, &from,
+                            &trace_is_dbx, 0)) {
+        draw();
+        return;
+    }
     DebugContext next;
     DebugSession::Result r = have_context ? session->trace(from, pred, &next)
                                           : session->trace_at(start_pc, pred, &next);
@@ -6553,6 +6820,15 @@ void MachineMonitor :: debug_request_trace()
         if (debug_handle_terminal_result(r)) {
             return;
         }
+        if (trace_is_dbx &&
+                debug_step_source(start_pc, debug_exec_cpu_port(&from)) ==
+                    DEBUG_SRC_VISIBLE_ROM) {
+            monitor_set_rom_image_changed();
+            debug_show_status("ROM image changed: reload ROM");
+            printf("MCM debug trace $%04X rom-image-changed\n", start_pc);
+            draw();
+            return;
+        }
         const char *msg = monitor_debug_result_message(r);
         if (msg) {
             get_ui()->popup(msg, BUTTON_OK);
@@ -6563,6 +6839,7 @@ void MachineMonitor :: debug_request_trace()
 
 void MachineMonitor :: debug_request_out()
 {
+    debug_clear_status();
     DebugSession *session = ensure_debug_session();
     if (!session) {
         monitor_log_debug("out", state.current_addr, DebugSession::DBG_NOT_SUPPORTED);
@@ -6601,6 +6878,7 @@ void MachineMonitor :: debug_request_out()
 
 void MachineMonitor :: debug_request_go()
 {
+    debug_clear_status();
     DebugContext from = debug.context();
     if (debug_cursor_override) {
         debug_context_reset(&from);
@@ -6633,16 +6911,19 @@ void MachineMonitor :: debug_request_go()
     uint16_t start_pc = state.current_addr;
     if (debug_run_window_refreeze_enabled &&
             !debug_has_enabled_breakpoint() &&
-            from.valid &&
             session->has_parked_context_handoff()) {
         // Freeze-mode parked-context G must let the monitor fully tear down
         // and release ownership before the BRK session hands execution back to
         // the live machine. Defer that handoff to run_machine_monitor(), which
         // calls cleanup_to_context() after deinit() and ownership release.
-        last_go_addr = from.pc;
+        last_go_addr = from.valid ? from.pc : start_pc;
         last_go_valid = true;
         deferred_debug_go_pending = true;
-        deferred_debug_go_context = from;
+        if (from.valid) {
+            deferred_debug_go_context = from;
+        } else {
+            debug_context_reset(&deferred_debug_go_context);
+        }
         release_host_after_exit = true;
         clear_pending_go();
         debug.invalidate_context();
@@ -6702,6 +6983,7 @@ void MachineMonitor :: debug_request_go()
 
 void MachineMonitor :: debug_request_cursor()
 {
+    debug_clear_status();
     DebugContext from = debug.context();
     if (!from.valid) {
         DebugContext snap;
@@ -7238,6 +7520,24 @@ int MachineMonitor :: handle_key(int key)
 
     dismiss_bookmark_status();
 
+    // 'X' toggles DbX (experimental Debug) while Assembly Debug is active and no
+    // inline Edit or popup is in front (popups returned above). It never
+    // executes CPU instructions, alters breakpoints, the monitor view bank, the
+    // live CPU bank, or resets/freezes the machine. C=+X (reset) is handled
+    // earlier and is unaffected. Pressing X over the Debug help just closes
+    // help; X outside Assembly Debug is inert.
+    if ((key == 'x' || key == 'X') && debug.is_active() && !edit_mode &&
+            state.view == MONITOR_VIEW_ASM) {
+        if (help_visible) {
+            help_visible = false;
+            draw();
+            return 0;
+        }
+        debug_toggle_dbx();
+        draw();
+        return 0;
+    }
+
     if (key == KEY_HELP || key == KEY_F3) {
         toggle_help();
         draw();
@@ -7757,11 +8057,14 @@ int MachineMonitor :: handle_key(int key)
         case '?':
             toggle_help();
             break;
-        case 'x': case 'X':
         case KEY_CTRL_O:
         case KEY_BREAK:
         case KEY_ESCAPE:
             return 1;
+        case 'x': case 'X':
+            // X is the DbX toggle inside Assembly Debug (handled earlier).
+            // Outside Assembly Debug it is inert: it never closes the monitor.
+            break;
         case 'j': case 'J':
         {
             char jump_buffer[5];
@@ -7888,6 +8191,9 @@ int MachineMonitor :: poll(int)
     bool status_changed = false;
 
     if (reopen_after_reset && reset_exits_monitor) {
+        return MENU_EXIT;
+    }
+    if (reset_exit_pending && reset_exits_monitor) {
         return MENU_EXIT;
     }
     if (!keyboard) {

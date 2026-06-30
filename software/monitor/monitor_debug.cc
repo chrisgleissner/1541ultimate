@@ -84,7 +84,7 @@ void debug_context_reset(DebugContext *ctx)
 }
 
 MonitorDebug :: MonitorDebug()
-    : active(false)
+    : active(false), experimental(false)
 {
     debug_context_reset(&ctx);
 }
@@ -92,13 +92,18 @@ MonitorDebug :: MonitorDebug()
 void MonitorDebug :: enter(void)
 {
     active = true;
+    // A fresh Debug entry always starts in normal Dbg. DbX is opt-in per
+    // session via the X key and is never carried over from a previous session.
+    experimental = false;
 }
 
 void MonitorDebug :: leave(void)
 {
     active = false;
     // Leaving Debug mode does not invalidate the cached context: returning to
-    // Debug should show the same numbers until execution resumes.
+    // Debug should show the same numbers until execution resumes. DbX, however,
+    // is always cleared so the next session starts in normal Dbg.
+    experimental = false;
 }
 
 void MonitorDebug :: invalidate_context(void)
@@ -164,6 +169,7 @@ int MonitorDebug :: format_help_lines(const char *lines[], int max_lines)
         "D Step Over  T Step Into  U Step Out",
         "G Continue   K Cont Crsr  RET Follow",
         "R Breakpt    C=+R Brkpts  C=+X Reset",
+        "X Dbg/DbX    DbX is experimental",
         "",
         "M Memory     I ASCII      V Screen",
         "A Assembly   B Binary     O CPU Bank",

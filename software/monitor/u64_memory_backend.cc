@@ -228,6 +228,9 @@ uint8_t U64MemoryBackend :: get_live_cpu_port(void)
     if (observed_live_cpu_port_valid) {
         return observed_live_cpu_port & 0x07;
     }
+    if (machine && machine->is_accessible()) {
+        return get_monitor_cpu_port();
+    }
     return machine ? machine->get_cpu_port() : 0;
 }
 

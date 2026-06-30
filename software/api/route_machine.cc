@@ -6,6 +6,7 @@
 #include "c64_subsys.h"
 #include "userinterface.h"
 #if U64
+#include "u64.h"
 #include "keyboard_usb.h"
 #include "joystick_output.h"
 extern "C" void route_input_note_menu_button(void);
@@ -244,7 +245,6 @@ API_CALL(GET, machine, menu_screen, NULL, ARRAY( {  }))
 }
 
 #if U64
-#include "u64.h"
 API_CALL(GET, machine, debugreg, NULL, ARRAY( {  }))
 {
     char buf[4];
