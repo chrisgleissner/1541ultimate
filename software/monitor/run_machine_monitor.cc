@@ -56,6 +56,9 @@ void UserInterface :: run_machine_monitor(MemoryBackend *backend)
         int ret = 0;
         while(!ret && host->exists()) {
             ret = monitor->poll(0);
+            if (!ret && pollMenuButtonPush()) {
+                break;
+            }
         }
         bool exit_ui = ret == MENU_EXIT;
         // C=+I inside the monitor routes to swap_interface_type(), which toggles
