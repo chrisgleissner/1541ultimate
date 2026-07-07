@@ -51,77 +51,52 @@ OP_FIELDS = (
 
 
 # ---------------------------------------------------------------------------
-# DbX scope contract. The canonical one-line Debug alerts, the plain status
-# values used by DEBUG_SCOPE.md, and the terms that must never reach the UI or
-# the manual. `--focus dbx-scope` validates these without needing a device, so
-# the contract is checkable in CI; a live host adds a best-effort REST smoke.
+# Debug alert contract. The canonical one-line Debug alerts and the terms that
+# must never reach the UI or the manual. `--focus alerts` validates these
+# without needing a device, so the contract is checkable in CI; a live host
+# adds a best-effort REST smoke. DbX (the experimental step mode) is gone:
+# parked-context steps in RAM-under-ROM and visible ROM are completed without
+# releasing the CPU into the fetch-lagging bank, so no experimental mode and
+# no ROM-image-changed latch remain.
 # ---------------------------------------------------------------------------
-DBX_ALERTS = (
-    "DbX: test-only stepping",
-    "Dbg: normal Debug",
-    "Dbg: Over uses breakpoint+Go",
-    "No safe Step here",
-    "Step Into here needs DbX",
-    "ROM image changed: reload ROM",
-    "Mode not checked in Dbg",
-    "X toggles Dbg/DbX",
+DEBUG_ALERTS = (
+    "Step Into: run to a breakpoint 1st",
 )
 
-DBX_ALERT_MAX_WIDTH = 38
+DEBUG_ALERT_MAX_WIDTH = 38
 
-DBX_BANNED_ALERT_TERMS = (
+DEBUG_BANNED_ALERT_TERMS = (
     "production", "capability", "unsupported", "qualified",
-    "enterprise", "certified", "uncharacterized", "Db!",
-)
-
-DBX_SCOPE_STATUS_VALUES = (
-    "WORKS",
-    "WORKS VIA BREAKPOINT+GO",
-    "DBX ONLY",
-    "NO SAFE WAY",
-    "NOT CHECKED",
-)
-
-DBX_BANNED_DOC_TERMS = (
-    "production mode", "production-grade", "enterprise", "capability map",
+    "enterprise", "certified", "uncharacterized", "Db!", "DbX",
+    "experimental",
 )
 
 
-def validate_dbx_alerts(alerts=DBX_ALERTS) -> list[str]:
+def validate_debug_alerts(alerts=DEBUG_ALERTS) -> list[str]:
     """Return a list of contract violations for the one-line Debug alerts."""
     problems: list[str] = []
     for alert in alerts:
         if "\n" in alert or "\r" in alert:
             problems.append(f"alert contains a newline: {alert!r}")
-        if len(alert) > DBX_ALERT_MAX_WIDTH:
+        if len(alert) > DEBUG_ALERT_MAX_WIDTH:
             problems.append(
-                f"alert exceeds {DBX_ALERT_MAX_WIDTH} chars ({len(alert)}): {alert!r}")
-        for term in DBX_BANNED_ALERT_TERMS:
+                f"alert exceeds {DEBUG_ALERT_MAX_WIDTH} chars ({len(alert)}): {alert!r}")
+        for term in DEBUG_BANNED_ALERT_TERMS:
             if term in alert:
                 problems.append(f"alert uses banned term {term!r}: {alert!r}")
     return problems
 
 
-def validate_debug_scope_text(text: str) -> list[str]:
-    """DEBUG_SCOPE.md must use only the plain status values and no jargon."""
-    problems: list[str] = []
-    for value in DBX_SCOPE_STATUS_VALUES:
-        if value not in text:
-            problems.append(f"DEBUG_SCOPE.md missing status value {value!r}")
-    for term in DBX_BANNED_DOC_TERMS:
-        if term in text:
-            problems.append(f"DEBUG_SCOPE.md uses banned term {term!r}")
-    return problems
-
-
 def validate_manual_text(text: str) -> list[str]:
-    """doc/machine_code_monitor.md must explain Dbg/DbX/X in plain language."""
+    """doc/machine_code_monitor.md must explain Debug stepping in plain language."""
     problems: list[str] = []
-    required = ("Dbg", "DbX", "X toggles", "breakpoint+Go", "RAM under ROM")
+    required = ("Dbg", "breakpoint+Go", "RAM under ROM")
     for token in required:
         if token not in text:
             problems.append(f"manual missing required phrase {token!r}")
-    for term in DBX_BANNED_DOC_TERMS:
+    banned = ("DbX", "experimental Debug", "production mode", "production-grade",
+              "enterprise", "capability map")
+    for term in banned:
         if term in text:
             problems.append(f"manual uses banned term {term!r}")
     return problems
@@ -421,7 +396,31 @@ def apply_fixture_entry_side_effects(mem: bytearray, fixture: MatrixFixture) -> 
         mem[0x0001] = 0x37
 
 
+def source_tag_for(address: int, bank: int) -> str:
+    """Monitor source tag ([RAM]/[BAS]/[KRN]/...) for an address in a bank."""
+    bank &= 7
+    if 0xA000 <= address <= 0xBFFF:
+        return "BAS" if (bank & 3) == 3 else "RAM"
+    if 0xD000 <= address <= 0xDFFF:
+        if (bank & 3) == 0:
+            return "RAM"
+        return "I/O" if (bank & 4) else "CHR"
+    if address >= 0xE000:
+        return "KRN" if (bank & 2) else "RAM"
+    return "RAM"
+
+
 def apply_captured_rom_heads(mem: bytearray, cell_dir: Path) -> None:
+    # Full pre-freeze ROM snapshots first (required for freeze cells, where the
+    # in-session memory image cannot see BASIC/KERNAL), then the short heads.
+    basic_full = cell_dir / "live-basic-a000-full.bin"
+    kernal_full = cell_dir / "live-kernal-e000-full.bin"
+    if basic_full.exists():
+        data = basic_full.read_bytes()
+        mem[0xA000:0xA000 + len(data)] = data
+    if kernal_full.exists():
+        data = kernal_full.read_bytes()
+        mem[0xE000:0xE000 + len(data)] = data
     kernal_head = cell_dir / "live-kernal-e000.bin"
     basic_head = cell_dir / "live-basic-bc00.bin"
     if kernal_head.exists():
@@ -501,6 +500,17 @@ class BaseDriver(DebugInterfaceDriver):
             basic_head = self.read_bytes(0xBC00, 0x40)
             (self.cell_dir / "live-kernal-e000.bin").write_bytes(kernal_head)
             (self.cell_dir / "live-basic-bc00.bin").write_bytes(basic_head)
+            # Capture the FULL ROM regions while the machine is still live:
+            # once the freezer owns the banking, raw readmem no longer serves
+            # BASIC/KERNAL, so the oracle image must be seeded from this
+            # pre-freeze snapshot instead of the in-session memory image.
+            basic_full = bytearray()
+            kernal_full = bytearray()
+            for off in range(0, 0x2000, 0x1000):
+                basic_full.extend(self.read_bytes(0xA000 + off, 0x1000))
+                kernal_full.extend(self.read_bytes(0xE000 + off, 0x1000))
+            (self.cell_dir / "live-basic-a000-full.bin").write_bytes(bytes(basic_full))
+            (self.cell_dir / "live-kernal-e000-full.bin").write_bytes(bytes(kernal_full))
             if kernal_head[:5] != bytes([0x85, 0x56, 0x20, 0x0F, 0xBC]):
                 raise BlockedWithEvidence(
                     "Configured KERNAL at $E000 is not the canonical path "
@@ -948,7 +958,8 @@ class RestDebugDriver(BaseDriver):
                        note="RAM-under-ROM breakpoint may be invisible until CPU bank maps RAM")
             return
         overlay_lifecycle.ensure_breakpoint_at(
-            self.rest, address, self.fixture.bank, self.fixture.source,
+            self.rest, address, self.fixture.bank,
+            source_tag_for(address, self.fixture.bank),
             f"{self.row['cell_id']}: set bp ${address:04X}")
         self.event("set_breakpoint", address=f"{address:04X}")
 
@@ -1761,6 +1772,46 @@ def run_rom_opcode_trace_dual(driver: BaseDriver, row: dict[str, Any], cell_dir:
         "KERNAL->BASIC and BASIC->KERNAL transitions")
 
 
+def run_step_trace_dual(driver: BaseDriver, row: dict[str, Any], cell_dir: Path,
+                        oracles: DualOracles,
+                        minimum_opcodes: int = 100) -> int:
+    """Dual-oracle Step Into trace for the RAM / RAM-under-ROM fixtures.
+
+    Unlike the ROM trace this follows the synthetic fixture program (chain
+    unwind, then the sentinel/progress loop), so there is no region or call
+    depth requirement: it proves that `minimum_opcodes` consecutive live Step
+    Intos agree with the 6510 oracle on registers and stack, through whatever
+    mix of linear ops, JSR/RTS, and JMPs the fixture path contains.
+    """
+    trace = []
+    for index in range(1, minimum_opcodes + 1):
+        before_pc = oracles.cpu.pc
+        result = oracles.advance_one(f"Step trace {index}")
+        driver.step_into()
+        state = driver.wait_pc(oracles.cpu.pc, f"Step trace {index}", timeout=12.0)
+        oracles.compare_state_and_stack(state, f"Step trace {index}")
+        trace.append({
+            "index": index,
+            "pc_before": f"{before_pc:04X}",
+            "opcode": f"{result.opcode:02X}",
+            "mnemonic": result.mnemonic,
+            "pc_after": f"{oracles.cpu.pc:04X}",
+            "sp": f"{oracles.cpu.sp:02X}",
+            "vice_enabled": oracles.vice_enabled,
+        })
+    summary = {
+        "opcode_count": len(trace),
+        "final_pc": f"{oracles.cpu.pc:04X}",
+        "vice_enabled": oracles.vice_enabled,
+    }
+    (cell_dir / "step-opcode-trace.json").write_text(
+        json.dumps({"summary": summary, "trace": trace}, indent=2) + "\n",
+        encoding="utf-8")
+    row["step_trace"] = summary
+    driver.event("step_opcode_trace_pass", **summary)
+    return len(trace)
+
+
 def run_vice_oracle_check(artifact_dir: Path, port: int = 6518,
                           minimum_opcodes: int = 100) -> dict[str, Any]:
     out_dir = artifact_dir / "preflight" / "vice-oracle"
@@ -1917,56 +1968,6 @@ def run_cell(args: argparse.Namespace, row: dict[str, Any], ledger: Ledger) -> N
                     stage="step_over",
                     reason="active-Debug REST readmem is not a proven live target oracle")
             ledger.save()
-
-            if row["memory_mode"] == "ram-under-rom":
-                # Step Over advanced via breakpoint+Go (validated above). Step
-                # Into of RAM under ROM is DbX-only in normal Dbg, so assert the
-                # gated alert and then validate the remaining reliable
-                # breakpoint+Go execution ops (Continue to breakpoint, Continue).
-                log_line(f"{cid}: Step Into (normal Dbg gates RAM-under-ROM to DbX)")
-                driver.step_into()
-                time.sleep(0.3)
-                txt = screen_text(driver)
-                if "Step Into here needs DbX" not in txt:
-                    raise GateError(
-                        "normal Dbg Step Into on RAM under ROM must gate to DbX; "
-                        f"status was: {txt!r}")
-                mark_op(row, "step_into", "DBX_ONLY")
-                mark_op(row, "step_out", "DBX_ONLY")
-                mark_op(row, "continue_to_cursor", "DBX_ONLY")
-                row["step_into_depth"] = 0
-                ledger.save()
-
-                log_line(f"{cid}: Continue to breakpoint")
-                driver.continue_to_breakpoint(fixture.breakpoint_target)
-                driver.wait_pc(fixture.breakpoint_target,
-                               "Continue to breakpoint", timeout=12.0)
-                driver.clear_breakpoint(fixture.breakpoint_target)
-                row["breakpoint_hygiene_validated"] = True
-                row["brk_patch_hygiene_validated"] = True
-                mark_op(row, "continue_to_breakpoint", "PASS")
-                ledger.save()
-
-                log_line(f"{cid}: Continue")
-                driver.continue_run()
-                driver.wait_progress_change(fixture.progress, "Continue liveness")
-                row["liveness_validated"] = True
-                row["memory_writes_validated"] = True
-                mark_op(row, "continue", "PASS")
-                ledger.save()
-
-                log_line(f"{cid}: Reset")
-                driver.reset_from_debug_ui()
-                row["rest_liveness_validated"] = driver.rest.alive()
-                if row["interface"] == "telnet":
-                    row["telnet_liveness_validated"] = tcp_probe(args.host, args.port)
-                driver.verify_hygiene()
-                row["banking_restore_validated"] = True
-                mark_op(row, "reset", "PASS")
-                row["opcode_count"] = 9
-                row["status"] = "PASS"
-                ledger.save()
-                return
 
             if row["memory_mode"] == "rom":
                 log_line(f"{cid}: Step Into along live ROM path to real JSR")
@@ -2126,41 +2127,33 @@ def run_cell(args: argparse.Namespace, row: dict[str, Any], ledger: Ledger) -> N
                 mark_op(row, "step_out", "PASS")
                 ledger.save()
 
+                log_line(f"{cid}: 100-opcode dual-oracle Step Into trace")
+                trace_steps = run_step_trace_dual(driver, row, cell_dir, oracles,
+                                                  minimum_opcodes=100)
+                row["opcode_count"] = row["step_into_depth"] + trace_steps
+                row["oracle_validated"] = True
+                ledger.save()
+
             log_line(f"{cid}: Continue to cursor")
-            if row["memory_mode"] == "rom":
-                target = clone_cpu(oracles.cpu)
-                target.step()
-                driver.continue_to_cursor(target.pc)
-                rom_state = driver.wait_pc(target.pc, "Continue to cursor", timeout=15.0)
-                oracles.advance_until_pc(target.pc, "Continue to cursor")
-                oracles.compare_state_and_stack(rom_state, "Continue to cursor")
-                row["opcode_count"] += 1
-            else:
-                driver.continue_to_cursor(fixture.cursor_target)
-                cursor = driver.wait_pc(fixture.cursor_target, "Continue to cursor", timeout=15.0)
-                oracles.advance_until_pc(fixture.cursor_target, "Continue to cursor")
-                oracles.compare_state_and_stack(cursor, "Continue to cursor")
-                assert_state_pc_sp(cursor, fixture.cursor_target, sp_entry, "Continue to cursor")
+            target = clone_cpu(oracles.cpu)
+            target.step()
+            driver.continue_to_cursor(target.pc)
+            cursor_state = driver.wait_pc(target.pc, "Continue to cursor", timeout=15.0)
+            oracles.advance_until_pc(target.pc, "Continue to cursor")
+            oracles.compare_state_and_stack(cursor_state, "Continue to cursor")
+            row["opcode_count"] += 1
             mark_op(row, "continue_to_cursor", "PASS")
             ledger.save()
 
             log_line(f"{cid}: Continue to breakpoint")
-            if row["memory_mode"] == "rom":
-                target = clone_cpu(oracles.cpu)
-                target.step()
-                driver.continue_to_breakpoint(target.pc)
-                rom_state = driver.wait_pc(target.pc, "Continue to breakpoint", timeout=10.0)
-                oracles.advance_until_pc(target.pc, "Continue to breakpoint")
-                oracles.compare_state_and_stack(rom_state, "Continue to breakpoint")
-                driver.clear_breakpoint(rom_state.pc)
-                row["opcode_count"] += 1
-            else:
-                driver.continue_to_breakpoint(fixture.breakpoint_target)
-                bp = driver.wait_pc(fixture.breakpoint_target, "Continue to breakpoint", timeout=10.0)
-                oracles.advance_until_pc(fixture.breakpoint_target, "Continue to breakpoint")
-                oracles.compare_state_and_stack(bp, "Continue to breakpoint")
-                assert_state_pc_sp(bp, fixture.breakpoint_target, sp_entry, "Continue to breakpoint")
-                driver.clear_breakpoint(fixture.breakpoint_target)
+            target = clone_cpu(oracles.cpu)
+            target.step()
+            driver.continue_to_breakpoint(target.pc)
+            bp_state = driver.wait_pc(target.pc, "Continue to breakpoint", timeout=10.0)
+            oracles.advance_until_pc(target.pc, "Continue to breakpoint")
+            oracles.compare_state_and_stack(bp_state, "Continue to breakpoint")
+            driver.clear_breakpoint(bp_state.pc)
+            row["opcode_count"] += 1
             row["breakpoint_hygiene_validated"] = True
             row["brk_patch_hygiene_validated"] = True
             mark_op(row, "continue_to_breakpoint", "PASS")
@@ -2193,7 +2186,7 @@ def run_cell(args: argparse.Namespace, row: dict[str, Any], ledger: Ledger) -> N
             row["banking_restore_validated"] = True
             mark_op(row, "reset", "PASS")
             if row["memory_mode"] != "rom":
-                row["opcode_count"] = row["step_into_depth"] + 6
+                row["opcode_count"] += 6
             row["status"] = "PASS"
             ledger.save()
         except BlockedWithEvidence as exc:
@@ -2612,9 +2605,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--password")
     parser.add_argument("--memory", choices=MEMORY_MODES + ("all",), default="all")
     parser.add_argument("--ui", choices=INTERFACES + ("all",), default="all")
-    parser.add_argument("--focus", choices=("matrix", "dbx-scope"), default="matrix",
-                        help="matrix = full debugger matrix; dbx-scope = focused "
-                             "DbX shortcut/alert/scope/ROM-image contract check.")
+    parser.add_argument("--focus", choices=("matrix", "alerts"), default="matrix",
+                        help="matrix = full debugger matrix; alerts = focused "
+                             "Debug alert/manual wording contract check.")
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--required-step-into-depth", type=int, default=32)
     parser.add_argument("--opcode-run", type=int, default=1000)
@@ -2637,35 +2630,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_dbx_scope(args: argparse.Namespace, artifact_dir: Path) -> int:
-    """Focused DbX contract check: shortcut/alert/scope/ROM-image wording.
+def run_alert_scope(args: argparse.Namespace, artifact_dir: Path) -> int:
+    """Focused Debug alert/manual wording contract check.
 
     Hardware-free by design so it is deterministic in CI; if the REST host is
     reachable it adds a non-fatal menu_screen smoke. Returns 0 when the contract
     holds, 1 otherwise (and always when --strict and any check fails).
     """
-    scope_dir = (REPO_ROOT / "doc" / "research" / "machine-monitor" / "debug" /
-                 "artifacts" / "2026-06-30_mcm_debug_dbx_scope")
-    debug_scope = scope_dir / "DEBUG_SCOPE.md"
-    ux_review = scope_dir / "UX_SHORTCUT_REVIEW.md"
     manual = REPO_ROOT / "doc" / "machine_code_monitor.md"
 
     problems: list[str] = []
 
-    problems += validate_dbx_alerts()
-
-    if not debug_scope.exists():
-        problems.append(f"missing {debug_scope}")
-    else:
-        problems += validate_debug_scope_text(debug_scope.read_text())
-
-    if not ux_review.exists():
-        problems.append(f"missing {ux_review}")
-    else:
-        ux_text = ux_review.read_text()
-        for alert in DBX_ALERTS:
-            if alert not in ux_text:
-                problems.append(f"UX_SHORTCUT_REVIEW.md missing alert {alert!r}")
+    problems += validate_debug_alerts()
 
     if not manual.exists():
         problems.append(f"missing {manual}")
@@ -2684,21 +2660,21 @@ def run_dbx_scope(args: argparse.Namespace, artifact_dir: Path) -> int:
         rest_note = f"rest smoke skipped: {exc}"
 
     result = {
-        "focus": "dbx-scope",
-        "alerts_checked": len(DBX_ALERTS),
-        "alert_max_width": DBX_ALERT_MAX_WIDTH,
+        "focus": "alerts",
+        "alerts_checked": len(DEBUG_ALERTS),
+        "alert_max_width": DEBUG_ALERT_MAX_WIDTH,
         "rest_reachable": rest_reachable,
         "rest_note": rest_note,
         "problems": problems,
         "status": "PASS" if not problems else "FAIL",
     }
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    (artifact_dir / "dbx-scope-results.json").write_text(
+    (artifact_dir / "alert-scope-results.json").write_text(
         json.dumps(result, indent=2) + "\n")
     for line in problems:
-        print(f"dbx-scope: {line}", flush=True)
-    print(f"dbx-scope: {result['status']} "
-          f"(alerts={len(DBX_ALERTS)}, rest_reachable={rest_reachable})", flush=True)
+        print(f"alert-scope: {line}", flush=True)
+    print(f"alert-scope: {result['status']} "
+          f"(alerts={len(DEBUG_ALERTS)}, rest_reachable={rest_reachable})", flush=True)
     return 0 if not problems else 1
 
 
@@ -2706,8 +2682,8 @@ def main() -> int:
     args = parse_args()
     artifact_dir = Path(args.artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    if args.focus == "dbx-scope":
-        return run_dbx_scope(args, artifact_dir)
+    if args.focus == "alerts":
+        return run_alert_scope(args, artifact_dir)
     ledger = create_or_load_ledger(args, artifact_dir)
 
     preflight = load_preflight_results(artifact_dir) if args.skip_preflight else {"skipped": True}

@@ -445,8 +445,8 @@ void BrkDebugSession :: restore_stale_visible_hard_vector(void)
         return;
     }
     bool stopped_it = begin_stopped_session();
-    uint8_t lo = peek_cpu(HARD_VECTOR_LO, HARD_VECTOR_ROM_CPU_PORT);
-    uint8_t hi = peek_cpu(HARD_VECTOR_HI, HARD_VECTOR_ROM_CPU_PORT);
+    uint8_t lo = read_patch_byte(HARD_VECTOR_LO, HARD_VECTOR_ROM_CPU_PORT);
+    uint8_t hi = read_patch_byte(HARD_VECTOR_HI, HARD_VECTOR_ROM_CPU_PORT);
     if (hard_vector_points_to_stub(lo, hi)) {
         poke_cpu(HARD_VECTOR_LO, HARD_VECTOR_DEFAULT_LO,
                  HARD_VECTOR_ROM_CPU_PORT);
@@ -465,10 +465,13 @@ void BrkDebugSession :: save_and_install_visible_hard_vector(void)
         save_and_install_hard_vector();
     }
     bool stopped_it = begin_stopped_session();
-    saved_hard_rom_vector[0] = peek_cpu(HARD_VECTOR_LO,
-                                        HARD_VECTOR_ROM_CPU_PORT);
-    saved_hard_rom_vector[1] = peek_cpu(HARD_VECTOR_HI,
-                                        HARD_VECTOR_ROM_CPU_PORT);
+    // read_patch_byte, not peek_cpu: the saved bytes get RESTORED into the
+    // ROM image later, and under the freezer a raw aperture read returns the
+    // freezer cart's garbage, which would trash the IRQ vector on uninstall.
+    saved_hard_rom_vector[0] = read_patch_byte(HARD_VECTOR_LO,
+                                               HARD_VECTOR_ROM_CPU_PORT);
+    saved_hard_rom_vector[1] = read_patch_byte(HARD_VECTOR_HI,
+                                               HARD_VECTOR_ROM_CPU_PORT);
     if (hard_vector_points_to_stub(saved_hard_rom_vector[0],
                                    saved_hard_rom_vector[1])) {
         saved_hard_rom_vector[0] = HARD_VECTOR_DEFAULT_LO;
@@ -1508,12 +1511,21 @@ DebugSession::Result BrkDebugSession :: step_linear_via_trampoline(
     if (pred.length == 0 || pred.length > 3) {
         return DBG_REFUSED;
     }
+    // Fetch the instruction through read_step_bytes when the caller did not
+    // supply it: under the freezer the live aperture (peek_cpu) does not
+    // serve BASIC/KERNAL for ROM addresses, so a raw read would copy
+    // freezer-cart garbage into the trampoline.
+    uint8_t fetched[3] = { 0, 0, 0 };
+    if (!instruction_bytes) {
+        if (!read_step_bytes(start_pc, fetched, pred.length)) {
+            return DBG_NOT_SUPPORTED;
+        }
+        instruction_bytes = fetched;
+    }
     bool stopped = begin_stopped_session();
     for (uint8_t i = 0; i < pred.length; i++) {
-        uint8_t byte = instruction_bytes ?
-            instruction_bytes[i] : peek_cpu((uint16_t)(start_pc + i), cpu_port);
         poke_cpu((uint16_t)(INSN_TRAMPOLINE_ADDR + i),
-                 byte, cpu_port);
+                 instruction_bytes[i], cpu_port);
     }
     end_stopped_session(stopped);
 
@@ -1554,12 +1566,107 @@ static void set_nz(uint8_t *sr, uint8_t value)
         (value & 0x80));
 }
 
+namespace {
+
+// 6502 SR bits.
+enum {
+    SR_C = 0x01, SR_Z = 0x02, SR_I = 0x04, SR_D = 0x08,
+    SR_B = 0x10, SR_U = 0x20, SR_V = 0x40, SR_N = 0x80
+};
+
+static void set_flag(uint8_t *sr, uint8_t flag, bool value)
+{
+    if (value) {
+        *sr = (uint8_t)(*sr | flag);
+    } else {
+        *sr = (uint8_t)(*sr & (uint8_t)~flag);
+    }
+}
+
+static void alu_adc(DebugContext *ctx, uint8_t m)
+{
+    uint8_t a = ctx->a;
+    unsigned carry_in = (ctx->sr & SR_C) ? 1 : 0;
+    unsigned bin = (unsigned)a + m + carry_in;
+    // NMOS 6502: N/V/Z reflect the binary intermediate even in decimal mode.
+    set_flag(&ctx->sr, SR_Z, (bin & 0xFF) == 0);
+    if (ctx->sr & SR_D) {
+        unsigned lo = (unsigned)(a & 0x0F) + (m & 0x0F) + carry_in;
+        unsigned hi = (unsigned)(a & 0xF0) + (m & 0xF0);
+        if (lo > 9) {
+            lo += 6;
+            hi += 0x10;
+        }
+        set_flag(&ctx->sr, SR_N, (hi & 0x80) != 0);
+        set_flag(&ctx->sr, SR_V, ((a ^ (uint8_t)hi) & ~(a ^ m) & 0x80) != 0);
+        if (hi > 0x90) {
+            hi += 0x60;
+        }
+        set_flag(&ctx->sr, SR_C, hi > 0xFF);
+        ctx->a = (uint8_t)((hi & 0xF0) | (lo & 0x0F));
+    } else {
+        set_flag(&ctx->sr, SR_N, (bin & 0x80) != 0);
+        set_flag(&ctx->sr, SR_V, (~(a ^ m) & (a ^ (uint8_t)bin) & 0x80) != 0);
+        set_flag(&ctx->sr, SR_C, bin > 0xFF);
+        ctx->a = (uint8_t)bin;
+    }
+}
+
+static void alu_sbc(DebugContext *ctx, uint8_t m)
+{
+    uint8_t a = ctx->a;
+    unsigned borrow = (ctx->sr & SR_C) ? 0 : 1;
+    unsigned bin = (unsigned)a - m - borrow;
+    set_flag(&ctx->sr, SR_N, (bin & 0x80) != 0);
+    set_flag(&ctx->sr, SR_Z, (bin & 0xFF) == 0);
+    set_flag(&ctx->sr, SR_V, ((a ^ m) & (a ^ (uint8_t)bin) & 0x80) != 0);
+    set_flag(&ctx->sr, SR_C, bin < 0x100);
+    if (ctx->sr & SR_D) {
+        unsigned lo = (unsigned)(a & 0x0F) - (m & 0x0F) - borrow;
+        unsigned hi = (unsigned)(a & 0xF0) - (m & 0xF0);
+        if (lo & 0x10) {
+            lo -= 6;
+            hi -= 0x10;
+        }
+        if (hi & 0x100) {
+            hi -= 0x60;
+        }
+        ctx->a = (uint8_t)((hi & 0xF0) | (lo & 0x0F));
+    } else {
+        ctx->a = (uint8_t)bin;
+    }
+}
+
+static void alu_compare(uint8_t *sr, uint8_t reg, uint8_t m)
+{
+    uint8_t diff = (uint8_t)(reg - m);
+    set_flag(sr, SR_C, reg >= m);
+    set_flag(sr, SR_Z, reg == m);
+    set_flag(sr, SR_N, (diff & 0x80) != 0);
+}
+
+} // namespace
+
+// Full documented-opcode interpreter for non-control-flow instructions,
+// executed while the CPU stays parked. Data accesses go through the DMA
+// peek/poke path (the same coherent path every monitor read/write uses), so
+// I/O reads and writes have the side effects the real instruction would have.
+// Together with emulate_control_flow_step this steps any documented
+// instruction without releasing the CPU, which is what makes stepping in
+// fetch-lagging banks (RAM under ROM, visible ROM, and everything under the
+// freezer) deterministic - and keeps parked_step_walk free of unfreeze/
+// refreeze cycles, which the freezer does not survive in rapid succession.
+// Undocumented opcodes return DBG_NOT_SUPPORTED (trampoline fallback).
 DebugSession::Result BrkDebugSession :: interpret_simple_linear(
     const DebugContext *from, uint16_t start_pc,
     const DebugPredictResult &pred, DebugContext *out, uint8_t cpu_port,
     const uint8_t *instruction_bytes)
 {
-    if (!from || !from->valid || !out || pred.kind != DBG_PREDICT_LINEAR) {
+    // Context mutation is only truthful while the CPU is parked in the spin
+    // loop (every parked resume rebuilds the full register file). A non-parked
+    // launch keeps the live registers, so fall through to the trampoline run.
+    if (!from || !from->valid || !out || !cpu_parked_in_spin ||
+            pred.kind != DBG_PREDICT_LINEAR) {
         return DBG_NOT_SUPPORTED;
     }
     uint8_t bytes[3] = { 0, 0, 0 };
@@ -1572,79 +1679,558 @@ DebugSession::Result BrkDebugSession :: interpret_simple_linear(
     }
 
     DebugContext next = *from;
-    switch (bytes[0]) {
-        case 0xEA:
-            if (pred.length != 1) return DBG_NOT_SUPPORTED;
-            break;
-        case 0xA9:
-            if (pred.length != 2) return DBG_NOT_SUPPORTED;
-            next.a = bytes[1];
+    uint8_t op = bytes[0];
+
+    // Implied / accumulator / stack instructions first.
+    switch (op) {
+        case 0xEA: goto done;                                        // NOP
+        case 0x18: set_flag(&next.sr, SR_C, false); goto done;       // CLC
+        case 0x38: set_flag(&next.sr, SR_C, true); goto done;        // SEC
+        case 0x58: set_flag(&next.sr, SR_I, false); goto done;       // CLI
+        case 0x78: set_flag(&next.sr, SR_I, true); goto done;        // SEI
+        case 0xB8: set_flag(&next.sr, SR_V, false); goto done;       // CLV
+        case 0xD8: set_flag(&next.sr, SR_D, false); goto done;       // CLD
+        case 0xF8: set_flag(&next.sr, SR_D, true); goto done;        // SED
+        case 0xAA: next.x = next.a; set_nz(&next.sr, next.x); goto done; // TAX
+        case 0xA8: next.y = next.a; set_nz(&next.sr, next.y); goto done; // TAY
+        case 0x8A: next.a = next.x; set_nz(&next.sr, next.a); goto done; // TXA
+        case 0x98: next.a = next.y; set_nz(&next.sr, next.a); goto done; // TYA
+        case 0xBA: next.x = next.sp; set_nz(&next.sr, next.x); goto done; // TSX
+        case 0x9A: next.sp = next.x; goto done;                      // TXS
+        case 0xE8: next.x = (uint8_t)(next.x + 1); set_nz(&next.sr, next.x); goto done; // INX
+        case 0xC8: next.y = (uint8_t)(next.y + 1); set_nz(&next.sr, next.y); goto done; // INY
+        case 0xCA: next.x = (uint8_t)(next.x - 1); set_nz(&next.sr, next.x); goto done; // DEX
+        case 0x88: next.y = (uint8_t)(next.y - 1); set_nz(&next.sr, next.y); goto done; // DEY
+        case 0x0A: { // ASL A
+            set_flag(&next.sr, SR_C, (next.a & 0x80) != 0);
+            next.a = (uint8_t)(next.a << 1);
             set_nz(&next.sr, next.a);
-            break;
-        case 0xA2:
-            if (pred.length != 2) return DBG_NOT_SUPPORTED;
-            next.x = bytes[1];
-            set_nz(&next.sr, next.x);
-            break;
-        case 0xA5:
-            if (pred.length != 2) return DBG_NOT_SUPPORTED;
-            next.a = peek_cpu(bytes[1], cpu_port);
+            goto done;
+        }
+        case 0x4A: { // LSR A
+            set_flag(&next.sr, SR_C, (next.a & 0x01) != 0);
+            next.a = (uint8_t)(next.a >> 1);
             set_nz(&next.sr, next.a);
-            break;
-        case 0xB5:
-            if (pred.length != 2) return DBG_NOT_SUPPORTED;
-            next.a = peek_cpu((uint8_t)(bytes[1] + next.x), cpu_port);
+            goto done;
+        }
+        case 0x2A: { // ROL A
+            uint8_t c = (uint8_t)((next.sr & SR_C) ? 1 : 0);
+            set_flag(&next.sr, SR_C, (next.a & 0x80) != 0);
+            next.a = (uint8_t)((next.a << 1) | c);
             set_nz(&next.sr, next.a);
-            break;
-        case 0x85:
-            if (pred.length != 2) return DBG_NOT_SUPPORTED;
-            poke_cpu(bytes[1], next.a, cpu_port);
-            break;
-        case 0x86:
-            if (pred.length != 2) return DBG_NOT_SUPPORTED;
-            poke_cpu(bytes[1], next.x, cpu_port);
-            break;
-        case 0x95:
-            if (pred.length != 2) return DBG_NOT_SUPPORTED;
-            poke_cpu((uint8_t)(bytes[1] + next.x), next.a, cpu_port);
-            break;
-        case 0x29:
-            if (pred.length != 2) return DBG_NOT_SUPPORTED;
-            next.a = (uint8_t)(next.a & bytes[1]);
+            goto done;
+        }
+        case 0x6A: { // ROR A
+            uint8_t c = (uint8_t)((next.sr & SR_C) ? 0x80 : 0);
+            set_flag(&next.sr, SR_C, (next.a & 0x01) != 0);
+            next.a = (uint8_t)((next.a >> 1) | c);
             set_nz(&next.sr, next.a);
-            break;
-        case 0x09:
-            if (pred.length != 2) return DBG_NOT_SUPPORTED;
-            next.a = (uint8_t)(next.a | bytes[1]);
+            goto done;
+        }
+        case 0x48: // PHA
+            poke_cpu((uint16_t)(0x0100 + next.sp), next.a, cpu_port);
+            next.sp = (uint8_t)(next.sp - 1);
+            goto done;
+        case 0x08: // PHP pushes with B and U set.
+            poke_cpu((uint16_t)(0x0100 + next.sp),
+                     (uint8_t)(next.sr | SR_B | SR_U), cpu_port);
+            next.sp = (uint8_t)(next.sp - 1);
+            goto done;
+        case 0x68: // PLA
+            next.sp = (uint8_t)(next.sp + 1);
+            next.a = peek_cpu((uint16_t)(0x0100 + next.sp), cpu_port);
             set_nz(&next.sr, next.a);
-            break;
-        case 0xAA:
-            if (pred.length != 1) return DBG_NOT_SUPPORTED;
-            next.x = next.a;
-            set_nz(&next.sr, next.x);
-            break;
-        case 0xE8:
-            if (pred.length != 1) return DBG_NOT_SUPPORTED;
-            next.x = (uint8_t)(next.x + 1);
-            set_nz(&next.sr, next.x);
-            break;
-        case 0xCA:
-            if (pred.length != 1) return DBG_NOT_SUPPORTED;
-            next.x = (uint8_t)(next.x - 1);
-            set_nz(&next.sr, next.x);
-            break;
-        case 0xC8:
-            if (pred.length != 1) return DBG_NOT_SUPPORTED;
-            next.y = (uint8_t)(next.y + 1);
-            set_nz(&next.sr, next.y);
-            break;
+            goto done;
+        case 0x28: // PLP: B is not a real flag; keep U set.
+            next.sp = (uint8_t)(next.sp + 1);
+            next.sr = (uint8_t)((peek_cpu((uint16_t)(0x0100 + next.sp),
+                                          cpu_port) | SR_U) & (uint8_t)~SR_B);
+            goto done;
         default:
-            return DBG_NOT_SUPPORTED;
+            break;
     }
+
+    {
+        // Addressing-mode decode for the remaining documented ops (aaabbbcc).
+        uint8_t cc = (uint8_t)(op & 0x03);
+        uint8_t bbb = (uint8_t)((op >> 2) & 0x07);
+        bool has_addr = false;
+        bool is_imm = false;
+        uint16_t addr = 0;
+        uint8_t imm = 0;
+
+        if (cc == 0x01) { // cc=01: (zp,X) zp # abs (zp),Y zp,X abs,Y abs,X
+            switch (bbb) {
+                case 0: { // (zp,X)
+                    uint8_t zp = (uint8_t)(bytes[1] + next.x);
+                    addr = (uint16_t)(peek_cpu(zp, cpu_port) |
+                                      (peek_cpu((uint8_t)(zp + 1), cpu_port) << 8));
+                    has_addr = true;
+                    break;
+                }
+                case 1: addr = bytes[1]; has_addr = true; break;        // zp
+                case 2: imm = bytes[1]; is_imm = true; break;           // #
+                case 3: addr = (uint16_t)(bytes[1] | (bytes[2] << 8)); has_addr = true; break; // abs
+                case 4: { // (zp),Y
+                    uint16_t base = (uint16_t)(peek_cpu(bytes[1], cpu_port) |
+                        (peek_cpu((uint8_t)(bytes[1] + 1), cpu_port) << 8));
+                    addr = (uint16_t)(base + next.y);
+                    has_addr = true;
+                    break;
+                }
+                case 5: addr = (uint8_t)(bytes[1] + next.x); has_addr = true; break; // zp,X
+                case 6: addr = (uint16_t)((bytes[1] | (bytes[2] << 8)) + next.y); has_addr = true; break; // abs,Y
+                case 7: addr = (uint16_t)((bytes[1] | (bytes[2] << 8)) + next.x); has_addr = true; break; // abs,X
+                default: break;
+            }
+            if (!has_addr && !is_imm) {
+                return DBG_NOT_SUPPORTED;
+            }
+            uint8_t aaa = (uint8_t)(op >> 5);
+            if (aaa == 4) { // STA
+                if (is_imm) return DBG_NOT_SUPPORTED;
+                poke_cpu(addr, next.a, cpu_port);
+                goto done;
+            }
+            uint8_t m = is_imm ? imm : peek_cpu(addr, cpu_port);
+            switch (aaa) {
+                case 0: next.a = (uint8_t)(next.a | m); set_nz(&next.sr, next.a); goto done; // ORA
+                case 1: next.a = (uint8_t)(next.a & m); set_nz(&next.sr, next.a); goto done; // AND
+                case 2: next.a = (uint8_t)(next.a ^ m); set_nz(&next.sr, next.a); goto done; // EOR
+                case 3: alu_adc(&next, m); goto done;                                        // ADC
+                case 5: next.a = m; set_nz(&next.sr, next.a); goto done;                     // LDA
+                case 6: alu_compare(&next.sr, next.a, m); goto done;                         // CMP
+                case 7: alu_sbc(&next, m); goto done;                                        // SBC
+                default: return DBG_NOT_SUPPORTED;
+            }
+        }
+
+        if (cc == 0x02) { // cc=10: ASL ROL LSR ROR STX LDX DEC INC (zp/abs[,X|,Y])
+            uint8_t aaa = (uint8_t)(op >> 5);
+            switch (bbb) {
+                case 0: // # (LDX only)
+                    if (aaa == 5) {
+                        next.x = bytes[1];
+                        set_nz(&next.sr, next.x);
+                        goto done;
+                    }
+                    return DBG_NOT_SUPPORTED;
+                case 1: addr = bytes[1]; has_addr = true; break;        // zp
+                case 3: addr = (uint16_t)(bytes[1] | (bytes[2] << 8)); has_addr = true; break; // abs
+                case 5: // zp,X (zp,Y for STX/LDX)
+                    addr = (aaa == 4 || aaa == 5) ?
+                        (uint8_t)(bytes[1] + next.y) : (uint8_t)(bytes[1] + next.x);
+                    has_addr = true;
+                    break;
+                case 7: // abs,X (abs,Y for LDX)
+                    addr = (aaa == 5) ?
+                        (uint16_t)((bytes[1] | (bytes[2] << 8)) + next.y) :
+                        (uint16_t)((bytes[1] | (bytes[2] << 8)) + next.x);
+                    has_addr = true;
+                    break;
+                default:
+                    return DBG_NOT_SUPPORTED;
+            }
+            if (!has_addr) {
+                return DBG_NOT_SUPPORTED;
+            }
+            if (aaa == 4) { // STX
+                poke_cpu(addr, next.x, cpu_port);
+                goto done;
+            }
+            if (aaa == 5) { // LDX
+                next.x = peek_cpu(addr, cpu_port);
+                set_nz(&next.sr, next.x);
+                goto done;
+            }
+            uint8_t m = peek_cpu(addr, cpu_port);
+            switch (aaa) {
+                case 0: // ASL
+                    set_flag(&next.sr, SR_C, (m & 0x80) != 0);
+                    m = (uint8_t)(m << 1);
+                    break;
+                case 1: { // ROL
+                    uint8_t c = (uint8_t)((next.sr & SR_C) ? 1 : 0);
+                    set_flag(&next.sr, SR_C, (m & 0x80) != 0);
+                    m = (uint8_t)((m << 1) | c);
+                    break;
+                }
+                case 2: // LSR
+                    set_flag(&next.sr, SR_C, (m & 0x01) != 0);
+                    m = (uint8_t)(m >> 1);
+                    break;
+                case 3: { // ROR
+                    uint8_t c = (uint8_t)((next.sr & SR_C) ? 0x80 : 0);
+                    set_flag(&next.sr, SR_C, (m & 0x01) != 0);
+                    m = (uint8_t)((m >> 1) | c);
+                    break;
+                }
+                case 6: m = (uint8_t)(m - 1); break; // DEC
+                case 7: m = (uint8_t)(m + 1); break; // INC
+                default: return DBG_NOT_SUPPORTED;
+            }
+            set_nz(&next.sr, m);
+            poke_cpu(addr, m, cpu_port);
+            goto done;
+        }
+
+        if (cc == 0x00) { // cc=00: BIT STY LDY CPY CPX (subset of modes)
+            uint8_t aaa = (uint8_t)(op >> 5);
+            switch (bbb) {
+                case 0: // # (LDY/CPY/CPX)
+                    imm = bytes[1];
+                    is_imm = true;
+                    break;
+                case 1: addr = bytes[1]; has_addr = true; break;        // zp
+                case 3: addr = (uint16_t)(bytes[1] | (bytes[2] << 8)); has_addr = true; break; // abs
+                case 5: addr = (uint8_t)(bytes[1] + next.x); has_addr = true; break; // zp,X
+                case 7: addr = (uint16_t)((bytes[1] | (bytes[2] << 8)) + next.x); has_addr = true; break; // abs,X
+                default:
+                    return DBG_NOT_SUPPORTED;
+            }
+            switch (aaa) {
+                case 1: { // BIT (zp/abs only)
+                    if (!has_addr || (bbb != 1 && bbb != 3)) return DBG_NOT_SUPPORTED;
+                    uint8_t m = peek_cpu(addr, cpu_port);
+                    set_flag(&next.sr, SR_Z, (uint8_t)(next.a & m) == 0);
+                    set_flag(&next.sr, SR_N, (m & 0x80) != 0);
+                    set_flag(&next.sr, SR_V, (m & 0x40) != 0);
+                    goto done;
+                }
+                case 4: // STY (zp, abs, zp,X)
+                    if (!has_addr || bbb == 7) return DBG_NOT_SUPPORTED;
+                    poke_cpu(addr, next.y, cpu_port);
+                    goto done;
+                case 5: // LDY
+                    next.y = is_imm ? imm : peek_cpu(addr, cpu_port);
+                    set_nz(&next.sr, next.y);
+                    goto done;
+                case 6: // CPY (#, zp, abs)
+                    if (has_addr && (bbb == 5 || bbb == 7)) return DBG_NOT_SUPPORTED;
+                    alu_compare(&next.sr, next.y,
+                                is_imm ? imm : peek_cpu(addr, cpu_port));
+                    goto done;
+                case 7: // CPX (#, zp, abs)
+                    if (has_addr && (bbb == 5 || bbb == 7)) return DBG_NOT_SUPPORTED;
+                    alu_compare(&next.sr, next.x,
+                                is_imm ? imm : peek_cpu(addr, cpu_port));
+                    goto done;
+                default:
+                    return DBG_NOT_SUPPORTED;
+            }
+        }
+    }
+    return DBG_NOT_SUPPORTED;
+
+done:
     next.pc = pred.fall_through;
     *out = next;
     last_context = next;
     has_last_context = true;
+    return DBG_OK;
+}
+
+bool BrkDebugSession :: step_bank_is_ram_under_rom(uint16_t addr,
+                                                   uint8_t cpu_port) const
+{
+    return monitor_backing_store_for_cpu_port(addr, cpu_port) ==
+               MONITOR_BACKING_RAM &&
+           monitor_backing_store_for_cpu_port(addr, 0x07) !=
+               MONITOR_BACKING_RAM;
+}
+
+bool BrkDebugSession :: step_bank_fetch_unreliable(uint16_t addr,
+                                                   uint8_t cpu_port) const
+{
+    if (monitor_backing_store_is_visible_rom(
+            monitor_backing_store_for_cpu_port(addr, cpu_port))) {
+        return true;
+    }
+    return step_bank_is_ram_under_rom(addr, cpu_port);
+}
+
+static bool branch_taken_6502(uint8_t opcode, uint8_t sr)
+{
+    uint8_t flag;
+    switch (opcode & 0xC0) {
+        case 0x00: flag = (uint8_t)(sr & 0x80); break;  // BPL/BMI test N
+        case 0x40: flag = (uint8_t)(sr & 0x40); break;  // BVC/BVS test V
+        case 0x80: flag = (uint8_t)(sr & 0x01); break;  // BCC/BCS test C
+        default:   flag = (uint8_t)(sr & 0x02); break;  // BNE/BEQ test Z
+    }
+    return (flag != 0) == ((opcode & 0x20) != 0);
+}
+
+// Complete a control-flow single step by computing its architectural effects
+// while the CPU stays parked in the debug spin loop, instead of releasing the
+// live CPU into a bank whose instruction fetches can lag DMA-committed bytes.
+//
+// Rationale: the U64 slot aperture serves fetches from a registered latch that
+// is not invalidated by firmware DMA writes, so a landing BRK freshly planted
+// in RAM-under-ROM (or in visible ROM during a short step window) is not
+// reliably observed on the first fetches after a release. JMP/branch/JSR/RTS/
+// RTI have exact architectural semantics - PC, SP, SR, and $01xx stack bytes
+// only - so with a parked context the step needs no live execution at all:
+// every resume path rebuilds the full register file including SP from the
+// context (TXS in the spin trampoline / resume stub), and the stack bytes are
+// written through the always-coherent DMA path the breakpoint engine already
+// relies on in low RAM. Flags are untouched by all of these except RTI, which
+// pulls SR from the stack, so no ALU emulation is involved.
+//
+// Applies only when the launch site or a landing address is in such a bank;
+// plain-RAM steps keep running the live CPU. Returns DBG_NOT_SUPPORTED when
+// not applicable so the caller falls through to the real-run path. A JSR
+// stepped over (not into) must really run its callee and stays on the
+// breakpoint+Go path, whose fall-through BRK is observed after a sustained
+// run.
+DebugSession::Result BrkDebugSession :: emulate_control_flow_step(
+    const DebugContext *from, uint16_t start_pc,
+    const DebugPredictResult &pred, bool prefer_jsr_target,
+    DebugContext *out, uint8_t cpu_port, bool force,
+    const uint8_t *insn_bytes)
+{
+    if (!from || !from->valid || !out || !cpu_parked_in_spin) {
+        return DBG_NOT_SUPPORTED;
+    }
+    // Instruction and vector bytes must come through read_step_bytes: while
+    // the machine is held by the freezer, the live aperture (read_patch_byte
+    // -> peek_cpu) does not serve BASIC/KERNAL for ROM addresses, so a raw
+    // re-read returns freezer-cart garbage. read_step_bytes prefers the
+    // monitor ROM cache and stays truthful in every UI mode.
+    uint8_t fetched[3];
+    if (!insn_bytes) {
+        if (!read_step_bytes(start_pc, fetched, 3)) {
+            return DBG_NOT_SUPPORTED;
+        }
+        insn_bytes = fetched;
+    }
+    DebugContext next = *from;
+    bool launch_unreliable = force ||
+        step_bank_fetch_unreliable(start_pc, cpu_port);
+    bool push_traced_return = false;
+    bool pop_traced_return = false;
+    switch (pred.kind) {
+        case DBG_PREDICT_JMP_ABS: {
+            if (!pred.has_target) {
+                return DBG_NOT_SUPPORTED;
+            }
+            if (!launch_unreliable &&
+                    !step_bank_fetch_unreliable(pred.branch_target, cpu_port)) {
+                return DBG_NOT_SUPPORTED;
+            }
+            next.pc = pred.branch_target;
+            break;
+        }
+        case DBG_PREDICT_JMP_IND: {
+            uint16_t op = (uint16_t)(insn_bytes[1] | (insn_bytes[2] << 8));
+            // NMOS 6502 JMP ($xxFF) wraps the vector high byte within the page.
+            uint16_t op_hi = (uint16_t)((op & 0xFF00) | ((op + 1) & 0x00FF));
+            uint8_t vec_lo = 0, vec_hi = 0;
+            if (!read_step_bytes(op, &vec_lo, 1) ||
+                    !read_step_bytes(op_hi, &vec_hi, 1)) {
+                return DBG_NOT_SUPPORTED;
+            }
+            uint16_t target = (uint16_t)(vec_lo | (vec_hi << 8));
+            if (!launch_unreliable &&
+                    !step_bank_fetch_unreliable(target, cpu_port)) {
+                return DBG_NOT_SUPPORTED;
+            }
+            next.pc = target;
+            break;
+        }
+        case DBG_PREDICT_BRANCH: {
+            if (!pred.has_target) {
+                return DBG_NOT_SUPPORTED;
+            }
+            if (!launch_unreliable &&
+                    !step_bank_fetch_unreliable(pred.fall_through, cpu_port) &&
+                    !step_bank_fetch_unreliable(pred.branch_target, cpu_port)) {
+                return DBG_NOT_SUPPORTED;
+            }
+            next.pc = branch_taken_6502(insn_bytes[0], next.sr) ?
+                pred.branch_target : pred.fall_through;
+            break;
+        }
+        case DBG_PREDICT_JSR: {
+            // Only a Step Into consumes the JSR itself; a Step Over's callee
+            // really runs (free-run or parked walk).
+            if (!prefer_jsr_target || !pred.has_target) {
+                return DBG_NOT_SUPPORTED;
+            }
+            if (!launch_unreliable &&
+                    !step_bank_fetch_unreliable(pred.branch_target, cpu_port)) {
+                return DBG_NOT_SUPPORTED;
+            }
+            // JSR pushes the address of its own third byte; RTS pulls it and
+            // adds one. Write the real stack bytes so a later free-running RTS
+            // (or Step Out) pulls exactly what an undebugged run would see.
+            uint16_t ret = (uint16_t)(start_pc + 2);
+            poke_cpu((uint16_t)(0x0100 + next.sp), (uint8_t)(ret >> 8),
+                     cpu_port);
+            poke_cpu((uint16_t)(0x0100 + ((next.sp - 1) & 0xFF)),
+                     (uint8_t)(ret & 0xFF), cpu_port);
+            next.sp = (uint8_t)(next.sp - 2);
+            next.pc = pred.branch_target;
+            push_traced_return = true;
+            break;
+        }
+        case DBG_PREDICT_RTS: {
+            uint16_t sp1 = (uint16_t)(0x0100 + ((next.sp + 1) & 0xFF));
+            uint16_t sp2 = (uint16_t)(0x0100 + ((next.sp + 2) & 0xFF));
+            uint16_t ret = (uint16_t)(peek_cpu(sp1, cpu_port) |
+                                      (peek_cpu(sp2, cpu_port) << 8));
+            uint16_t target = (uint16_t)(ret + 1);
+            if (!launch_unreliable &&
+                    !step_bank_fetch_unreliable(target, cpu_port)) {
+                return DBG_NOT_SUPPORTED;
+            }
+            // Same active-frame guard as the real-run path: without a traced
+            // Step Into frame, reject stale/forged stack targets early. A
+            // forced walk executes stack truth like the real CPU (KERNAL and
+            // BASIC use push-address-then-RTS dispatch, which has no JSR at
+            // the caller side).
+            uint16_t traced_target;
+            if (!force && !peek_return_target(&traced_target)) {
+                uint16_t caller = (uint16_t)(ret - 2);
+                uint8_t caller_byte = 0;
+                if (!read_step_bytes(caller, &caller_byte, 1) ||
+                        caller_byte != 0x20) {
+                    return DBG_NOT_IN_SUBROUTINE;
+                }
+            }
+            next.sp = (uint8_t)(next.sp + 2);
+            next.pc = target;
+            pop_traced_return = true;
+            break;
+        }
+        case DBG_PREDICT_RTI: {
+            uint16_t sp1 = (uint16_t)(0x0100 + ((next.sp + 1) & 0xFF));
+            uint16_t sp2 = (uint16_t)(0x0100 + ((next.sp + 2) & 0xFF));
+            uint16_t sp3 = (uint16_t)(0x0100 + ((next.sp + 3) & 0xFF));
+            uint16_t target = (uint16_t)(peek_cpu(sp2, cpu_port) |
+                                         (peek_cpu(sp3, cpu_port) << 8));
+            if (!launch_unreliable &&
+                    !step_bank_fetch_unreliable(target, cpu_port)) {
+                return DBG_NOT_SUPPORTED;
+            }
+            // RTI pulls SR then PC. B does not exist in the register; keep the
+            // stored SR normalized the way captured contexts are (U set).
+            next.sr = (uint8_t)((peek_cpu(sp1, cpu_port) | 0x20) & ~0x10);
+            next.sp = (uint8_t)(next.sp + 3);
+            next.pc = target;
+            pop_traced_return = true;
+            break;
+        }
+        default:
+            return DBG_NOT_SUPPORTED;
+    }
+    if (push_traced_return) {
+        push_return_target(pred.fall_through);
+    }
+    if (pop_traced_return) {
+        pop_return_target(next.pc);
+    }
+    *out = next;
+    last_context = next;
+    has_last_context = true;
+    return DBG_OK;
+}
+
+// True when a free-run leg (Step Over callee, Step Out unwind) would have to
+// launch or land in visible ROM. Those runs are unreliable on fetch-lagging
+// hardware: the freezer path cannot settle the ROM fetch at all, and the
+// overlay path intermittently derails on the first callee fetches. Plain-RAM
+// and RAM-under-ROM free runs stay on the (validated) live path.
+bool BrkDebugSession :: frozen_rom_run_unreliable(uint16_t launch_pc,
+                                                  uint16_t landing_pc,
+                                                  bool landing_valid,
+                                                  uint8_t cpu_port)
+{
+    if (!visible_rom_fetch_lags() || !cpu_parked_in_spin) {
+        return false;
+    }
+    if (monitor_backing_store_is_visible_rom(
+            monitor_backing_store_for_cpu_port(launch_pc, cpu_port))) {
+        return true;
+    }
+    return landing_valid && monitor_backing_store_is_visible_rom(
+        monitor_backing_store_for_cpu_port(landing_pc, cpu_port));
+}
+
+// Walk a parked context forward one instruction at a time until it reaches
+// stop_pc in the same stack frame (stop_sp), without ever free-running the
+// CPU through a fetch-lagging bank: control flow is completed architecturally
+// (emulate_control_flow_step, forced) and every other instruction executes for
+// real from the plain-RAM trampoline. This is the deterministic replacement
+// for the free-run legs of Step Over and Step Out when they would launch or
+// land in visible ROM.
+//
+// The walk stops early - reporting the truthful parked context, never a stale
+// one, because stack bytes and trampoline side effects are already committed -
+// when it reaches an enabled breakpoint, an unsteppable opcode (BRK/illegal),
+// a step primitive fails, or the budget runs out. The caller surfaces the
+// context wherever the walk stopped; the E2E oracles flag a wrong endpoint.
+DebugSession::Result BrkDebugSession :: parked_step_walk(
+    const DebugContext &start, uint16_t stop_pc, uint8_t stop_sp,
+    const MonitorBreakpoints *bps, uint16_t skip_breakpoint_address,
+    bool skip_breakpoint_address_valid, DebugContext *out, uint8_t cpu_port)
+{
+    // Interpreted steps are a couple of DMA accesses each (~ms), so this
+    // covers real KERNAL/BASIC helpers - including state-dependent loops like
+    // the FAC normalize - within a few seconds. A callee that legitimately
+    // runs longer stops mid-way with the truthful walked context and can be
+    // continued with another Over/Out/Go.
+    static const int PARKED_STEP_WALK_BUDGET = 8192;
+    if (!out) {
+        return DBG_REFUSED;
+    }
+    DebugContext cur = start;
+    for (int i = 0; i < PARKED_STEP_WALK_BUDGET; i++) {
+        if (cur.pc == stop_pc && cur.sp == stop_sp) {
+            *out = cur;
+            return DBG_OK;
+        }
+        uint8_t port = execution_cpu_port(&cur);
+        MonitorBackingStore skip_target = monitor_backing_store_for_cpu_port(
+            skip_breakpoint_address, port);
+        if (context_at_breakpoint(cur, bps, skip_breakpoint_address,
+                                  skip_target, skip_breakpoint_address_valid,
+                                  true)) {
+            *out = cur;
+            return DBG_OK;
+        }
+        // read_step_bytes, not the raw live aperture: under the freezer the
+        // aperture does not serve BASIC/KERNAL for ROM addresses.
+        uint8_t bytes[3];
+        if (!read_step_bytes(cur.pc, bytes, 3)) {
+            *out = cur;
+            return (i > 0) ? DBG_OK : DBG_NOT_SUPPORTED;
+        }
+        DebugPredictResult pred;
+        debug_predict(cur.pc, bytes, false, &pred);
+        if (pred.kind == DBG_PREDICT_BRK || pred.kind == DBG_PREDICT_UNSAFE) {
+            *out = cur;
+            return (i > 0) ? DBG_OK : DBG_REFUSED;
+        }
+        DebugContext next;
+        Result r;
+        if (pred.kind == DBG_PREDICT_LINEAR) {
+            r = interpret_simple_linear(&cur, cur.pc, pred, &next, port, bytes);
+            if (r != DBG_OK) {
+                r = step_linear_via_trampoline(&cur, cur.pc, pred, &next, port,
+                                               bytes);
+            }
+        } else {
+            r = emulate_control_flow_step(&cur, cur.pc, pred, true, &next,
+                                          port, true, bytes);
+        }
+        if (r != DBG_OK || !next.valid) {
+            *out = cur;
+            return (i > 0) ? DBG_OK : r;
+        }
+        cur = next;
+    }
+    *out = cur;
     return DBG_OK;
 }
 
@@ -1661,17 +2247,49 @@ DebugSession::Result BrkDebugSession :: step_with_predict(
     if (pred.kind == DBG_PREDICT_UNSAFE || pred.kind == DBG_PREDICT_BRK) {
         return DBG_REFUSED;
     }
-    // NOTE: stepping into a visible-ROM JSR must run the real 6510 so the JSR
-    // pushes its return address and decrements the real stack pointer. A pure
-    // context-simulation (which only moves the cached SP) leaves the live SP
-    // un-decremented, so a later RTS pulls the wrong slot and either returns to
-    // the wrong address or never reaches its breakpoint (DEBUG TIMEOUT). The
-    // linear fast-paths below are safe because they never change SP.
-    // Avoid stale visible-ROM fetches by running linear instructions from RAM.
+    // Fetch-lagging hardware (U64): a step whose launch site or landing BRK
+    // sits in visible ROM or in RAM under a ROM window must not depend on the
+    // live CPU fetching a freshly-committed byte right after a release. With a
+    // parked context, control-flow instructions are completed architecturally
+    // without running the CPU at all (see emulate_control_flow_step). Context
+    // mutation is safe ONLY while parked: every parked resume rebuilds the
+    // full register file including SP. A non-parked launch (NMI redirect)
+    // keeps the live registers, so a context-only simulation there would
+    // desync the live SP and a later RTS would mispull (DEBUG TIMEOUT).
+    if (out && visible_rom_fetch_lags()) {
+        Result emulated = emulate_control_flow_step(from, start_pc, pred,
+                                                    prefer_jsr_target, out,
+                                                    cpu_port);
+        if (emulated != DBG_NOT_SUPPORTED) {
+            return emulated;
+        }
+    }
+    // Step Over of a JSR that would free-run through visible ROM: enter the
+    // callee architecturally and walk it while parked instead of releasing
+    // the live CPU into the fetch-lagging aperture.
+    if (pred.kind == DBG_PREDICT_JSR && !prefer_jsr_target && out &&
+            from && from->valid && pred.has_target &&
+            frozen_rom_run_unreliable(start_pc, pred.branch_target, true,
+                                      cpu_port)) {
+        DebugContext entered;
+        Result r = emulate_control_flow_step(from, start_pc, pred, true,
+                                             &entered, cpu_port, true);
+        if (r == DBG_OK && entered.valid) {
+            return parked_step_walk(entered, pred.fall_through, from->sp,
+                                    bps, skip_breakpoint_address,
+                                    skip_breakpoint_address_valid, out,
+                                    cpu_port);
+        }
+    }
+    // Linear instructions never change SP/PC beyond the fall-through: run them
+    // from a plain-RAM trampoline copy (or interpret the simple ones) instead
+    // of fetching them through a lagging launch bank.
     if (pred.kind == DBG_PREDICT_LINEAR && out &&
-            visible_rom_fetch_lags() && !debug_owner.remote &&
-            monitor_backing_store_is_visible_rom(
-                monitor_backing_store_for_cpu_port(start_pc, cpu_port))) {
+            visible_rom_fetch_lags() &&
+            ((!debug_owner.remote &&
+              monitor_backing_store_is_visible_rom(
+                  monitor_backing_store_for_cpu_port(start_pc, cpu_port))) ||
+             step_bank_is_ram_under_rom(start_pc, cpu_port))) {
         if (allow_linear_interpret) {
             Result interpreted = interpret_simple_linear(from, start_pc, pred, out,
                                                          cpu_port, linear_step_bytes);
@@ -1854,6 +2472,23 @@ DebugSession::Result BrkDebugSession :: step_out(const DebugContext &from,
     uint16_t target;
     if (!peek_return_target(&target)) {
         return DBG_NOT_IN_SUBROUTINE;
+    }
+    // A Step Out that would free-run through visible ROM (launch or return
+    // site) walks the remainder of the frame while parked instead of
+    // releasing the live CPU into the fetch-lagging aperture.
+    if (frozen_rom_run_unreliable(from.pc, target, true, cpu_port)) {
+        Result walked = parked_step_walk(from, target,
+                                         (uint8_t)(from.sp + 2), bps,
+                                         from.pc, true, ctx, cpu_port);
+        if (walked == DBG_OK && ctx->valid && ctx->pc == target) {
+            pop_return_target(target);
+        }
+        // An early stop (breakpoint hit, unsteppable opcode, budget) already
+        // advanced the real machine state - stack bytes and data side effects
+        // are committed - so the walked context is the truth and MUST be
+        // adopted; reporting a failure here would leave the monitor's cached
+        // context stale against the parked CPU.
+        return walked;
     }
     // Run the real 6510 out to the caller (breakpoint at the return target)
     // rather than simulating the RTS: a simulated RTS only adjusts the cached

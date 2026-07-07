@@ -23,12 +23,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 REDEPLOY_SCRIPT = REPO_ROOT / "tooling" / "build_and_deploy_u64.sh"
 
 STATUS_LINE_RE = re.compile(r"(?:CPU[0-7]|C[0-7]O[0-7]) \$A:(?:RAM|BAS) \$D:(?:RAM|CHR|I/O) \$E:(?:RAM|KRN) VIC[0-3] \$[0-9A-F]{4}")
-# In Debug, when the debug PC's exec bank maps RAM under what $07 serves as ROM,
-# the footer replaces the $A/$D/$E banking detail with a best-effort warning line
-# (intentional; RAM-under-ROM single-step is unreliable). It still reports the
-# live CPU bank (CPUn when live==view, CnOm when live!=view), so the suites must
-# recognise it as a valid status line and read the live bank from it.
-RAM_UNDER_ROM_STATUS_RE = re.compile(r"(?:CPU[0-7]|C[0-7]O[0-7]) ! RAM-under-ROM step VIC[0-3]")
 # U2 cartridge backend has no monitor-side CPU banking or VIC bank selection,
 # so the status line collapses to a fixed "no banking" label.
 U2_STATUS_LINE_RE = re.compile(r"CPU VIEW\s+CPU BANK N/A\s+VIC N/A")
@@ -282,8 +276,7 @@ class Snapshot:
 
     def find_status_line(self) -> int:
         for index, line in enumerate(self.lines):
-            if (STATUS_LINE_RE.search(line) or U2_STATUS_LINE_RE.search(line)
-                    or RAM_UNDER_ROM_STATUS_RE.search(line)):
+            if STATUS_LINE_RE.search(line) or U2_STATUS_LINE_RE.search(line):
                 return index
         raise Failure(
             f"Snapshot mismatch after {self.last_command}: no CPU/VIC status line found\n{self.text()}"
@@ -832,17 +825,7 @@ def parse_text_row(snapshot: Snapshot, address: int, line_index: Optional[int] =
     )
 
 
-def _status_line_live_bank(line: str):
-    """Return the live CPU bank from a status line (full or RAM-under-ROM warning)."""
-    match = re.search(r"\bCPU([0-7])\b|\bC([0-7])O[0-7]\b", line)
-    if not match:
-        return None
-    return int(match.group(1) if match.group(1) is not None else match.group(2))
-
-
 def ensure_status(session: MonitorSession, expected: str) -> Snapshot:
-    expected_bank_match = re.match(r"CPU([0-7])", expected)
-    expected_bank = int(expected_bank_match.group(1)) if expected_bank_match else None
     screen = session.capture()
     for _ in range(8):
         try:
@@ -852,14 +835,6 @@ def ensure_status(session: MonitorSession, expected: str) -> Snapshot:
         if line_index >= 0:
             line = screen.line(line_index)
             if expected in line:
-                return screen
-            # In Debug at a RAM-under-ROM PC the footer shows the best-effort
-            # warning line in place of the $A/$D/$E banking detail. It still
-            # reports the live CPU bank, which is the banking fact these checks
-            # assert, so accept it when the requested CPU bank matches.
-            if (expected_bank is not None
-                    and RAM_UNDER_ROM_STATUS_RE.search(line)
-                    and _status_line_live_bank(line) == expected_bank):
                 return screen
         screen = session.send_char("o")
     raise Failure(

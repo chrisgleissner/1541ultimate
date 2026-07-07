@@ -563,14 +563,26 @@ int C64_Subsys :: dma_load_raw(File *f)
 
 int C64_Subsys :: dma_load_raw_buffer(uint16_t offset, uint8_t *buffer, int length, int rw)
 {
+    // A raw DMA transfer is a pure memory access; it must not kick a
+    // C64-hosted UI (the freezer menu/monitor) off the machine. Releasing the
+    // host here - copied from the PRG-load path, which hands the machine back
+    // on purpose - tore down the freeze monitor whenever the REST
+    // readmem/writemem routes ran while it was open. The transfer only needs
+    // the bus, so a stop/resume bracket is sufficient.
     bool i_stopped_it = false;
-    if (c64->client) {
-        c64->client->release_host(); // disconnect from user interface
-        c64->release_ownership();
-    }
     if(!c64->is_stopped()) {
         c64->stop(false);
         i_stopped_it = true;
+    }
+
+    // While the freezer menu holds the machine, the DMA window follows the
+    // freezer cartridge's banking, so a plain copy would read/write the cart
+    // aperture instead of RAM for most of the address space. Force the
+    // memory-only view (the same one the frozen monitor uses) so a raw
+    // transfer is always plain RAM.
+    uint8_t saved_memonly = C64_DMA_MEMONLY;
+    if (c64->isFrozen) {
+        C64_DMA_MEMONLY = 1;
     }
 
     volatile uint8_t *dest = (volatile uint8_t *)(C64_MEMORY_BASE + offset);
@@ -580,6 +592,8 @@ int C64_Subsys :: dma_load_raw_buffer(uint16_t offset, uint8_t *buffer, int leng
     } else {
         memcpy((void *)dest, buffer, length);
     }
+
+    C64_DMA_MEMONLY = saved_memonly;
 
     if (i_stopped_it) {
         c64->resume();

@@ -84,7 +84,7 @@ void debug_context_reset(DebugContext *ctx)
 }
 
 MonitorDebug :: MonitorDebug()
-    : active(false), experimental(false)
+    : active(false)
 {
     debug_context_reset(&ctx);
 }
@@ -92,7 +92,6 @@ MonitorDebug :: MonitorDebug()
 void MonitorDebug :: enter(void)
 {
     active = true;
-    experimental = false;
 }
 
 void MonitorDebug :: leave(void)
@@ -100,7 +99,6 @@ void MonitorDebug :: leave(void)
     active = false;
     // Leaving Debug mode does not invalidate the cached context: returning to
     // Debug should show the same numbers until execution resumes.
-    experimental = false;
 }
 
 void MonitorDebug :: invalidate_context(void)
@@ -166,7 +164,6 @@ int MonitorDebug :: format_help_lines(const char *lines[], int max_lines)
         "D Step Over  T Step Into  U Step Out",
         "G Continue   K Cont Crsr  RET Follow",
         "R Breakpt    C=+R Brkpts  C=+X Reset",
-        "X Dbg/DbX    DbX is experimental",
         "",
         "M Memory     I ASCII      V Screen",
         "A Assembly   B Binary     O CPU Bank",

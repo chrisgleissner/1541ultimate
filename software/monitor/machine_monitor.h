@@ -27,11 +27,12 @@ enum MachineMonitorView {
 };
 
 // Central Debug step chooser. Before any Debug execution command runs, the
-// monitor classifies it so normal Dbg uses a direct step where that is known to
-// work, completes a Step Over through breakpoint+Go where a direct step into
-// the called routine would be flaky, and stops with a clear one-line alert only
-// when neither is safe. DbX (experimental Debug) may additionally run the
-// direct test steps that normal Dbg refuses.
+// monitor classifies it. With a parked context every step is a direct step:
+// the session completes steps in fetch-lagging banks (RAM under ROM, visible
+// ROM) without releasing the CPU into them (architectural emulation of
+// control flow, plain-RAM trampoline for linear ops), so no bank needs an
+// experimental mode. The only stop left is a Step Into in such a bank without
+// a parked context, where no authoritative register file exists to step from.
 enum DebugStepOp {
     DEBUG_OP_OVER = 0,    // Step Over (D)
     DEBUG_OP_TRACE,       // Trace / Step Into (T)
@@ -50,10 +51,8 @@ enum DebugStepSource {
 };
 
 enum DebugStepPlan {
-    DEBUG_PLAN_DIRECT = 0,    // normal Dbg: run the direct step
-    DEBUG_PLAN_BREAKPOINT_GO, // normal Dbg: complete via a temporary breakpoint+Go
-    DEBUG_PLAN_STOP,          // normal Dbg: no safe way; stop and show the alert
-    DEBUG_PLAN_DBX_TEST       // DbX only: run the direct test step
+    DEBUG_PLAN_DIRECT = 0,    // run the step
+    DEBUG_PLAN_STOP           // no safe way; stop and show the alert
 };
 
 struct DebugStepDecision {
@@ -64,14 +63,7 @@ struct DebugStepDecision {
 
 // Pure classifier. Host-testable with no machine access.
 DebugStepDecision debug_classify_step(DebugStepOp op, DebugStepSource src,
-                                      bool ui_freeze, bool dbx,
-                                      bool rom_image_changed, bool over_target_flaky);
-
-// Process-lifetime "ROM image changed" latch (see machine_monitor.cc for the
-// full rationale). While set, normal Dbg refuses visible-ROM single stepping.
-bool monitor_rom_image_changed(void);
-void monitor_set_rom_image_changed(void);
-void monitor_clear_rom_image_changed(void);
+                                      bool ui_freeze, bool have_parked_context);
 
 enum MonitorScreenCharset {
     MONITOR_SCREEN_CHARSET_UPPER_GRAPHICS = 0,
@@ -301,8 +293,8 @@ class MachineMonitor : public UIObject
     bool breakpoint_popup_active;
     uint8_t breakpoint_selected;
     // One-line transient Debug status/alert shown on the bottom row while Debug
-    // is active (DbX toggle, breakpoint+Go note, refusals). Single line, kept to
-    // the 38-column alert budget. Cleared at the start of the next Debug action.
+    // is active (refusals, notes). Single line, kept to the 38-column alert
+    // budget. Cleared at the start of the next Debug action.
     char debug_status_text[40];
     bool debug_status_visible;
     bool bookmark_popup_active;
@@ -421,21 +413,15 @@ class MachineMonitor : public UIObject
     void debug_request_out(void);
     void debug_request_go(void);
     void debug_request_cursor(void);
-    void debug_toggle_dbx(void);
     void debug_show_status(const char *message);
     void debug_clear_status(void);
     DebugStepSource debug_step_source(uint16_t pc, uint8_t cpu_port) const;
     uint8_t debug_exec_cpu_port(const DebugContext *from) const;
-    bool debug_over_target_flaky(const struct DebugPredictResult &pred,
-                                 uint8_t cpu_port) const;
     // Resolve the step chooser for the operation at start_pc. Returns true when
-    // the caller may proceed to run the operation (DIRECT/BREAKPOINT_GO/DBX);
-    // false when the operation was stopped with an alert and must not run. On a
-    // proceed, *is_dbx_test reports whether this is a DbX test step.
+    // the caller may proceed to run the operation; false when the operation was
+    // stopped with an alert and must not run.
     bool debug_resolve_step(DebugStepOp op, uint16_t start_pc,
-                            const struct DebugPredictResult &pred,
-                            DebugContext *from, bool *is_dbx_test,
-                            bool *info_breakpoint_go);
+                            DebugContext *from);
     bool debug_has_breakpoint(void) const;
     bool debug_has_enabled_breakpoint(void) const;
     MonitorBackingStore breakpoint_target_for_view(uint16_t address) const;
@@ -553,8 +539,7 @@ public:
     void request_debug_reset_cancel(void);
     void invalidate_live_cpu_port_view(void);
     bool is_debug_session_active(void) const;
-    // Test/inspection accessors for the Debug mode marker and transient status.
-    bool debug_is_experimental(void) const { return debug.is_experimental(); }
+    // Test/inspection accessor for the transient Debug status line.
     const char *debug_status_message(void) const {
         return debug_status_visible ? debug_status_text : "";
     }

@@ -15,8 +15,11 @@ class U64MemoryBackend : public MemoryBackend
 
     void load_monitor_char_rom_cache(C64 *machine);
     void load_monitor_rom_cache(C64 *machine);
-    bool read_monitor_rom_byte(uint16_t address, uint8_t cpu_port, uint8_t *value) const;
 public:
+    // Truthful ROM byte for an address/bank from the monitor's ROM cache.
+    // Used by the debug session whenever the live aperture cannot serve
+    // BASIC/KERNAL (the freezer's cartridge banking owns it).
+    bool read_monitor_rom_byte(uint16_t address, uint8_t cpu_port, uint8_t *value) const;
     explicit U64MemoryBackend(U64Machine *machine)
         : machine(machine), stopped_machine_for_session(false),
           observed_live_cpu_port_valid(false), observed_live_cpu_port(0x07) { }

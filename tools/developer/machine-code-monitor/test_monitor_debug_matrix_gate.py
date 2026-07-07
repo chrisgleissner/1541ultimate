@@ -81,41 +81,30 @@ class FixtureOracleSetupTest(unittest.TestCase):
         self.assertEqual(mem[0xBC00:0xBC04], bytes([0xA2, 0x06, 0xB5, 0x60]))
 
 
-class DbxScopeContractTest(unittest.TestCase):
+class AlertScopeContractTest(unittest.TestCase):
     def test_every_alert_is_single_line_and_fits_38_columns(self) -> None:
-        self.assertEqual(gate.validate_dbx_alerts(), [])
-        for alert in gate.DBX_ALERTS:
+        self.assertEqual(gate.validate_debug_alerts(), [])
+        for alert in gate.DEBUG_ALERTS:
             self.assertLessEqual(len(alert), 38, alert)
             self.assertNotIn("\n", alert)
             self.assertNotIn("\r", alert)
 
     def test_exact_canonical_alert_strings_present(self) -> None:
-        for required in (
-            "DbX: test-only stepping",
-            "Dbg: normal Debug",
-            "Dbg: Over uses breakpoint+Go",
-            "ROM image changed: reload ROM",
-            "Step Into here needs DbX",
-            "X toggles Dbg/DbX",
-        ):
-            self.assertIn(required, gate.DBX_ALERTS)
+        self.assertIn("Step Into: run to a breakpoint 1st", gate.DEBUG_ALERTS)
 
-    def test_alerts_use_no_corporate_terms(self) -> None:
-        problems = gate.validate_dbx_alerts(
-            gate.DBX_ALERTS + ("This is production mode",))
+    def test_alerts_use_no_corporate_or_dbx_terms(self) -> None:
+        problems = gate.validate_debug_alerts(
+            gate.DEBUG_ALERTS + ("This is production mode", "Use DbX here"))
         self.assertTrue(any("production" in p for p in problems))
+        self.assertTrue(any("DbX" in p for p in problems))
 
-    def test_debug_scope_text_requires_plain_status_values(self) -> None:
-        good = " ".join(gate.DBX_SCOPE_STATUS_VALUES)
-        self.assertEqual(gate.validate_debug_scope_text(good), [])
-        bad = good + " production mode"
-        self.assertTrue(gate.validate_debug_scope_text(bad))
-
-    def test_manual_text_requires_dbg_dbx_and_breakpoint_go(self) -> None:
-        good = "Dbg DbX X toggles breakpoint+Go RAM under ROM"
+    def test_manual_text_requires_dbg_and_breakpoint_go(self) -> None:
+        good = "Dbg breakpoint+Go RAM under ROM"
         self.assertEqual(gate.validate_manual_text(good), [])
         missing = "Dbg only"
         self.assertTrue(gate.validate_manual_text(missing))
+        stale = good + " DbX"
+        self.assertTrue(gate.validate_manual_text(stale))
 
 
 if __name__ == "__main__":

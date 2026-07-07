@@ -213,6 +213,17 @@ protected:
     {
         volatile uint8_t *rom = rom_patch_ptr(addr, cpu_port);
         if (rom) {
+            // While the freezer holds the machine, the live aperture serves
+            // the freezer cartridge's banking, not BASIC/KERNAL: a raw read
+            // returns garbage, and a patch "original" saved from it would be
+            // restored INTO the ROM image later (a trashed $FFFE vector was
+            // exactly the frozen-continue jiffy-death). The monitor ROM cache
+            // is the truthful frozen source.
+            uint8_t cached = 0;
+            if (machine_is_frozen() && backend &&
+                    backend->read_monitor_rom_byte(addr, cpu_port, &cached)) {
+                return cached;
+            }
             // Keep reads aligned with actual 6510 fetches. The volatile ROM
             // image pointer remains the write target only.
             return machine->peek_cpu(addr, cpu_port);

@@ -102,6 +102,7 @@ public:
     virtual void cleanup(void);
     virtual void cleanup_to_context(const DebugContext *ctx);
     virtual bool has_parked_context_handoff(void) const;
+    virtual bool has_parked_context(void) const { return cpu_parked_in_spin; }
     virtual bool read_step_bytes(uint16_t address, uint8_t *dst, uint8_t len);
     virtual void forget_context(void);
     virtual bool screen_render_target_invalidated(void) const { return screen_was_clobbered; }
@@ -266,6 +267,22 @@ private:
                                    const DebugPredictResult &pred,
                                    DebugContext *out, uint8_t cpu_port,
                                    const uint8_t *instruction_bytes = 0);
+    bool step_bank_is_ram_under_rom(uint16_t addr, uint8_t cpu_port) const;
+    bool step_bank_fetch_unreliable(uint16_t addr, uint8_t cpu_port) const;
+    Result emulate_control_flow_step(const DebugContext *from,
+                                     uint16_t start_pc,
+                                     const DebugPredictResult &pred,
+                                     bool prefer_jsr_target,
+                                     DebugContext *out, uint8_t cpu_port,
+                                     bool force = false,
+                                     const uint8_t *insn_bytes = 0);
+    bool frozen_rom_run_unreliable(uint16_t launch_pc, uint16_t landing_pc,
+                                   bool landing_valid, uint8_t cpu_port);
+    Result parked_step_walk(const DebugContext &start, uint16_t stop_pc,
+                            uint8_t stop_sp, const MonitorBreakpoints *bps,
+                            uint16_t skip_breakpoint_address,
+                            bool skip_breakpoint_address_valid,
+                            DebugContext *out, uint8_t cpu_port);
 };
 
 #endif

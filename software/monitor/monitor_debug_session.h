@@ -146,6 +146,12 @@ public:
     // backends on the existing immediate path.
     virtual bool has_parked_context_handoff(void) const { return false; }
 
+    // True while the live CPU sits parked in the backend's debug spin loop, so
+    // every resume path rebuilds the full register file (including SP) from the
+    // captured context. Only then may a step be completed by mutating the
+    // context instead of running the CPU. Non-parking backends stay false.
+    virtual bool has_parked_context(void) const { return false; }
+
     // True only when the backend can patch bytes in currently visible ROM
     // windows (e.g. U64 volatile BASIC/KERNAL/CHAR images). Backends that
     // cannot must leave this false so the shared BRK engine refuses visible
