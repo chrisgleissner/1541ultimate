@@ -676,10 +676,12 @@ instructions run from a small RAM trampoline. The result is exactly what the
 live CPU would have produced, without releasing it into the unreliable fetch
 window. Plain RAM always steps the live CPU directly.
 
-The one remaining stop: Step Into of RAM under ROM (or visible ROM while the
-UI Freeze screen is up) before any context has been captured shows
-`Step Into: run to a breakpoint 1st`. Set a breakpoint and `G` (or Step Over
-once); from then on Step Into works there too.
+The one remaining stop: before any context has been captured, Step Into of
+RAM under ROM or of visible ROM shows `Step Into: run to a breakpoint 1st`,
+and in visible ROM a Step Over of anything that is not a `JSR` shows
+`Step Over: run to a breakpoint 1st` (it is the same immediate single step
+underneath). Set a breakpoint and `G` (or Step Over a `JSR`); from then on
+every step works there too.
 
 | Key | Outside Debug | Inside Debug |
 | --- | --- | --- |
@@ -711,7 +713,7 @@ Notes:
 | Path | Stepping | Notes |
 | --- | --- | --- |
 | RAM (Telnet/Overlay/Freeze) | Live single step | Direct and reliable |
-| Visible KERNAL/BASIC ROM (Telnet/Overlay) | Live single step; control flow completed while parked | ROM image stays untouched during steps |
+| Visible KERNAL/BASIC ROM (Telnet/Overlay) | Live single step; control flow completed while parked | Needs a captured context for Step Into; ROM image stays untouched during steps |
 | Visible KERNAL/BASIC ROM (Freeze) | Completed while parked (control flow) or via RAM trampoline (other ops) | Needs a captured context for Step Into |
 | RAM under ROM | Completed while parked (control flow) or via RAM trampoline (other ops) | Needs a captured context for Step Into |
 | Step Over of a JSR | breakpoint+Go at the return site | Works in every bank; the callee really runs |
@@ -721,7 +723,9 @@ Key points:
 
 - **Step Over works in every bank.** A JSR is completed with breakpoint+Go to
   the return site (the callee really executes); everything else steps like Step
-  Into. No user-placed breakpoint is required.
+  Into, so before any context is captured a non-JSR Step Over in visible ROM
+  stops with `Step Over: run to a breakpoint 1st` just like Step Into does.
+  With a context (or over a JSR) no user-placed breakpoint is required.
 - **Step Into works in every bank once a context is captured.** In RAM under ROM
   and in visible ROM the debugger completes control-flow instructions while the
   CPU stays parked and runs other instructions from a RAM trampoline, so the
@@ -732,6 +736,14 @@ Key points:
 - Stepping never rewrites the visible ROM image; only free-run breakpoints in
   ROM patch the volatile ROM image, and those bytes are restored when the
   breakpoint is removed.
+- A stepped instruction that reads or writes `$00`/`$01` (the 6510 port)
+  always runs on the live CPU, so its banking side effect is real - stepping
+  code that flips `$01` in RAM under ROM behaves exactly like an undebugged
+  run.
+- When a step is completed while the CPU is parked, a data access to I/O is
+  performed as one clean read or write. The NMOS bus quirks (the double write
+  of a read-modify-write instruction, the dummy read on an indexed page
+  cross) are not replayed.
 - User-visible alerts are single-line and limited to 38 visible characters.
 
 ### CPU footer
@@ -765,8 +777,9 @@ There are 10 breakpoint slots:
 - Opcode rows with a breakpoint show `[BRKx]` immediately before the memory source marker, for example `[BRK0][BAS]`.
 - Breakpoints are kept in volatile RAM. They survive a `C=+X` reset and an ordinary monitor close/reopen, but power-cycling the device clears them.
 - Breakpoints refer to an address in a specific memory source. For example,`$E000 KRN` and `$E000 RAM` are distinct breakpoints and can coexist.
-- A breakpoint can be valid but invisible to the live CPU. If you see the popup `BRK <target>, CPU <current>; not mapped now`, it means the breakpoint was set in `<target>`, but the running program must first activate the relevant bank so that the breakpoint will pause the CPU.
+- A breakpoint can be valid but invisible to the live CPU. If you see the popup `BRK <target>, CPU <current>; not mapped now`, it means the breakpoint was set in `<target>`, but the running program must first activate the relevant bank so that the breakpoint will pause the CPU. The `<current>` bank reflects the machine's last known state (after a reset or the latest Debug stop); a free-running program that changes `$01` afterwards is picked up at its next Debug stop.
 - On U64, breakpoints in BASIC, KERNAL, and character ROM use temporary patches in the volatile U64 ROM image, so ROM code remains step-capable without copying ROMs into C64 RAM or writing flash.
+- Under heavy concurrent REST memory traffic, the very first pass over a freshly set ROM breakpoint reached by a `G` started without a captured context can occasionally be missed: the Go then times out cleanly (`DEBUG TIMEOUT`), the breakpoint stays armed, and retrying the `G` succeeds. Once a context has been captured, ROM breakpoints and stepping are exact.
 - RAM-under-KERNAL breakpoints work when KERNAL is banked out.
 
 `C=+R` opens the breakpoint list which offers these shortcuts (the popup help row uses abbreviated forms in parentheses to fit the line):
@@ -843,7 +856,9 @@ have to place a breakpoint by hand to get past an unsafe region:
   completed by planting a breakpoint at the return site and free-running the
   callee, following the live CPU banking. So you can Step Over a call from RAM
   into RAM under ROM or ROM and the debugger runs the entire region and stops at
-  the next instruction - no manual breakpoint required.
+  the next instruction - no manual breakpoint required. A non-JSR Step Over is
+  the same single step as Step Into underneath, so before any context is
+  captured it follows the same rule as Step Into below.
 - **Step Out**, **Go**, and **Run to cursor** are breakpoint-plus-Go primitives
   and work in every bank.
 - **Step Into** (Trace) works in every bank once a live context has been
@@ -854,8 +869,9 @@ have to place a breakpoint by hand to get past an unsafe region:
   the real stack bytes, so a later RTS or free run behaves exactly as an
   undebugged run - and executes other instructions from a small RAM trampoline.
   Before any context is captured, Step Into of those banks stops with
-  `Step Into: run to a breakpoint 1st`; run to a breakpoint (or Step Over once)
-  and continue from there.
+  `Step Into: run to a breakpoint 1st` (a non-JSR Step Over stops with
+  `Step Over: run to a breakpoint 1st`); run to a breakpoint (or Step Over a
+  JSR) and continue from there.
 
 The debugger never steps the wrong source and never leaves a hidden breakpoint
 patch behind.

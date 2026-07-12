@@ -275,6 +275,58 @@ def _enter_rom_debug_at(session: "mt.MonitorSession", address: int, marker: str,
     return snap
 
 
+def _assert_step_alert(session: "mt.MonitorSession", key: str, alert: str,
+                       context: str) -> None:
+    """Press a step key and require the one-line gated-stop alert."""
+    snap = session.send_char(key)
+    if alert not in snap.text():
+        snap = session.capture()
+    if alert not in snap.text():
+        raise mt.Failure(f"{context}: expected alert {alert!r}:\n{snap.text()}")
+
+
+def _acquire_rom_context_at(rest_host: str, session: "mt.MonitorSession",
+                            address: int, context: str) -> None:
+    """Capture a live context exactly at a ROM address.
+
+    Uses the documented breakpoint+Go flow with a RAM bootstrap so the
+    release happens in RAM and the entry BRK in the ROM image is fetched by
+    natural execution well past the post-release window (the deterministic
+    pattern the matrix gate's long bootstrap established: the very first ROM
+    fetch after a release can serve a stale byte, so the bootstrap spins in
+    RAM for ~300 cycles before jumping). One retry covers the residual
+    first-pass miss of the raw launch; the breakpoint stays armed throughout.
+    """
+    boot = 0xC5F0
+    program = bytes([
+        0xA2, 0x40,             # LDX #$40
+        0xCA,                   # DEX
+        0xD0, 0xFD,             # BNE *-1
+        0x4C, address & 0xFF, (address >> 8) & 0xFF,  # JMP target
+    ])
+    mt.write_rest_memory(rest_host, boot, program)
+    session.goto(f"{address:04X}")
+    _ensure_breakpoint_at(session, address, f"{context}: entry bp")
+    last_exc: Optional[mt.Failure] = None
+    for attempt in range(2):
+        session.goto(f"{boot:04X}")
+        session.send_char("G")
+        try:
+            _wait_for_pc(session, f"{address:04X}")
+            last_exc = None
+            break
+        except mt.Failure as exc:
+            last_exc = exc
+            # A missed first pass times out cleanly firmware-side; dismiss
+            # any DEBUG TIMEOUT popup and retry once.
+            session.send_key("ENTER")
+            time.sleep(1.0)
+    if last_exc is not None:
+        raise last_exc
+    _clear_breakpoint_at(session, address, f"{context}: entry bp clear")
+    session.goto(f"{address:04X}")
+
+
 def _assert_debug_pc(session: "mt.MonitorSession", expected_pc: int, context: str) -> dict:
     expected = f"{expected_pc:04X}"
     parsed = _wait_for_pc(session, expected)
@@ -1730,6 +1782,15 @@ def run_rom_single_step_tests(rest_host: str, session: "mt.MonitorSession") -> N
         else:
             expected_pc = 0xE000 + _instruction_length_from_row(row)
             print(f"[info] non-canonical KERNAL $E000 row selected: {row}", flush=True)
+        # Contextless visible-ROM single steps are gated: both Step Into and
+        # a non-JSR Step Over stop with one-line guidance.
+        _assert_step_alert(session, "T", "Step Into: run to a breakpoint 1st",
+                           "contextless KERNAL Step Into $E000")
+        _assert_step_alert(session, "D", "Step Over: run to a breakpoint 1st",
+                           "contextless KERNAL Step Over $E000")
+        # The documented flow: run to a breakpoint, then step normally.
+        _acquire_rom_context_at(rest_host, session, 0xE000,
+                                "KERNAL Step Into $E000")
         try:
             _step_and_assert_pc(session, "T", expected_pc, "KERNAL Step Into $E000")
         except mt.Failure:
@@ -1768,6 +1829,10 @@ def run_rom_single_step_tests(rest_host: str, session: "mt.MonitorSession") -> N
             session.goto(f"{jsr_addr:04X}")
             print(f"[info] non-canonical KERNAL JSR row selected: {row}", flush=True)
         target_pc = _jsr_target_from_row(row)
+        # Step Into needs a captured context in visible ROM; acquire it at the
+        # JSR itself through the documented breakpoint+Go flow.
+        _acquire_rom_context_at(rest_host, session, jsr_addr,
+                                f"KERNAL Step Into ${jsr_addr:04X}")
         _step_and_assert_pc(session, "T", target_pc, f"KERNAL Step Into ${jsr_addr:04X}")
         after = session.capture()
         _assert_no_debug_modal_snapshot(after, "KERNAL Step Into JSR target")
@@ -2910,6 +2975,8 @@ def run_jsr_runcursor_rts_tests(rest_host: str, session: "mt.MonitorSession") ->
                   flush=True)
             return
         _enter_rom_debug_at(session, 0xE000, "KRN", "JSR/run-cursor/RTS", "$E:KRN")
+        # Visible-ROM Step Into needs a captured context first.
+        _acquire_rom_context_at(rest_host, session, 0xE000, "JSR/run-cursor/RTS")
 
         # E000 STA $56 -> E002
         _step_and_assert_pc(session, "T", 0xE002, "step STA $56")
@@ -3009,6 +3076,8 @@ def run_exit_liveness_reentry_tests(rest_host: str, session: "mt.MonitorSession"
     with mt.check("Exit-liveness: KERNAL ROM step then natural exit stays live",
                   u2=False, u2_reason="U64 CPU-visible KERNAL ROM stepping required"):
         _enter_rom_debug_at(session, 0xE000, "KRN", "exit-liveness ROM step", "$E:KRN")
+        # Visible-ROM Step Into needs a captured context first.
+        _acquire_rom_context_at(rest_host, session, 0xE000, "exit-liveness ROM step")
         snap = session.capture()
         row = _disassembly_row(snap, 0xE000)
         _step_and_assert_pc(session, "T", 0xE000 + _instruction_length_from_row(row),

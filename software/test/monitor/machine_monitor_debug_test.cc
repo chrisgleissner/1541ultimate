@@ -20,6 +20,7 @@
 #include "monitor_file_io.h"
 #include "monitor_debug_predictor.h"
 #include "machine_monitor_test_support.h"
+#include "monitor_debug_interpreter_vectors.h"
 
 // Host stubs for monitor_io. The Debug-mode tests do not exercise file IO
 // or the live `G` handoff, but MachineMonitor still pulls these symbols in.
@@ -559,7 +560,10 @@ protected:
     virtual uint8_t peek_cpu(uint16_t a, uint8_t) { return ram[a]; }
     virtual void poke_cpu(uint16_t a, uint8_t b, uint8_t)
     {
+        // $0000/$0001 are the 6510-port RAM mirror the capture refreshes;
+        // they are never BRK patch sites, so keep them out of the counter.
         if (b == 0x00 &&
+                a > 0x0001 &&
                 a != FAKE_HARD_NMI_VECTOR_LO &&
                 a != FAKE_HARD_NMI_VECTOR_HI &&
                 a != FAKE_HARD_VECTOR_LO &&
@@ -1650,15 +1654,18 @@ static int test_debug_predictor_uses_session_bytes_over_backend_reads()
     TrackingDebugBackend backend;
     monitor_reset_saved_state();
 
-    backend.write(0xA000, 0x00);
-    backend.write(0xA001, 0x00);
-    backend.write(0xA002, 0x00);
+    // Plain-RAM cursor target: a contextless non-JSR Step Over of visible ROM
+    // is gated now, and this test is about the predictor's byte source, not
+    // banking. The backend still serves BRK bytes the session must override.
+    backend.write(0x4000, 0x00);
+    backend.write(0x4001, 0x00);
+    backend.write(0x4002, 0x00);
 
     const int keys[] = { 'J', 'A', 'D', 'D', KEY_BREAK, KEY_BREAK };
     FakeKeyboard keyboard(keys, 6);
     ui.screen = &screen;
     ui.keyboard = &keyboard;
-    ui.set_prompt("A000", 1);
+    ui.set_prompt("4000", 1);
 
     BackendMachineMonitor monitor(&ui, &backend);
     monitor.init(&screen, &keyboard);
@@ -1925,9 +1932,12 @@ static int test_t_after_goto_ignores_successful_stale_snapshot()
     backend.canned_snapshot = stale;
     backend.canned_snapshot_set = true;
     backend.snapshot_result = DebugSession::DBG_OK;
-    backend.write(0xE000, 0x85);
-    backend.write(0xE001, 0x56);
-    backend.write(0xE002, 0xEA);
+    // Plain-RAM cursor target: contextless Step Into of visible ROM is gated
+    // ("run to a breakpoint 1st"), and this test is about stale-snapshot
+    // handling, not banking.
+    backend.write(0x2000, 0x85);
+    backend.write(0x2001, 0x56);
+    backend.write(0x2002, 0xEA);
     backend.write(0x0000, 0xEA);
     backend.write(0x0001, 0xEA);
 
@@ -1935,7 +1945,7 @@ static int test_t_after_goto_ignores_successful_stale_snapshot()
     FakeKeyboard keyboard(keys, 6);
     ui.screen = &screen;
     ui.keyboard = &keyboard;
-    ui.set_prompt("E000", 1);
+    ui.set_prompt("2000", 1);
 
     BackendMachineMonitor monitor(&ui, &backend);
     monitor.init(&screen, &keyboard);
@@ -1952,8 +1962,8 @@ static int test_t_after_goto_ignores_successful_stale_snapshot()
                "Cursor-authoritative Debug entry must ignore a successful stale snapshot")) return 1;
     if (expect(backend.last_session->trace_at_calls == 1,
                "Cursor-authoritative Debug entry must Trace from the cursor")) return 1;
-    if (expect(backend.last_session->last_start_pc == 0xE000,
-               "Trace after J E000 must start at the cursor, not stale PC $0000")) return 1;
+    if (expect(backend.last_session->last_start_pc == 0x2000,
+               "Trace after J 2000 must start at the cursor, not stale PC $0000")) return 1;
     monitor.deinit();
     return 0;
 }
@@ -7392,8 +7402,10 @@ static int test_ctrl_x_reset_not_shadowed_by_x()
     return 0;
 }
 
-static int test_visible_rom_freeze_step_over_runs()
+static int test_visible_rom_contextless_linear_step_over_stops()
 {
+    // A contextless Step Over of a non-JSR is the same immediate single step
+    // as Step Into and must stop with guidance in a fetch-lagging bank.
     TestUserInterface ui;
     CaptureScreen screen;
     TrackingDebugBackend backend;
@@ -7414,10 +7426,48 @@ static int test_visible_rom_freeze_step_over_runs()
     if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
     set_predict_bytes(backend.last_session, 0xEA, 0xEA, 0xEA);
     if (expect(monitor.poll(0) == 0, "Step Over must stay in monitor")) return 1;
+    if (expect(backend.last_session->over_at_breakpoint_calls == 0 &&
+               backend.last_session->over_calls == 0 &&
+               backend.last_session->over_at_calls == 0,
+               "Contextless linear ROM Step Over must not dispatch")) return 1;
+    if (expect(strcmp(monitor.debug_status_message(),
+                      "Step Over: run to a breakpoint 1st") == 0,
+               "Contextless linear ROM Step Over stops with guidance")) return 1;
+    monitor.poll(0);
+    monitor.poll(0);
+    monitor.deinit();
+    return 0;
+}
+
+static int test_visible_rom_contextless_jsr_step_over_runs()
+{
+    // Step Over of a JSR keeps its sustained breakpoint+Go completion even
+    // without a context: the fall-through BRK is fetched only after the
+    // callee's natural run.
+    TestUserInterface ui;
+    CaptureScreen screen;
+    TrackingDebugBackend backend;
+    monitor_reset_saved_state();
+    backend.snapshot_result = DebugSession::DBG_NOT_SUPPORTED;
+
+    const int keys[] = { 'J', 'A', 'D', 'D', KEY_BREAK, KEY_BREAK };
+    FakeKeyboard keyboard(keys, 6);
+    ui.screen = &screen;
+    ui.keyboard = &keyboard;
+    ui.set_prompt("E000", 1);
+
+    BackendMachineMonitor monitor(&ui, &backend);
+    monitor.set_debug_run_window_refreeze_enabled(true); // UI Freeze mode
+    monitor.init(&screen, &keyboard);
+    if (expect(monitor.poll(0) == 0, "Jump to E000")) return 1;
+    if (expect(monitor.poll(0) == 0, "ASM switch")) return 1;
+    if (expect(monitor.poll(0) == 0, "Enter Debug")) return 1;
+    set_predict_bytes(backend.last_session, 0x20, 0x0F, 0xBC); // JSR $BC0F
+    if (expect(monitor.poll(0) == 0, "JSR Step Over must stay in monitor")) return 1;
     if (expect(backend.last_session->over_at_breakpoint_calls == 1,
-               "Visible-ROM Freeze Step Over runs")) return 1;
+               "Contextless ROM JSR Step Over dispatches")) return 1;
     if (expect(strcmp(monitor.debug_status_message(), "") == 0,
-               "Visible-ROM Freeze Step Over needs no alert")) return 1;
+               "Contextless ROM JSR Step Over needs no alert")) return 1;
     monitor.poll(0);
     monitor.poll(0);
     monitor.deinit();
@@ -7911,6 +7961,63 @@ static int test_frozen_step_out_of_rom_callee_walks_while_parked()
     return 0;
 }
 
+// Running UI modes (Telnet/Overlay) must NOT route a visible-ROM Step Out
+// through the parked walk: a large frame (e.g. Step Out from inside BASIC's
+// EXP evaluation) would exhaust the walk budget and stop at an arbitrary
+// mid-frame PC. Breakpoint+Go at the traced return target is the reliable
+// primitive when the machine can free-run. (Regression: deep-trace group
+// stopped at $BAA1 instead of returning to the RAM caller.)
+static int test_running_step_out_of_rom_callee_uses_breakpoint_go()
+{
+    FakeVisibleRomMachine m(false); // running, not frozen
+    m.allow_visible_rom_patching = true;
+    m.fetch_lags = true;
+    m.cpu_port = 0x07;
+    // Telnet/Overlay-host sessions run with the run-window refreeze disabled
+    // (run_machine_monitor wires it only for the C64-rendered Freeze UI).
+    m.set_run_window_refreeze_enabled(false);
+    if (park_session_via_ram_step(m)) return 1;
+
+    m.ram[0x2001] = 0x20;
+    m.ram[0x2002] = 0x00;
+    m.ram[0x2003] = 0xFF; // JSR $FF00
+    m.ram[0x2004] = 0xEA; // return site holds a real opcode to patch
+    m.kernal_rom[0xFF00 - 0xE000] = 0x60; // RTS
+    m.ram[FAKE_STORE_CPU_DDR] = 0x2F;
+    m.ram[FAKE_STORE_CPU_PORT] = 0x37;
+
+    DebugContext from;
+    debug_context_reset(&from);
+    from.valid = true;
+    from.pc = 0x2001;
+    from.sp = 0xF8;
+    from.sr = 0x24;
+    from.live_cpu_port_valid = true;
+    from.live_cpu_port = 0x07;
+
+    uint8_t jsr[3] = { 0x20, 0x00, 0xFF };
+    DebugPredictResult pred;
+    debug_predict(0x2001, jsr, false, &pred);
+    DebugContext inside;
+    if (expect(m.trace(from, pred, &inside) == DebugSession::DBG_OK,
+               "running-mode Step Into enters the ROM callee")) return 1;
+    if (expect(inside.pc == 0xFF00 && inside.sp == 0xF6,
+               "running-mode traced frame is in place")) return 1;
+
+    int brk_before = m.brk_patch_writes;
+    m.arm_capture_context(0x2004, 0xF8, 0, 0, 0, 0x24);
+    DebugContext ctx;
+    DebugSession::Result r = m.step_out(inside, &ctx);
+    if (expect(r == DebugSession::DBG_OK,
+               "running-mode ROM Step Out completes via breakpoint+Go")) return 1;
+    if (expect(ctx.valid && ctx.pc == 0x2004 && ctx.sp == 0xF8,
+               "running-mode Step Out lands at the traced return target")) return 1;
+    if (expect(m.brk_patch_writes > brk_before,
+               "running-mode Step Out must plant the return breakpoint and "
+               "free-run, not walk the frame while parked")) return 1;
+    return 0;
+}
+
 static int test_parked_freeze_step_into_rom_jsr_stays_frozen()
 {
     FakeVisibleRomMachine m(true); // freeze mode
@@ -8007,20 +8114,47 @@ static int test_debug_classify_step_matrix()
     if (expect(rom_freeze_unparked.plan == DEBUG_PLAN_STOP,
                "Unparked visible-ROM Freeze Step Into stops with guidance")) return 1;
 
-    // Visible ROM outside Freeze keeps the contextless direct step it always
-    // had; Step Over and the breakpoint+Go primitives are never gated.
+    // Visible ROM without a context is gated in every UI mode: the first ROM
+    // fetch after a just-committed step BRK races the FPGA fetch path on a
+    // contextless launch regardless of Freeze. Step Over and the
+    // breakpoint+Go primitives are never gated.
     DebugStepDecision rom_overlay_unparked = debug_classify_step(DEBUG_OP_TRACE,
         DEBUG_SRC_VISIBLE_ROM, false, false);
-    if (expect(rom_overlay_unparked.plan == DEBUG_PLAN_DIRECT,
-               "Overlay/Telnet visible-ROM Step Into stays direct")) return 1;
+    if (expect(rom_overlay_unparked.plan == DEBUG_PLAN_STOP &&
+               strcmp(rom_overlay_unparked.alert,
+                      "Step Into: run to a breakpoint 1st") == 0,
+               "Overlay/Telnet unparked visible-ROM Step Into stops with "
+               "guidance")) return 1;
+    DebugStepDecision rom_overlay_parked = debug_classify_step(DEBUG_OP_TRACE,
+        DEBUG_SRC_VISIBLE_ROM, false, true);
+    if (expect(rom_overlay_parked.plan == DEBUG_PLAN_DIRECT,
+               "Parked Overlay/Telnet visible-ROM Step Into is direct")) return 1;
+    // Contextless non-JSR Step Over is gated only in visible ROM (ROM-image
+    // fall-through patch races the post-release fetch); RAM-under-ROM keeps
+    // its long-proven banked-RAM-patch clean-release path. Step Over of a
+    // JSR keeps its sustained breakpoint+Go completion everywhere.
     DebugStepDecision over_rur_unparked = debug_classify_step(DEBUG_OP_OVER,
-        DEBUG_SRC_RAM_UNDER_ROM, false, false);
+        DEBUG_SRC_RAM_UNDER_ROM, false, false, false);
     if (expect(over_rur_unparked.plan == DEBUG_PLAN_DIRECT,
-               "RAM-under-ROM Step Over stays available")) return 1;
+               "Unparked RAM-under-ROM Step Over keeps the banked-RAM "
+               "clean-release path")) return 1;
     DebugStepDecision over_rom_freeze = debug_classify_step(DEBUG_OP_OVER,
-        DEBUG_SRC_VISIBLE_ROM, true, false);
-    if (expect(over_rom_freeze.plan == DEBUG_PLAN_DIRECT,
-               "Visible-ROM Freeze Step Over stays available")) return 1;
+        DEBUG_SRC_VISIBLE_ROM, true, false, false);
+    if (expect(over_rom_freeze.plan == DEBUG_PLAN_STOP,
+               "Unparked visible-ROM non-JSR Step Over stops with "
+               "guidance")) return 1;
+    DebugStepDecision over_rur_jsr = debug_classify_step(DEBUG_OP_OVER,
+        DEBUG_SRC_RAM_UNDER_ROM, false, false, true);
+    if (expect(over_rur_jsr.plan == DEBUG_PLAN_DIRECT,
+               "RAM-under-ROM JSR Step Over stays available")) return 1;
+    DebugStepDecision over_rom_jsr = debug_classify_step(DEBUG_OP_OVER,
+        DEBUG_SRC_VISIBLE_ROM, true, false, true);
+    if (expect(over_rom_jsr.plan == DEBUG_PLAN_DIRECT,
+               "Visible-ROM JSR Step Over stays available")) return 1;
+    DebugStepDecision over_rom_parked = debug_classify_step(DEBUG_OP_OVER,
+        DEBUG_SRC_VISIBLE_ROM, false, true, false);
+    if (expect(over_rom_parked.plan == DEBUG_PLAN_DIRECT,
+               "Parked visible-ROM non-JSR Step Over is direct")) return 1;
     DebugStepDecision go_rur = debug_classify_step(DEBUG_OP_GO,
         DEBUG_SRC_RAM_UNDER_ROM, true, false);
     if (expect(go_rur.plan == DEBUG_PLAN_DIRECT,
@@ -8042,6 +8176,330 @@ static int test_debug_help_has_no_dbx_hint()
         if (expect(strstr(lines[i], "DbX") == NULL,
                    "Debug help must not mention DbX")) return 1;
     }
+    return 0;
+}
+
+// Differential sweep: the parked-step linear interpreter is the production
+// stepping path for RAM under ROM and visible ROM, so it must produce exactly
+// the architectural state the independent mcm6502 oracle produces for every
+// documented non-control-flow instruction. Vectors are generated by
+// tools/developer/machine-code-monitor/gen_interpreter_vectors.py.
+static int test_parked_interpreter_matches_mcm6502_vectors()
+{
+    char msg[192];
+    for (int vi = 0; vi < interpreter_vector_count; vi++) {
+        const InterpreterVector &v = interpreter_vectors[vi];
+
+        FakeVisibleRomMachine m(false);
+        m.allow_visible_rom_patching = true;
+        m.fetch_lags = true;
+
+        // Park the CPU in the debug spin loop first; context-mutating
+        // interpretation is only truthful while parked.
+        m.ram[0x2000] = 0xEA;
+        m.ram[0x2001] = 0xEA;
+        {
+            uint8_t nop[3] = { 0xEA, 0xEA, 0xEA };
+            DebugPredictResult park_pred;
+            debug_predict(0x2000, nop, false, &park_pred);
+            m.arm_capture_context(0x2001, 0xCB, 0, 0, 0, 0x24);
+            DebugContext parked;
+            if (expect(m.trace_at(0x2000, park_pred, &parked) == DebugSession::DBG_OK,
+                       "vector parking step must complete")) return 1;
+        }
+
+        // Sentinel over the instruction trampoline: a linear step in visible
+        // ROM must be interpreted while parked, never trampolined here.
+        for (int i = 0; i < 4; i++) {
+            m.ram[0x0340 + i] = 0x77;
+        }
+        m.kernal_rom[0x0900] = v.opcode;
+        m.kernal_rom[0x0901] = v.operand1;
+        m.kernal_rom[0x0902] = v.operand2;
+        for (int i = 0; i < v.pre_mem_count; i++) {
+            m.ram[v.pre_mem[i].addr] = v.pre_mem[i].value;
+        }
+
+        DebugContext from;
+        debug_context_reset(&from);
+        from.valid = true;
+        from.pc = interpreter_vector_pc;
+        from.a = v.a;
+        from.x = v.x;
+        from.y = v.y;
+        from.sp = v.sp;
+        from.sr = v.sr;
+        from.live_cpu_port_valid = true;
+        from.live_cpu_port = 0x07;
+
+        uint8_t bytes[3] = { v.opcode, v.operand1, v.operand2 };
+        DebugPredictResult pred;
+        debug_predict(interpreter_vector_pc, bytes, false, &pred);
+        if (v.expect_linear) {
+            snprintf(msg, sizeof(msg),
+                     "%s: predictor must classify LINEAR len %u",
+                     v.label, (unsigned)v.length);
+            if (expect(pred.kind == DBG_PREDICT_LINEAR &&
+                       pred.length == v.length, msg)) return 1;
+        } else {
+            snprintf(msg, sizeof(msg),
+                     "%s: predictor must classify control flow len %u",
+                     v.label, (unsigned)v.length);
+            if (expect(pred.kind != DBG_PREDICT_LINEAR &&
+                       pred.kind != DBG_PREDICT_UNSAFE &&
+                       pred.length == v.length, msg)) return 1;
+        }
+
+        DebugContext out;
+        DebugSession::Result r = m.trace(from, pred, &out);
+        snprintf(msg, sizeof(msg), "%s: parked step must complete", v.label);
+        if (expect(r == DebugSession::DBG_OK, msg)) return 1;
+
+        snprintf(msg, sizeof(msg),
+                 "%s: got PC %04X A %02X X %02X Y %02X SP %02X SR %02X, "
+                 "oracle PC %04X A %02X X %02X Y %02X SP %02X SR %02X",
+                 v.label, out.pc, out.a, out.x, out.y, out.sp, out.sr,
+                 v.expect_pc, v.expect_a, v.expect_x, v.expect_y,
+                 v.expect_sp, v.expect_sr);
+        if (expect(out.pc == v.expect_pc && out.a == v.expect_a &&
+                   out.x == v.expect_x && out.y == v.expect_y &&
+                   out.sp == v.expect_sp && out.sr == v.expect_sr,
+                   msg)) return 1;
+
+        for (int i = 0; i < v.post_mem_count; i++) {
+            snprintf(msg, sizeof(msg),
+                     "%s: memory $%04X must be $%02X, got $%02X",
+                     v.label, v.post_mem[i].addr, v.post_mem[i].value,
+                     m.ram[v.post_mem[i].addr]);
+            if (expect(m.ram[v.post_mem[i].addr] == v.post_mem[i].value,
+                       msg)) return 1;
+        }
+        for (int i = 0; i < 4; i++) {
+            snprintf(msg, sizeof(msg),
+                     "%s: parked step must be interpreted or emulated, "
+                     "not run the trampoline", v.label);
+            if (expect(m.ram[0x0340 + i] == 0x77, msg)) return 1;
+        }
+    }
+    return 0;
+}
+
+// $00/$01 are the 6510's internal port. A parked-interpretation DMA access
+// reads/writes the RAM under the port and cannot produce the banking side
+// effect a real access has, so the interpreter must refuse and let the
+// RAM trampoline run the instruction on the live CPU. This is the canonical
+// RAM-under-ROM debug scenario (stepping code that flips $01).
+static int test_parked_interpreter_defers_cpu_port_access_to_trampoline()
+{
+    struct PortCase {
+        uint8_t bytes[3];
+        uint8_t length;
+        const char *label;
+    };
+    static const PortCase cases[] = {
+        { { 0x85, 0x01, 0x00 }, 2, "STA $01" },
+        { { 0x85, 0x00, 0x00 }, 2, "STA $00" },
+        { { 0xA5, 0x01, 0x00 }, 2, "LDA $01" },
+        { { 0xE6, 0x01, 0x00 }, 2, "INC $01" },
+        { { 0xB5, 0x02, 0x00 }, 2, "LDA $02,X with X=$FF wrapping to $01" },
+        { { 0xA1, 0xFF, 0x00 }, 2, "LDA ($FF,X) pointer bytes at $00/$01" },
+        { { 0x8D, 0x01, 0x00 }, 3, "STA $0001 absolute" },
+    };
+    char msg[128];
+    for (unsigned ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        const PortCase &pc = cases[ci];
+        FakeVisibleRomMachine m(false);
+        m.allow_visible_rom_patching = true;
+        m.fetch_lags = true;
+
+        m.ram[0x2000] = 0xEA;
+        m.ram[0x2001] = 0xEA;
+        {
+            uint8_t nop[3] = { 0xEA, 0xEA, 0xEA };
+            DebugPredictResult park_pred;
+            debug_predict(0x2000, nop, false, &park_pred);
+            m.arm_capture_context(0x2001, 0xCB, 0, 0, 0, 0x24);
+            DebugContext parked;
+            if (expect(m.trace_at(0x2000, park_pred, &parked) == DebugSession::DBG_OK,
+                       "port-case parking step must complete")) return 1;
+        }
+
+        for (int i = 0; i < 4; i++) {
+            m.ram[0x0340 + i] = 0x77;
+        }
+        m.kernal_rom[0x0900] = pc.bytes[0];
+        m.kernal_rom[0x0901] = pc.bytes[1];
+        m.kernal_rom[0x0902] = pc.bytes[2];
+        m.ram[0x0000] = 0x2F;
+        m.ram[0x0001] = 0x37;
+        // The trampoline completion ends in a capture, which refreshes the
+        // $00/$01 mirror from the stub-read registers; seed those with the
+        // same true-port values so the mirror assertions stay meaningful.
+        m.ram[FAKE_STORE_CPU_DDR] = 0x2F;
+        m.ram[FAKE_STORE_CPU_PORT] = 0x37;
+
+        DebugContext from;
+        debug_context_reset(&from);
+        from.valid = true;
+        from.pc = 0xE900;
+        from.a = 0x5A;
+        from.x = (pc.bytes[0] == 0xB5) ? 0xFF : 0x00;
+        from.y = 0x00;
+        from.sp = 0xF0;
+        from.sr = 0x24;
+        from.live_cpu_port_valid = true;
+        from.live_cpu_port = 0x07;
+
+        DebugPredictResult pred;
+        debug_predict(0xE900, pc.bytes, false, &pred);
+        // The trampoline completes the step; arm the capture at its BRK.
+        m.arm_capture_context((uint16_t)(0x0340 + pc.length), 0xF0,
+                              from.a, from.x, from.y, 0x24);
+        DebugContext out;
+        DebugSession::Result r = m.trace(from, pred, &out);
+        snprintf(msg, sizeof(msg),
+                 "%s: step must complete via the trampoline", pc.label);
+        if (expect(r == DebugSession::DBG_OK, msg)) return 1;
+        snprintf(msg, sizeof(msg),
+                 "%s: trampoline must receive the instruction "
+                 "(interpreter must refuse $00/$01 access)", pc.label);
+        if (expect(m.ram[0x0340] == pc.bytes[0], msg)) return 1;
+        snprintf(msg, sizeof(msg),
+                 "%s: interpreter must not poke RAM under the port", pc.label);
+        if (expect(m.ram[0x0001] == 0x37 && m.ram[0x0000] == 0x2F,
+                   msg)) return 1;
+        snprintf(msg, sizeof(msg), "%s: PC must land at fall-through", pc.label);
+        if (expect(out.pc == (uint16_t)(0xE900 + pc.length), msg)) return 1;
+    }
+
+    // Control: an ordinary zero-page access one byte above the port is still
+    // interpreted while parked and never engages the trampoline.
+    {
+        FakeVisibleRomMachine m(false);
+        m.allow_visible_rom_patching = true;
+        m.fetch_lags = true;
+        m.ram[0x2000] = 0xEA;
+        m.ram[0x2001] = 0xEA;
+        {
+            uint8_t nop[3] = { 0xEA, 0xEA, 0xEA };
+            DebugPredictResult park_pred;
+            debug_predict(0x2000, nop, false, &park_pred);
+            m.arm_capture_context(0x2001, 0xCB, 0, 0, 0, 0x24);
+            DebugContext parked;
+            if (expect(m.trace_at(0x2000, park_pred, &parked) == DebugSession::DBG_OK,
+                       "port-control parking step must complete")) return 1;
+        }
+        for (int i = 0; i < 4; i++) {
+            m.ram[0x0340 + i] = 0x77;
+        }
+        m.kernal_rom[0x0900] = 0x85; // STA $02
+        m.kernal_rom[0x0901] = 0x02;
+        DebugContext from;
+        debug_context_reset(&from);
+        from.valid = true;
+        from.pc = 0xE900;
+        from.a = 0x5A;
+        from.sp = 0xF0;
+        from.sr = 0x24;
+        from.live_cpu_port_valid = true;
+        from.live_cpu_port = 0x07;
+        uint8_t bytes[3] = { 0x85, 0x02, 0x00 };
+        DebugPredictResult pred;
+        debug_predict(0xE900, bytes, false, &pred);
+        DebugContext out;
+        if (expect(m.trace(from, pred, &out) == DebugSession::DBG_OK,
+                   "STA $02 must be interpreted while parked")) return 1;
+        if (expect(m.ram[0x0002] == 0x5A,
+                   "STA $02 must store through the DMA path")) return 1;
+        if (expect(m.ram[0x0340] == 0x77,
+                   "STA $02 must not engage the trampoline")) return 1;
+    }
+    return 0;
+}
+
+// The U64's FPGA 6510 never writes CPU stores to $00/$01 through to the RAM
+// underneath, so the RAM copy is a DMA-only mirror that goes stale the moment
+// a debugged program (or a DMA fixture) changes banking. Every debug capture
+// must refresh that mirror from the registers the capture stub read on the
+// real CPU, or DMA-side readers (live-bank display, the breakpoint
+// "not mapped now" check) keep reporting a phantom bank.
+static int test_capture_refreshes_cpu_port_ram_mirror()
+{
+    FakeVisibleRomMachine m(false);
+    m.ram[0x2000] = 0xEA;
+    m.ram[0x2001] = 0xEA;
+    m.ram[0x0000] = 0x11; // stale DMA-era mirror bytes
+    m.ram[0x0001] = 0x22;
+    m.ram[FAKE_STORE_CPU_DDR] = 0x2F;  // what the capture stub read on the CPU
+    m.ram[FAKE_STORE_CPU_PORT] = 0x36;
+
+    uint8_t nop[3] = { 0xEA, 0xEA, 0xEA };
+    DebugPredictResult pred;
+    debug_predict(0x2000, nop, false, &pred);
+    m.arm_capture_context(0x2001, 0xCB, 0, 0, 0, 0x24);
+    DebugContext parked;
+    if (expect(m.trace_at(0x2000, pred, &parked) == DebugSession::DBG_OK,
+               "mirror-refresh capture step must complete")) return 1;
+    if (expect(m.ram[0x0000] == 0x2F && m.ram[0x0001] == 0x36,
+               "capture must refresh the $00/$01 RAM mirror from the "
+               "stub-read registers")) return 1;
+    return 0;
+}
+
+// The interpreter must never decode an undocumented opcode as if it were the
+// documented instruction sharing its aaa/bbb/cc bit pattern (e.g. $9E SHX
+// abs,Y aliasing to "STX abs,X"). The UI refuses illegal opcodes before
+// predicting and internal walks predict with illegal_enabled=false, so this
+// pins the invariant at its last line of defense.
+static int test_parked_interpreter_refuses_undocumented_opcodes()
+{
+    FakeVisibleRomMachine m(false);
+    m.allow_visible_rom_patching = true;
+    m.fetch_lags = true;
+
+    m.ram[0x2000] = 0xEA;
+    m.ram[0x2001] = 0xEA;
+    {
+        uint8_t nop[3] = { 0xEA, 0xEA, 0xEA };
+        DebugPredictResult park_pred;
+        debug_predict(0x2000, nop, false, &park_pred);
+        m.arm_capture_context(0x2001, 0xCB, 0, 0, 0, 0x24);
+        DebugContext parked;
+        if (expect(m.trace_at(0x2000, park_pred, &parked) == DebugSession::DBG_OK,
+                   "illegal-op parking step must complete")) return 1;
+    }
+
+    // $9E with a forced LINEAR prediction: the interpreter must refuse it
+    // rather than execute a bogus "STX abs,X"; the write target must stay
+    // untouched.
+    m.kernal_rom[0x0900] = 0x9E;
+    m.kernal_rom[0x0901] = 0x00;
+    m.kernal_rom[0x0902] = 0x60;
+    m.ram[0x6000 + 0x22] = 0x5A; // would-be bogus STX abs,X target
+
+    DebugContext from;
+    debug_context_reset(&from);
+    from.valid = true;
+    from.pc = 0xE900;
+    from.a = 0x11;
+    from.x = 0x22;
+    from.y = 0x33;
+    from.sp = 0xF0;
+    from.sr = 0x24;
+    from.live_cpu_port_valid = true;
+    from.live_cpu_port = 0x07;
+
+    DebugPredictResult pred;
+    pred.kind = DBG_PREDICT_LINEAR;
+    pred.length = 3;
+    pred.fall_through = 0xE903;
+    pred.has_target = false;
+    pred.branch_target = 0;
+
+    DebugContext out;
+    (void)m.trace(from, pred, &out);
+    if (expect(m.ram[0x6022] == 0x5A,
+               "undocumented $9E must not be interpreted as STX abs,X")) return 1;
     return 0;
 }
 
@@ -8202,7 +8660,8 @@ int main()
     RUN(test_x_exits_monitor);
     RUN(test_x_in_edit_mode_is_edit_input);
     RUN(test_ctrl_x_reset_not_shadowed_by_x);
-    RUN(test_visible_rom_freeze_step_over_runs);
+    RUN(test_visible_rom_contextless_linear_step_over_stops);
+    RUN(test_visible_rom_contextless_jsr_step_over_runs);
     RUN(test_ram_under_rom_step_into_without_parked_context_stops);
     RUN(test_ram_under_rom_step_into_with_parked_context_runs);
     RUN(test_step_over_into_kernal_runs_without_alert);
@@ -8215,10 +8674,15 @@ int main()
     RUN(test_unparked_unsafe_step_into_uses_live_path);
     RUN(test_frozen_step_over_rom_jsr_walks_callee_while_parked);
     RUN(test_frozen_step_out_of_rom_callee_walks_while_parked);
+    RUN(test_running_step_out_of_rom_callee_uses_breakpoint_go);
     RUN(test_parked_freeze_step_into_rom_jsr_stays_frozen);
     RUN(test_debug_classify_step_alerts_are_plain_and_fit);
     RUN(test_debug_classify_step_matrix);
     RUN(test_debug_help_has_no_dbx_hint);
+    RUN(test_parked_interpreter_matches_mcm6502_vectors);
+    RUN(test_parked_interpreter_defers_cpu_port_access_to_trampoline);
+    RUN(test_parked_interpreter_refuses_undocumented_opcodes);
+    RUN(test_capture_refreshes_cpu_port_ram_mirror);
 
     puts("machine_monitor_debug_test: OK");
     return 0;

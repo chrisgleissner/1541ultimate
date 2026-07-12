@@ -1,5 +1,6 @@
 #include "monitor_debug_brk_session.h"
 
+#include "disassembler_6502.h"
 #include "keyboard.h"
 #include "monitor_file_io.h"
 #include "itu.h"
@@ -821,6 +822,7 @@ bool BrkDebugSession :: has_high_memory_patch(void) const
     return false;
 }
 
+
 bool BrkDebugSession :: begin_clean_stopped_session(void)
 {
     // Default: same as a normal stopped session. Backends whose plain stop/resume
@@ -879,11 +881,20 @@ void BrkDebugSession :: repark_running_cpu(uint8_t cpu_port)
     // itself. nmi_redirect_to() rewrites the NMI trampoline + vector, so it is
     // self-repairing if a runaway clobbered them.
     reinstall_handler_bytes();
+    // The spin JMP opcode itself is otherwise only written by
+    // resume_from_parked_context: a contextless first launch (or a runaway
+    // that scribbled the scratch) has no guarantee $0387 holds the JMP, and
+    // parking into a garbage byte free-runs the CPU instead. Install the
+    // complete self-loop before redirecting into it.
+    bool stopped_it = begin_stopped_session();
+    poke_visible(SPIN_JMP, 0x4C);
+    end_stopped_session(stopped_it);
     reset_spin_target();
     nmi_redirect_to(SPIN_JMP, cpu_port, false, false);
     delay_ms(1);
     cpu_parked_in_spin = true;
 }
+
 
 DebugSession::Result BrkDebugSession :: relaunch_on_breakpoint_runaway(
     DebugSession::Result waited, const DebugContext *launch_ctx,
@@ -1113,6 +1124,14 @@ void BrkDebugSession :: read_captured_context(DebugContext *ctx, uint8_t cpu_por
     fill_vectors(ctx, live_cpu_port);
     note_captured_cpu_port(live_cpu_port);
 
+    // Refresh the $00/$01 RAM mirror with the registers the capture stub read
+    // on the real CPU. The U64's FPGA 6510 never writes the port through to
+    // the RAM underneath, so DMA-side readers (the live-bank display and the
+    // breakpoint "not mapped now" check) would otherwise keep seeing whatever
+    // a DMA write last left there. On a real 6510 these bytes already match.
+    poke_cpu(0x0000, ctx->cpu_ddr, live_cpu_port);
+    poke_cpu(0x0001, ctx->cpu_port_latch, live_cpu_port);
+
     poke_visible(SENTINEL_ADDR, 0x00);
     poke_visible(STORE_TRAP_MODE, 0x00);
     poke_visible(STORE_HARD_CPU_DDR, 0x00);
@@ -1176,11 +1195,20 @@ void BrkDebugSession :: release_to_run(const DebugContext *from,
         sustained_settle = true;
         rom_bp_hit_pc_valid = false;
     }
-    // Settle ONLY for that re-trap. On a plain forward step the settle's extra
-    // stop/resume cycle frees the 6510 briefly and lets it run past the BRK; the
-    // recommit writes above already place the BRK in the stopped ROM image.
-    if (visible_rom_recommitted && sustained_settle) {
-        settle_visible_rom_for_live_fetch(sustained_settle);
+    // Settle for the re-trap relaunch, and for every parked non-frozen release
+    // that carries visible-ROM patches: while the CPU sits in the RAM spin
+    // loop the settle's stop/resume cannot run it past anything, and the
+    // sustained continuous run is the only thing that refreshes the live
+    // instruction-fetch ROM copy - without it a G/continue released from a
+    // parked ROM context can miss a ROM-image breakpoint whose fetch line is
+    // hot with the pre-patch byte (reproducible under concurrent REST/DMA
+    // load). Plain forward steps in ROM never release (parked emulation), so
+    // stepping latency is unaffected; the freeze path keeps the old gating
+    // because its settle frees the live program, not a spin loop.
+    bool parked_release = from && from->valid;
+    if (visible_rom_recommitted &&
+            (sustained_settle || (parked_release && !machine_is_frozen()))) {
+        settle_visible_rom_for_live_fetch(true);
     }
     if (from && from->valid) {
         poke_visible(SPIN_OPERAND_LO, (uint8_t)(TRAMPOLINE_ADDR & 0xFF));
@@ -1678,6 +1706,13 @@ DebugSession::Result BrkDebugSession :: interpret_simple_linear(
         return DBG_NOT_SUPPORTED;
     }
 
+    // Never decode an undocumented opcode as the documented instruction that
+    // shares its bit pattern (e.g. $9E SHX abs,Y aliasing to "STX abs,X").
+    // Callers already refuse illegal opcodes, so this is the last-line guard.
+    if (disassembler_6502_is_illegal(bytes[0])) {
+        return DBG_NOT_SUPPORTED;
+    }
+
     DebugContext next = *from;
     uint8_t op = bytes[0];
 
@@ -1763,6 +1798,11 @@ DebugSession::Result BrkDebugSession :: interpret_simple_linear(
             switch (bbb) {
                 case 0: { // (zp,X)
                     uint8_t zp = (uint8_t)(bytes[1] + next.x);
+                    // Pointer bytes at $00/$01 are the 6510 port on a real
+                    // fetch; a DMA read sees RAM under it. Trampoline instead.
+                    if (zp <= 0x01 || (uint8_t)(zp + 1) <= 0x01) {
+                        return DBG_NOT_SUPPORTED;
+                    }
                     addr = (uint16_t)(peek_cpu(zp, cpu_port) |
                                       (peek_cpu((uint8_t)(zp + 1), cpu_port) << 8));
                     has_addr = true;
@@ -1772,6 +1812,9 @@ DebugSession::Result BrkDebugSession :: interpret_simple_linear(
                 case 2: imm = bytes[1]; is_imm = true; break;           // #
                 case 3: addr = (uint16_t)(bytes[1] | (bytes[2] << 8)); has_addr = true; break; // abs
                 case 4: { // (zp),Y
+                    if (bytes[1] <= 0x01 || (uint8_t)(bytes[1] + 1) <= 0x01) {
+                        return DBG_NOT_SUPPORTED;
+                    }
                     uint16_t base = (uint16_t)(peek_cpu(bytes[1], cpu_port) |
                         (peek_cpu((uint8_t)(bytes[1] + 1), cpu_port) << 8));
                     addr = (uint16_t)(base + next.y);
@@ -1784,6 +1827,12 @@ DebugSession::Result BrkDebugSession :: interpret_simple_linear(
                 default: break;
             }
             if (!has_addr && !is_imm) {
+                return DBG_NOT_SUPPORTED;
+            }
+            // $00/$01 data access is the 6510's internal port: a DMA
+            // peek/poke cannot read the port bits or produce the banking
+            // side effect a real access has. The trampoline runs it live.
+            if (has_addr && addr <= 0x0001) {
                 return DBG_NOT_SUPPORTED;
             }
             uint8_t aaa = (uint8_t)(op >> 5);
@@ -1832,6 +1881,9 @@ DebugSession::Result BrkDebugSession :: interpret_simple_linear(
                     return DBG_NOT_SUPPORTED;
             }
             if (!has_addr) {
+                return DBG_NOT_SUPPORTED;
+            }
+            if (addr <= 0x0001) { // 6510 port: trampoline runs it live.
                 return DBG_NOT_SUPPORTED;
             }
             if (aaa == 4) { // STX
@@ -1887,6 +1939,9 @@ DebugSession::Result BrkDebugSession :: interpret_simple_linear(
                 case 7: addr = (uint16_t)((bytes[1] | (bytes[2] << 8)) + next.x); has_addr = true; break; // abs,X
                 default:
                     return DBG_NOT_SUPPORTED;
+            }
+            if (has_addr && addr <= 0x0001) { // 6510 port: trampoline.
+                return DBG_NOT_SUPPORTED;
             }
             switch (aaa) {
                 case 1: { // BIT (zp/abs only)
@@ -2147,6 +2202,16 @@ bool BrkDebugSession :: frozen_rom_run_unreliable(uint16_t launch_pc,
                                                   uint8_t cpu_port)
 {
     if (!visible_rom_fetch_lags() || !cpu_parked_in_spin) {
+        return false;
+    }
+    // Only the freezer truly cannot free-run (and does not survive rapid
+    // unfreeze/refreeze cycles), so only a frozen machine routes Step Over
+    // of a JSR and Step Out through the parked walk. In the running UI
+    // modes breakpoint+Go is the proven-reliable primitive, and walking a
+    // large frame while parked would stop on the step budget mid-frame
+    // (an arbitrary PC deep inside BASIC/KERNAL) instead of reaching the
+    // return site.
+    if (!machine_is_frozen()) {
         return false;
     }
     if (monitor_backing_store_is_visible_rom(

@@ -6432,30 +6432,50 @@ const char *monitor_debug_result_message(int result)
 }
 
 DebugStepDecision debug_classify_step(DebugStepOp op, DebugStepSource src,
-                                      bool ui_freeze, bool have_parked_context)
+                                      bool ui_freeze, bool have_parked_context,
+                                      bool over_runs_callee)
 {
     DebugStepDecision d;
     d.plan = DEBUG_PLAN_DIRECT;
     d.alert = 0;
     d.reason = "direct_step";
 
-    // RAM-under-ROM, and visible ROM while the UI Freeze screen is up, are the
-    // banks whose instruction fetches can serve a stale byte right after a
-    // release. With a parked context the session never releases the CPU into
-    // them for a single step (control flow is completed architecturally while
-    // parked; linear ops run from a plain-RAM trampoline), so every step is an
-    // ordinary direct step. Without a parked context there is no authoritative
-    // register file to complete a Step Into from, and a live launch into such
-    // a bank is not reliable, so that one case stops with guidance. Step Over
-    // stays available: its completion breakpoint at the caller-side
-    // fall-through is observed after a sustained run.
+    // RAM-under-ROM and visible ROM are the banks whose instruction fetches
+    // can serve a stale byte in the first cycles after a release - and a
+    // contextless single step commits its BRK immediately before that
+    // release, so the fetch race is live in every UI mode (the
+    // recommit+settle levers narrow but do not close it). With a parked
+    // context the session never releases the CPU into those banks for a
+    // single step (control flow is completed architecturally while parked;
+    // linear ops run from a plain-RAM trampoline), so every step is an
+    // ordinary direct step. Without a parked context, Step Into - and Step
+    // Over of anything that is not a JSR, which is mechanically the same
+    // immediate-BRK step - stops with guidance. Step Over of a JSR stays
+    // available: its completion breakpoint at the caller-side fall-through
+    // is fetched only after the callee's sustained natural run.
     bool unsafe_src = (src == DEBUG_SRC_RAM_UNDER_ROM) ||
-                      (src == DEBUG_SRC_VISIBLE_ROM && ui_freeze);
-    if (op == DEBUG_OP_TRACE && unsafe_src && !have_parked_context) {
-        d.plan = DEBUG_PLAN_STOP;
-        d.alert = "Step Into: run to a breakpoint 1st";
-        d.reason = "unsafe_step_into_no_context";
-        return d;
+                      (src == DEBUG_SRC_VISIBLE_ROM);
+    (void)ui_freeze;
+    if (unsafe_src && !have_parked_context) {
+        if (op == DEBUG_OP_TRACE) {
+            d.plan = DEBUG_PLAN_STOP;
+            d.alert = "Step Into: run to a breakpoint 1st";
+            d.reason = "unsafe_step_into_no_context";
+            return d;
+        }
+        // A non-JSR Step Over is the same immediate fall-through BRK step as
+        // Step Into. In visible ROM that BRK is a ROM-image patch whose first
+        // fetch races the post-release window, so it is gated. RAM-under-ROM
+        // fall-through patches live in banked RAM and release through the
+        // raster-synced clean session - the long-proven RUR path - so
+        // contextless Step Over stays available there.
+        if (op == DEBUG_OP_OVER && !over_runs_callee &&
+                src == DEBUG_SRC_VISIBLE_ROM) {
+            d.plan = DEBUG_PLAN_STOP;
+            d.alert = "Step Over: run to a breakpoint 1st";
+            d.reason = "unsafe_step_over_no_context";
+            return d;
+        }
     }
 
     return d;
@@ -6509,7 +6529,8 @@ void MachineMonitor :: debug_clear_status(void)
 }
 
 bool MachineMonitor :: debug_resolve_step(DebugStepOp op, uint16_t start_pc,
-                                          DebugContext *from)
+                                          DebugContext *from,
+                                          bool over_runs_callee)
 {
     uint8_t exec_port = debug_exec_cpu_port(from);
     DebugStepSource src = debug_step_source(start_pc, exec_port);
@@ -6517,7 +6538,8 @@ bool MachineMonitor :: debug_resolve_step(DebugStepOp op, uint16_t start_pc,
     bool have_parked_context = from && from->valid && debug_session &&
         debug_session->has_parked_context();
     DebugStepDecision dec = debug_classify_step(op, src, ui_freeze,
-                                                have_parked_context);
+                                                have_parked_context,
+                                                over_runs_callee);
     const char *op_name = "step";
     switch (op) {
         case DEBUG_OP_OVER:   op_name = "over"; break;
@@ -6578,7 +6600,8 @@ void MachineMonitor :: debug_request_over()
         redraw_full();
         return;
     }
-    if (!debug_resolve_step(DEBUG_OP_OVER, start_pc, &from)) {
+    if (!debug_resolve_step(DEBUG_OP_OVER, start_pc, &from,
+                            pred.kind == DBG_PREDICT_JSR)) {
         draw();
         return;
     }

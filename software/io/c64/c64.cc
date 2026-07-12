@@ -663,6 +663,17 @@ void C64::reset(void)
     ioWrite8(ITU_TIMER, 20);
     while (ioRead8(ITU_TIMER))
         ;
+#if U64
+    // The FPGA 6510 does not write CPU stores to $00/$01 through to the RAM
+    // underneath, so the RAM copy only ever changes by DMA and goes stale the
+    // moment anything (a debugged program, a test fixture) alters banking.
+    // A real 6510 leaves DDR=$2F/port=$37 after reset+KERNAL init; write the
+    // same defaults into the RAM mirror while the CPU is held in reset so
+    // every DMA-side reader of $00/$01 (the monitor's live-bank display and
+    // the breakpoint "not mapped now" check) sees the true post-reset state.
+    C64_POKE(0x0000, 0x2F);
+    C64_POKE(0x0001, 0x37);
+#endif
     C64_MODE = C64_MODE_UNRESET;
 }
 
@@ -1067,6 +1078,12 @@ void C64 :: start_cartridge(void *vdef)
     // To be discussed: Should this only happen with the reboot command?
     C64_MODE = MODE_NORMAL;
     C64_POKE(0x8005, 0);
+#if U64
+    // Keep the $00/$01 RAM mirror truthful across a cold start too; the FPGA
+    // 6510 never writes the port through to RAM (see C64::reset).
+    C64_POKE(0x0000, 0x2F);
+    C64_POKE(0x0001, 0x37);
+#endif
 
     // Now, let's reset the machine and release it into run mode
     C64_MODE = C64_MODE_RESET;

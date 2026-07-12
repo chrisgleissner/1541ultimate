@@ -61,6 +61,7 @@ OP_FIELDS = (
 # ---------------------------------------------------------------------------
 DEBUG_ALERTS = (
     "Step Into: run to a breakpoint 1st",
+    "Step Over: run to a breakpoint 1st",
 )
 
 DEBUG_ALERT_MAX_WIDTH = 38

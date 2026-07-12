@@ -61,9 +61,13 @@ struct DebugStepDecision {
     const char *reason;  // stable reason code for logs/traces
 };
 
-// Pure classifier. Host-testable with no machine access.
+// Pure classifier. Host-testable with no machine access. over_runs_callee is
+// true for Step Over of a JSR: its completion breakpoint at the caller-side
+// fall-through is fetched only after the callee's sustained run, which is
+// what makes that one contextless launch reliable in fetch-lagging banks.
 DebugStepDecision debug_classify_step(DebugStepOp op, DebugStepSource src,
-                                      bool ui_freeze, bool have_parked_context);
+                                      bool ui_freeze, bool have_parked_context,
+                                      bool over_runs_callee = false);
 
 enum MonitorScreenCharset {
     MONITOR_SCREEN_CHARSET_UPPER_GRAPHICS = 0,
@@ -421,7 +425,8 @@ class MachineMonitor : public UIObject
     // the caller may proceed to run the operation; false when the operation was
     // stopped with an alert and must not run.
     bool debug_resolve_step(DebugStepOp op, uint16_t start_pc,
-                            DebugContext *from);
+                            DebugContext *from,
+                            bool over_runs_callee = false);
     bool debug_has_breakpoint(void) const;
     bool debug_has_enabled_breakpoint(void) const;
     MonitorBackingStore breakpoint_target_for_view(uint16_t address) const;
