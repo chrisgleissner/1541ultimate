@@ -68,3 +68,43 @@ The harness parses the VT100 telnet stream into a deterministic `40x25` screen b
 The U64 debugger firmware additionally supports breakpoints in volatile U64 ROM
 image memory (no flash writes, restored on reboot), so non-soak debug sessions
 can step KERNAL/BASIC/CHAR ROM without the destructive RAM-shadow step.
+
+## Release Matrix Gate
+
+`monitor_debug_matrix_gate.py` is the release-readiness gate for the debugger.
+It drives the full UI x memory x repetition matrix (`telnet`/`overlay`/`freeze`
+x `ram`/`ram-under-rom`/`rom`, 2 reps by default) through the documented flow
+(Step Into -> Step Out -> Step Over -> Run to cursor -> Continue-to-breakpoint
+-> Continue -> Reset), validating state and stack against the independent
+`mcm6502.py` oracle, and writes a coverage ledger plus a `FINAL_REPORT.md` per
+run:
+
+```bash
+python3 tools/developer/machine-code-monitor/monitor_debug_matrix_gate.py \
+  --host <host> --rest-host <host> --memory all --ui all --reps 2 \
+  --strict --fail-fast --artifact-dir <dir>
+```
+
+Any code change that touches the stepping engine, breakpoint engine, context
+capture, reset state, or UI classification must rerun this full matrix before
+being treated as release evidence; a prior "PASS" recorded against a dirty
+tree or an older commit does not carry forward.
+
+### 1000-opcode coverage strategy
+
+The gate binds its large-volume opcode run to `ram` x `overlay`
+(`monitor_debug_stress.py`, REST-driven, every step oracle-validated) because
+parked-emulation stepping in `ram-under-rom`/`rom` is too slow per-step to
+support a standalone 1000-op run within a practical time budget. Instead,
+every `ram-under-rom`/`rom` matrix cell carries its own 100-opcode dual-oracle
+Step Into trace (6 cells x 2 reps), so cumulative RUR/ROM opcode coverage
+comes from the per-cell traces rather than a single dedicated volume cell.
+
+### Independent oracle
+
+`mcm6502.py` is a from-scratch 6510 interpreter (no shared code with the
+firmware's stepping engine) used both as the matrix gate's live oracle and to
+generate the parked-interpreter differential vectors in
+`gen_interpreter_vectors.py` / `software/test/monitor/monitor_debug_interpreter_vectors.h`.
+Run `python3 tools/developer/machine-code-monitor/mcm6502.py --selftest`
+before trusting any run that depends on it.

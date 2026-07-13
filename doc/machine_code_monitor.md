@@ -780,6 +780,7 @@ There are 10 breakpoint slots:
 - A breakpoint can be valid but invisible to the live CPU. If you see the popup `BRK <target>, CPU <current>; not mapped now`, it means the breakpoint was set in `<target>`, but the running program must first activate the relevant bank so that the breakpoint will pause the CPU. The `<current>` bank reflects the machine's last known state (after a reset or the latest Debug stop); a free-running program that changes `$01` afterwards is picked up at its next Debug stop.
 - On U64, breakpoints in BASIC, KERNAL, and character ROM use temporary patches in the volatile U64 ROM image, so ROM code remains step-capable without copying ROMs into C64 RAM or writing flash.
 - Under heavy concurrent REST memory traffic, the very first pass over a freshly set ROM breakpoint reached by a `G` started without a captured context can occasionally be missed: the Go then times out cleanly (`DEBUG TIMEOUT`), the breakpoint stays armed, and retrying the `G` succeeds. Once a context has been captured, ROM breakpoints and stepping are exact.
+- On the Overlay (local-UI) screen specifically, a contextless entry into a ROM breakpoint can, instead of the clean timeout above, leave the machine unresponsive and require a power cycle or reboot to recover. Prefer Telnet or Freeze for contextless ROM breakpoint entry until this is fixed.
 - RAM-under-KERNAL breakpoints work when KERNAL is banked out.
 
 `C=+R` opens the breakpoint list which offers these shortcuts (the popup help row uses abbreviated forms in parentheses to fit the line):
@@ -869,9 +870,10 @@ have to place a breakpoint by hand to get past an unsafe region:
   the real stack bytes, so a later RTS or free run behaves exactly as an
   undebugged run - and executes other instructions from a small RAM trampoline.
   Before any context is captured, Step Into of those banks stops with
-  `Step Into: run to a breakpoint 1st` (a non-JSR Step Over stops with
-  `Step Over: run to a breakpoint 1st`); run to a breakpoint (or Step Over a
-  JSR) and continue from there.
+  `Step Into: run to a breakpoint 1st` (a non-JSR Step Over in visible ROM
+  only - RAM under ROM keeps non-JSR Step Over available without a context -
+  stops with `Step Over: run to a breakpoint 1st`); run to a breakpoint (or
+  Step Over a JSR) and continue from there.
 
 The debugger never steps the wrong source and never leaves a hidden breakpoint
 patch behind.
