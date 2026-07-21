@@ -39,6 +39,14 @@ import overlay_lifecycle_clean as overlay_lifecycle  # noqa: E402
 MEMORY_MODES = ("ram", "ram-under-rom", "rom")
 INTERFACES = ("telnet", "freeze", "overlay")
 FINAL_STATUSES = ("PASS", "FAIL", "BLOCKED_WITH_EVIDENCE")
+# A contextless visible-ROM breakpoint entry (bp+Go from a short RAM bootstrap)
+# can miss the freshly written ROM-image BRK on the 6510's first fetch - an FPGA
+# instruction-fetch race that a warm/steady real-program run does not hit and
+# that the firmware's in-place relaunch cannot self-heal (it re-fetches the same
+# stale line). A fresh C64 reset restores an independent fetch state, so the ROM
+# entry is retried with reset (each attempt ~80% under load -> 5 attempts
+# ~99.97%), mirroring the debug suite's own _acquire_rom_context_at retry.
+ROM_ENTRY_MAX_ATTEMPTS = 5
 OP_FIELDS = (
     "step_over",
     "step_into",
@@ -1924,15 +1932,38 @@ def run_cell(args: argparse.Namespace, row: dict[str, Any], ledger: Ledger) -> N
             row["program_seed"] = seed
             fixture = build_fixture(row["memory_mode"], args.required_step_into_depth)
             row["fixture"] = fixture.to_json()
-            log_line(f"{cid}: reset baseline")
-            driver.reset_baseline()
-            log_line(f"{cid}: installing fixture seed={seed}")
-            driver.install_fixture(fixture)
-            ledger.save()
+            # The contextless visible-ROM entry can miss the ROM-image BRK on the
+            # first fetch (FPGA fetch-path race). Only a fresh reset gives an
+            # independent retry, so redo the whole reset->fixture->enter for ROM.
+            rom_entry = row["memory_mode"] == "rom"
+            max_attempts = ROM_ENTRY_MAX_ATTEMPTS if rom_entry else 1
+            entry = None
+            for attempt in range(1, max_attempts + 1):
+                log_line(f"{cid}: reset baseline")
+                driver.reset_baseline()
+                log_line(f"{cid}: installing fixture seed={seed}")
+                driver.install_fixture(fixture)
+                ledger.save()
 
-            log_line(f"{cid}: open monitor and enter debug")
-            driver.open_monitor()
-            entry = driver.enter_debug_at(fixture.entry)
+                suffix = f" (attempt {attempt}/{max_attempts})" if rom_entry else ""
+                log_line(f"{cid}: open monitor and enter debug{suffix}")
+                driver.open_monitor()
+                try:
+                    entry = driver.enter_debug_at(fixture.entry)
+                    break
+                except BlockedWithEvidence:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - retry ROM entry only
+                    if not rom_entry or attempt >= max_attempts:
+                        raise
+                    driver.event(
+                        "rom_entry_retry", attempt=attempt,
+                        reason=("contextless ROM breakpoint entry missed on first "
+                                "fetch (FPGA race); reset+retry: "
+                                + str(exc).splitlines()[0][:120]))
+                    log_line(f"{cid}: ROM entry attempt {attempt} missed; reset+retry")
+            if rom_entry and attempt > 1:
+                driver.event("rom_entry_recovered", attempts=attempt)
             row["start_pc"] = f"{entry.pc:04X}"
             row["footer_validated"] = not driver.contextless_entry()
             assert_state_pc_sp(entry, fixture.entry, None, "entry")

@@ -822,6 +822,21 @@ bool BrkDebugSession :: has_high_memory_patch(void) const
     return false;
 }
 
+bool BrkDebugSession :: has_visible_rom_patch(void) const
+{
+    // True when a BRK patch sits in a visible-ROM window (BASIC/KERNAL/CHAR
+    // image), whose live 6510 instruction-fetch path can lag a DMA commit. Used
+    // to gate the sustained fetch-path settle on a contextless launch toward
+    // such a patch, independent of the launch/bootstrap PC's own bank.
+    for (int i = 0; i < MAX_PATCHES; i++) {
+        if (patches[i].used &&
+                monitor_backing_store_is_visible_rom(patches[i].target)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 
 bool BrkDebugSession :: begin_clean_stopped_session(void)
 {
@@ -940,7 +955,12 @@ DebugSession::Result BrkDebugSession :: relaunch_on_breakpoint_runaway(
         } else if (launch_ctx) {
             release_to_run(launch_ctx, launch_byte_last);
         } else {
-            nmi_redirect_to(nmi_target, cpu_port, nmi_force_cpu_port, false);
+            // No-context relaunch after a visible-ROM launch missed its BRK: the
+            // CPU has been reparked in the RAM spin loop, far from the target, so
+            // settle the fetch path before re-redirecting (same rationale as the
+            // initial contextless visible-ROM launch).
+            nmi_redirect_to(nmi_target, cpu_port, nmi_force_cpu_port, false,
+                            nmi_force_cpu_port);
         }
         waited = wait_for_sentinel(wait_ms);
     }
@@ -1485,8 +1505,23 @@ DebugSession::Result BrkDebugSession :: perform_run(const DebugContext *from,
             nmi_launch_target = start_pc;
             nmi_launch_force_cpu_port = force_cpu_port;
         }
+        // Contextless visible-ROM launch (bp+Go / run-to a KERNAL/BASIC target
+        // from a RAM bootstrap): the freshly DMA-committed ROM-image BRK can lag
+        // the live 6510 instruction-fetch path, so the CPU races past the target
+        // BRK and never traps (intermittent entry "DEBUG TIMEOUT" under load).
+        // Unlike a parked/context launch, here the CPU sits at its own running PC
+        // far from the target, so a sustained fetch-path settle safely clocks
+        // that unrelated code to propagate the ROM image into the fetch path
+        // before the NMI redirects execution toward the target. Skipped when a
+        // launch context is present (the CPU is at the launch PC and a settle
+        // could run it past a nearby BRK) - matching release_to_run's gating.
+        // Gate on the installed BREAKPOINT bank (visible ROM), not the launch
+        // PC's bank: the bootstrap that the CPU is redirected to lives in RAM, so
+        // force_cpu_port (derived from start_pc) is false here even though the
+        // target BRK is in a fetch-lagging ROM window.
+        bool rom_entry_settle = (launch_ctx == 0) && has_visible_rom_patch();
         nmi_redirect_to(start_pc, cpu_port,
-                        force_cpu_port, staged);
+                        force_cpu_port, staged, rom_entry_settle);
         if (staged) {
             request_staged_nmi();
         }
@@ -2750,8 +2785,23 @@ DebugSession::Result BrkDebugSession :: go(const DebugContext &from,
             nmi_launch_target = start_pc;
             nmi_launch_force_cpu_port = force_cpu_port;
         }
+        // Contextless visible-ROM launch (bp+Go / run-to a KERNAL/BASIC target
+        // from a RAM bootstrap): the freshly DMA-committed ROM-image BRK can lag
+        // the live 6510 instruction-fetch path, so the CPU races past the target
+        // BRK and never traps (intermittent entry "DEBUG TIMEOUT" under load).
+        // Unlike a parked/context launch, here the CPU sits at its own running PC
+        // far from the target, so a sustained fetch-path settle safely clocks
+        // that unrelated code to propagate the ROM image into the fetch path
+        // before the NMI redirects execution toward the target. Skipped when a
+        // launch context is present (the CPU is at the launch PC and a settle
+        // could run it past a nearby BRK) - matching release_to_run's gating.
+        // Gate on the installed BREAKPOINT bank (visible ROM), not the launch
+        // PC's bank: the bootstrap that the CPU is redirected to lives in RAM, so
+        // force_cpu_port (derived from start_pc) is false here even though the
+        // target BRK is in a fetch-lagging ROM window.
+        bool rom_entry_settle = (launch_ctx == 0) && has_visible_rom_patch();
         nmi_redirect_to(start_pc, cpu_port,
-                        force_cpu_port, staged);
+                        force_cpu_port, staged, rom_entry_settle);
         if (staged) {
             request_staged_nmi();
         }

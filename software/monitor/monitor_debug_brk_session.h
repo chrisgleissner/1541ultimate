@@ -219,6 +219,7 @@ private:
     bool recommit_visible_rom_fetch_byte(uint16_t addr, uint8_t cpu_port);
     bool has_banked_ram_patch(void) const;
     bool has_high_memory_patch(void) const;
+    bool has_visible_rom_patch(void) const;
     bool has_any_patch(void) const;
     bool captured_at_installed_patch(uint16_t *captured_brk_pc = 0);
     void reinstall_handler_bytes(void);
