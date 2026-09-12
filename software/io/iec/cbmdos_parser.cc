@@ -134,7 +134,7 @@ int parse_dir_option(const char *buf, dir_options_t &opt)
     case 'R': opt.filetypes |= 0x10; break;
     case 'B': opt.filetypes |= 0x20; break;
     case 'D': opt.filetypes |= 0x20; break;
-    case 'H': opt.filetypes |= 0x40; break;
+    case 'H': opt.show_hidden = true; break; // a flag, not a file type (SI-134)
     case 'N': opt.timefmt = e_stamp_none; break;
     case '<':
     case '>':

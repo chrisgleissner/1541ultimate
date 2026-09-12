@@ -14,7 +14,9 @@ typedef enum _t_channel_state {
     
 } t_channel_state;
 
-static uint8_t c_header[32] = { 1,  1,  4,  1,  0,  0, 18, 34,
+// A listing is a BASIC program: load address $0401, then the header line with a link
+// of $0101 (SI-130).
+static uint8_t c_header[32] = { 1,  4,  1,  1,  0,  0, 18, 34,
                             32, 32, 32, 32, 32, 32, 32, 32,
                             32, 32, 32, 32, 32, 32, 32, 32,
                             34, 32, 48, 48, 32, 50, 65,  0 };

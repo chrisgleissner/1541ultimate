@@ -2764,6 +2764,102 @@ static void s11_si150_deep_path(FileManager *fm, IecDrive *dr)
     expect_command_response(testname, dr, "XPWD\r", pwd);
 }
 
+// SI-130 and SI-131: a listing is a BASIC program loaded at $0401, so it starts with
+// the load address 01 04 and a link 01 01; byte 4 is the partition number.
+static void s11_si130_listing_header(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI130-ListingHeader";
+    s11_partition(fm, dr, "si130");
+    uint8_t listing[4096];
+    read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    printf("%s: first bytes %02X %02X %02X %02X %02X\n", testname,
+           listing[0], listing[1], listing[2], listing[3], listing[4]);
+    REQUIRE((listing[0] == 0x01) && (listing[1] == 0x04));
+    REQUIRE((listing[2] == 0x01) && (listing[3] == 0x01));
+    REQUIRE(listing[4] == 40);
+}
+
+// The line of a listing whose quoted name is `name`, or NULL.
+static const uint8_t *s11_listing_line(const uint8_t *listing, int length, const char *name)
+{
+    char quoted[24];
+    snprintf(quoted, sizeof(quoted), "\"%s\"", name);
+    for (int offset = 32; offset + 32 <= length; offset += 32) {
+        if (memmem(listing + offset, 32, quoted, strlen(quoted))) {
+            return listing + offset;
+        }
+    }
+    return NULL;
+}
+
+// SI-133: the low byte of each line's link is (file size mod 254) + 2, so a program can
+// work out a file's exact length from the listing.
+static void s11_si133_size_remainder(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI133-SizeRemainder";
+    const char *path = s11_partition(fm, dr, "si133");
+    uint32_t tr;
+    uint8_t data[600];
+    memset(data, 'x', sizeof(data));
+    REQUIRE(fm->save_file(true, path, "TEN.prg", data, 10, &tr) == FR_OK);
+    REQUIRE(fm->save_file(true, path, "EXACT.prg", data, 254, &tr) == FR_OK);
+    REQUIRE(fm->save_file(true, path, "LONGER.prg", data, 300, &tr) == FR_OK);
+    uint8_t listing[4096];
+    int got = read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    static const struct { const char *name; uint8_t link; } cases[] = {
+        { "TEN", 12 }, { "EXACT", 2 }, { "LONGER", 48 },
+    };
+    for (int i = 0; i < 3; i++) {
+        const uint8_t *line = s11_listing_line(listing, got, cases[i].name);
+        REQUIRE(line != NULL);
+        printf("%s: %s link %02X %02X, expected %02X 01\n", testname, cases[i].name, line[0], line[1], cases[i].link);
+        REQUIRE((line[0] == cases[i].link) && (line[1] == 0x01));
+    }
+}
+
+// SI-134: $:*=H lists what $:* lists; H shows hidden files and filters nothing out.
+static void s11_si134_hidden_flag(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI134-HiddenFlag";
+    const char *path = s11_partition(fm, dr, "si134");
+    uint32_t tr;
+    REQUIRE(fm->save_file(true, path, "VISIBLE.prg", (const uint8_t *)"V", 1, &tr) == FR_OK);
+    expect_command_ok(testname, dr, "MD:FOLDER\r");
+    uint8_t all[4096], hidden[4096];
+    int n_all = read_directory_stream(testname, dr, "$:*", all, sizeof(all));
+    int n_hidden = read_directory_stream(testname, dr, "$:*=H", hidden, sizeof(hidden));
+    printf("%s: $:* is %d bytes, $:*=H is %d bytes\n", testname, n_all, n_hidden);
+    REQUIRE(s11_listing_line(hidden, n_hidden, "VISIBLE") != NULL);
+    REQUIRE(s11_listing_line(hidden, n_hidden, "FOLDER") != NULL);
+    REQUIRE(n_all == n_hidden);
+}
+
+// SI-065: the header of a listing carries the listed directory's own name, and the
+// partition's name only at the root.
+static void s11_si065_header_name(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI065-HeaderName";
+    s11_partition(fm, dr, "si065");
+    expect_command_ok(testname, dr, "MD:GAMES\r");
+    expect_command_ok(testname, dr, "MD/GAMES/:ACTION\r");
+    uint8_t listing[4096];
+    char header[17];
+    header[16] = 0;
+    read_directory_stream(testname, dr, "$/GAMES/", listing, sizeof(listing));
+    memcpy(header, listing + 8, 16);
+    printf("%s: header of $/GAMES/ is '%s'\n", testname, header);
+    REQUIRE(memcmp(listing + 8, "GAMES           ", 16) == 0);
+    expect_command_ok(testname, dr, "CD//GAMES/ACTION\r");
+    read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    memcpy(header, listing + 8, 16);
+    printf("%s: header of $ in ACTION is '%s'\n", testname, header);
+    REQUIRE(memcmp(listing + 8, "ACTION          ", 16) == 0);
+    read_directory_stream(testname, dr, "$//", listing, sizeof(listing));
+    memcpy(header, listing + 8, 16);
+    printf("%s: header of $// is '%s'\n", testname, header);
+    REQUIRE(memcmp(listing + 8, "SUITE11         ", 16) == 0);
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -2795,6 +2891,10 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-SI060-MdColon",           s11_si060_md_colon },
     { "Suite11-SI063-RdNoPath",          s11_si063_rd_no_path },
     { "Suite11-SI150-DeepPath",          s11_si150_deep_path },
+    { "Suite11-SI130-ListingHeader",     s11_si130_listing_header },
+    { "Suite11-SI133-SizeRemainder",     s11_si133_size_remainder },
+    { "Suite11-SI134-HiddenFlag",        s11_si134_hidden_flag },
+    { "Suite11-SI065-HeaderName",        s11_si065_header_name },
 };
 
 // Runs every case, or only those whose name contains `only`.

@@ -650,6 +650,19 @@ int main(int argc, const char *argv[])
 
     d_parse_open("$=P:*=X", o, ERR_SYNTAX);
 
+    // SI-134: H is not a file type but a flag that shows hidden files, so it must not
+    // set a type bit: $:*=H lists what $:* lists.
+    d_parse_open("$:*=H", o, 0,
+                { -1, "", "*", true, false, e_any, e_not_set,
+                  e_stream_dir, e_stamp_none, 0x0, 0x00, 0x00 });
+    if (!o.dir_opt.show_hidden) {
+        printf("Open '$:*=H' does not ask for hidden files\n");
+        failures++;
+    }
+    d_parse_open("$:*=P,H", o, 0,
+                { -1, "", "*", true, false, e_any, e_not_set,
+                  e_stream_dir, e_stamp_none, 0x0, 0x00, 0x02 });
+
     d_parse_open("$//", o, 0,
                 { -1, "//", "", false, false, e_any, e_not_set,
                   e_stream_dir, e_stamp_none, 0x0, 0x00, 0x00 });

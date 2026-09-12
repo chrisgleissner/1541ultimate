@@ -1087,6 +1087,8 @@ int IecChannel::read_dir_entry(void)
             return 0;
         }
 
+        buffer[0] = 1;
+        buffer[1] = 1;
         if (dir_free > 65535) {
             buffer[2] = 0xFF;
             buffer[3] = 0xFF;
@@ -1155,6 +1157,12 @@ int IecChannel::read_dir_entry(void)
         chars++;
     }
     int spaces = 3 - chars;
+    // The low byte of the link carries the size remainder, (size mod 254) + 2, where the
+    // size is exact (SI-133). A CBM image counts whole blocks and a partition line has no
+    // size, so those keep the plain link.
+    bool exact_size = !partition_type && !(info.fs && info.fs->supports_direct_sector_access());
+    buffer[0] = exact_size ? (uint8_t)((info.size % 254) + 2) : 1;
+    buffer[1] = 1;
     buffer[2] = size & 255;
     buffer[3] = size >> 8;
     int pos = 4;
@@ -1224,7 +1232,8 @@ int IecChannel :: setup_directory_read()
     petscii_to_fat(name_to_open.file.filename.c_str(), fatname, 48);
 
     mstring work;
-    FRESULT fres = resolve_directory_path(fm, partition, name_to_open.file.path, work);
+    mstring relative;
+    FRESULT fres = resolve_directory_path(fm, partition, name_to_open.file.path, work, &relative);
     if (fres != FR_OK) {
         drive->set_error(ERR_DIRECTORY_ERROR, drive->vfs->GetTargetPartitionNumber(name_to_open.file.partition), 0);
         state = e_error;
@@ -1268,8 +1277,36 @@ int IecChannel :: setup_directory_read()
         }
     }
 
-    //const char *fullname = part->GetRelativePath();
-    const char *pp = partition->GetName(); // new feature!
+    // The header names the listed directory as it appears in its parent, and the
+    // partition only at the root (SI-065, SD fat_getdirlabel()).
+    const char *rel = relative.c_str();
+    int rel_len = strlen(rel);
+    while ((rel_len > 0) && (rel[rel_len - 1] == '/')) {
+        rel_len--;
+    }
+    if (rel_len > 0) {
+        int start = rel_len;
+        while ((start > 0) && (rel[start - 1] != '/')) {
+            start--;
+        }
+        FileInfo dirinfo(40);
+        int n = rel_len - start;
+        if (n > dirinfo.lfsize - 1) {
+            n = dirinfo.lfsize - 1;
+        }
+        memcpy(dirinfo.lfname, rel + start, n);
+        dirinfo.lfname[n] = 0;
+        dirinfo.attrib = AM_DIR;
+        char cbm_name[24];
+        filetype_t ftype = e_any;
+        IecPartition::CreateIecName(&dirinfo, cbm_name, ftype);
+        for (int i = 0; (i < 16) && cbm_name[i]; i++) {
+            buffer[8 + i] = cbm_name[i];
+        }
+        return 0;
+    }
+
+    const char *pp = partition->GetName();
     int pos = 8;
     int len = strlen(pp);
     if (len > 16) {

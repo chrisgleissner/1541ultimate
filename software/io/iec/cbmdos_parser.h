@@ -50,9 +50,10 @@ typedef struct {
     uint32_t max_datetime;
     uint8_t filetypes; // P,S,U,R, B/D
     uint8_t partition_types; // one bit per CMD partition type; zero means all of them
+    bool show_hidden; // H: also list hidden files; not a file type (SI-134)
 } dir_options_t;
 
-const dir_options_t c_dir_options_init = { e_stream_file, e_stamp_none, 0, 0, 0x00, 0x00 };
+const dir_options_t c_dir_options_init = { e_stream_file, e_stamp_none, 0, 0, 0x00, 0x00, false };
 
 typedef struct {
     filename_t file;
