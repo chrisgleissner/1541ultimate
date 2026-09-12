@@ -733,13 +733,13 @@ int main(int argc, const char *argv[])
     test_command( 0, (const uint8_t *)"CP123", 5);
     test_command( 0, (const uint8_t *)"CP1234", 6);
     test_command( 0, (const uint8_t *)"C\xD0\x1F", 3);
-    test_command( 0, (const uint8_t *)"N3/INSOMEDIR:HELL/HEAVEN=D64,NAME OF DISK,XX", 44);
-    test_command( 0, (const uint8_t *)"N:HELLO,123", 11);
-    test_command( 0, (const uint8_t *)"N:HELLO,23", 10);
-    test_command( 0, (const uint8_t *)"N:HELLO,A", 9);
-    test_command( 0, (const uint8_t *)"N:HELLO,", 8);
-    test_command( 0, (const uint8_t *)"N:HELLO", 7);
-    test_command( 0, (const uint8_t *)"N:", 2);
+    // N[n][path]:name[,id] (SI-071): the parser passes the name and the id on.
+    test_dispatch_text("N3//DISKS/:HELLO.D64,AB", 23, 0, "format", "3|//DISKS/|HELLO.D64|AB");
+    test_dispatch_text("N:HELLO,123\r", 12, 0, "format", "-1||HELLO|123");
+    test_dispatch_text("N:HELLO", 7, 0, "format", "-1||HELLO|");
+    test_dispatch("N:", 2, 34, NULL);
+    test_dispatch("N:,AB", 5, 34, NULL);
+    test_dispatch("NHELLO,AB", 9, 34, NULL);
     test_command( 0, (const uint8_t *)"MD:TEMP", 7);
     test_command( 0, (const uint8_t *)"MD1:TEMP", 8);
     test_command( 0, (const uint8_t *)"MD1//:TEMP", 10);

@@ -403,7 +403,7 @@ class IecCommandChannel: public IecChannel, public IecCommandExecuter {
     int do_copy(filename_t& dest, filename_t sources[], int n);
     int do_initialize();
     int do_initialize_buffers();
-    int do_format(uint8_t *name, uint8_t id1, uint8_t id2);
+    int do_format(filename_t& dest, const char *id);
     int do_rename(filename_t &src, filename_t &dest);
     int do_scratch(filename_t filenames[], int n);
     int do_cmd_response(uint8_t *data, int len);

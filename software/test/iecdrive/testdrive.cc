@@ -3055,6 +3055,71 @@ static void s11_si083_seek_write_image(FileManager *fm, IecDrive *dr)
     close_file(dr, chan);
 }
 
+static uint32_t s11_host_size(FileManager *fm, const char *dir, const char *name)
+{
+    char host[96];
+    snprintf(host, sizeof(host), "%s/%s", dir, name);
+    FileInfo info(16);
+    if (fm->fstat(host, info) != FR_OK) {
+        return 0;
+    }
+    return info.size;
+}
+
+// SI-071: N:name[,id] creates a disk image, or formats one, the way sd2iec does, because
+// this drive has no medium of its own to format. The extension picks the format; no
+// extension means .D64, and then an existing file is not overwritten.
+static void s11_si071_format(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI071-Format";
+    const char *path = s11_partition(fm, dr, "si071");
+    static const struct { const char *cmd; const char *file; uint32_t size; } images[] = {
+        { "N:ONE.D64,AA\r",  "ONE.D64", 174848 },
+        { "N:TWO.D71,AB\r",  "TWO.D71", 349696 },
+        { "N:THREE.D81,AC\r", "THREE.D81", 819200 },
+    };
+    for (int i = 0; i < 3; i++) {
+        expect_command_ok(testname, dr, images[i].cmd);
+        uint32_t size = s11_host_size(fm, path, images[i].file);
+        printf("%s: %s is %u bytes, expected %u\n", testname, images[i].file, size, images[i].size);
+        REQUIRE(size == images[i].size);
+    }
+    // A created image mounts, lists with its label, and takes files.
+    expect_command_ok(testname, dr, "CD:ONE.D64\r");
+    expect_directory_contains(testname, dr, "$", "\"ONE ");
+    expect_iec_write_ok(testname, dr, 2, "INSIDE,S,W", "in the image");
+    expect_iec_file(testname, dr, 2, "INSIDE,S,R", "in the image");
+    expect_command_ok(testname, dr, "CD:_\r");
+    // Given explicitly, an existing image's extension means format it again.
+    expect_command_ok(testname, dr, "N:ONE.D64,ZZ\r");
+    expect_command_ok(testname, dr, "CD:ONE.D64\r");
+    expect_iec_file_missing(testname, dr, 2, "INSIDE,S,R");
+    expect_command_ok(testname, dr, "CD:_\r");
+
+    // A DNP takes a three digit track count as its id and is created, not formatted.
+    expect_command_ok(testname, dr, "N:FOUR.DNP,002\r");
+    REQUIRE(s11_host_size(fm, path, "FOUR.DNP") == 2 * 65536);
+    expect_command_response(testname, dr, "N:FOUR.DNP,002\r", "63,FILE EXISTS,00,00\r");
+
+    // No extension: .D64 is added, and an existing one is left alone.
+    expect_command_ok(testname, dr, "N:PLAIN,PL\r");
+    REQUIRE(s11_host_size(fm, path, "PLAIN.D64") == 174848);
+    expect_command_response(testname, dr, "N:PLAIN,PL\r", "63,FILE EXISTS,00,00\r");
+
+    // A new image needs an id, of two or three characters; the name needs a colon.
+    expect_command_response(testname, dr, "N:NOID.D64\r", "30,SYNTAX ERROR,00,00\r");
+    REQUIRE(s11_host_size(fm, path, "NOID.D64") == 0);
+    expect_command_response(testname, dr, "N:BADID.D64,A\r", "30,SYNTAX ERROR,00,00\r");
+    expect_command_response(testname, dr, "N:BADDNP.DNP,12\r", "30,SYNTAX ERROR,00,00\r");
+    expect_command_response(testname, dr, "NNOCOLON,AA\r", "34,SYNTAX ERROR,00,00\r");
+    expect_command_response(testname, dr, "N:,AA\r", "34,SYNTAX ERROR,00,00\r");
+    // Room for the image is checked before anything is created.
+    expect_command_response(testname, dr, "N:HUGE.DNP,255\r", "72,DISK FULL,00,00\r");
+    REQUIRE(s11_host_size(fm, path, "HUGE.DNP") == 0);
+
+    expect_command_response(testname, dr, "S:*\r", "01, FILES SCRATCHED,05,00\r");
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -3096,6 +3161,7 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-SI074-RenameChecks",      s11_si074_rename_checks },
     { "Suite11-SI083-SeekWrite",         s11_si083_seek_write },
     { "Suite11-SI083-SeekWriteImage",    s11_si083_seek_write_image },
+    { "Suite11-SI071-Format",            s11_si071_format },
 };
 
 // Runs every case, or only those whose name contains `only`.

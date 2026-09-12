@@ -91,7 +91,7 @@ public:
     virtual int do_copy(filename_t& dest, filename_t sources[], int n) { return 0; }
     virtual int do_initialize() { return 0; }
     virtual int do_initialize_buffers() { return 0; }
-    virtual int do_format(uint8_t *name, uint8_t id1, uint8_t id2) { return 0; }
+    virtual int do_format(filename_t& dest, const char *id) { return 0; }
     virtual int do_rename(filename_t &src, filename_t &dest) { return 0; }
     virtual int do_scratch(filename_t filenames[], int n) { return 0; }
     virtual int do_cmd_response(uint8_t *data, int len) { return 0; }

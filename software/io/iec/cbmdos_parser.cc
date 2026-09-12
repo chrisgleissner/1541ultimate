@@ -466,35 +466,28 @@ int IecParser :: initialize_command(const uint8_t *buffer, int len)
     return exec->do_initialize_buffers();
 }
 
+// N[n][path]:name[,id] creates or formats a disk image (SI-071, SD parse_new()). The
+// name needs a colon in front of it, and is split from the id at the first comma.
 int IecParser :: format_command(const uint8_t *buffer, int len)
 {
     mstring cmd((const char *)buffer, 1, len-1);    
-
-    const char *create[2];
-    int n = cmd.split('=', create, 2);;
-    if (n == 2) { // create!
-        filename_t dest;
-        int err = parse_full_path(create[0], dest, NULL, false);
-        if (err) {
-            return err;
-        }
-        printf("Create disk image command: (%d) %s:%s, cmd: %s\n", dest.partition, dest.path.c_str(), dest.filename.c_str(), create[1]);
-        return 0;
+    if (!strchr(cmd.c_str(), ':')) {
+        return ERR_NO_NAME;
     }
-
-    uint8_t name[24] = { 0xA0 };
-    name[23] = 0;
-    uint8_t id1 = 0xA0, id2 = 0xA0;
-    for(int i=2;i<len;i++) {
-        if (buffer[i] == ',') {
-            id1 = (i+1 < len)?buffer[i+1]:0xA0;
-            id2 = (i+2 < len)?buffer[i+2]:0xA0;
-            break;
-        } else {
-            name[i-2] = buffer[i];
-        }
+    filename_t dest;
+    int err = parse_full_path(cmd.c_str(), dest, NULL, false);
+    if (err) {
+        return err;
     }
-    return exec->do_format(name, id1, id2);
+    const char *id = "";
+    const char *rest;
+    if (dest.filename.split(',', &rest)) {
+        id = rest;
+    }
+    if (dest.filename.length() == 0) {
+        return ERR_NO_NAME;
+    }
+    return exec->do_format(dest, id);
 }
 
 int IecParser :: position_command(const uint8_t *buffer, int len)

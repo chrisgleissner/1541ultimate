@@ -2,6 +2,8 @@
 #include "dump_hex.h"
 #include "rtc.h"
 #include "iec_trace.h"
+#include "blockdev_file.h"
+#include "filesystem_d64.h"
 #include <stdarg.h>
 
 /* ------------------------------------------------------------------------------
@@ -719,10 +721,38 @@ static void iec_path_to_fs_path(mstring &path)
     path.replace("//", "/");
 }
 
+// The disk image formats, by the extension of a name (SD check_imageext()).
+typedef enum { e_image_none, e_image_d64, e_image_d71, e_image_d81, e_image_dnp } iec_image_t;
+
+static iec_image_t iec_image_type(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    if (!dot || (strlen(dot) != 4)) {
+        return e_image_none;
+    }
+    char ext[4] = { (char)toupper(dot[1]), (char)toupper(dot[2]), (char)toupper(dot[3]), 0 };
+    if (!strcmp(ext, "D64") || !strcmp(ext, "D41")) {
+        return e_image_d64;
+    }
+    if (!strcmp(ext, "D71")) {
+        return e_image_d71;
+    }
+    if (!strcmp(ext, "D81")) {
+        return e_image_d81;
+    }
+    if (!strcmp(ext, "DNP")) {
+        return e_image_dnp;
+    }
+    return e_image_none;
+}
+
 // A disk image or a cartridge is stored under exactly its own name, with no type
 // extension, so that a PC sees GAME.D81 and not GAME.D81.prg (SI-072, SD should_save_raw()).
 static bool iec_name_is_raw(const char *name)
 {
+    if (iec_image_type(name) != e_image_none) {
+        return true;
+    }
     const char *dot = strrchr(name, '.');
     if (!dot) {
         return false;
@@ -731,11 +761,6 @@ static bool iec_name_is_raw(const char *name)
     int n = 0;
     for (const char *p = dot + 1; *p && (n < 5); p++) {
         ext[n++] = toupper(*p);
-    }
-    if ((n == 3) && (ext[0] == 'D') &&
-        (!strncmp(ext, "D64", 3) || !strncmp(ext, "D41", 3) || !strncmp(ext, "D71", 3) ||
-         !strncmp(ext, "D81", 3) || !strncmp(ext, "DNP", 3))) {
-        return true;
     }
     return ((n == 3) && !strncmp(ext, "CRT", 3)) || ((n == 4) && !strncmp(ext, "TCRT", 4));
 }
@@ -2112,9 +2137,110 @@ int IecCommandChannel::do_initialize_buffers()
     return 0;
 }
 
-int IecCommandChannel::do_format(uint8_t *name, uint8_t id1, uint8_t id2)
+// N[n][path]:name[,id] (SI-071). This drive has no medium of its own to format, so like
+// sd2iec it creates a disk image, or formats one that exists, chosen by the extension:
+// .D64 or .D41, .D71, .D81, and .DNP, whose id is a three digit track count and which is
+// created but not formatted. A name without an image extension gets .D64, and then an
+// existing file is left alone, as an existing DNP always is. A new image needs an id.
+int IecCommandChannel::do_format(filename_t& dest, const char *id)
 {
-    printf("Format: %s %02x %02x\n", name, id1, id2);
+    if (int err = drive->refuse_write()) {
+        return err;
+    }
+    GETPARTITION(dest.partition, partition, -1);
+    mstring dir;
+    FRESULT fres = resolve_directory_path(fm, partition, dest.path, dir);
+    if (fres != FR_OK) {
+        drive->set_error_fres(fres);
+        return 0;
+    }
+
+    char name[24];
+    char label[24];
+    strncpy(name, dest.filename.c_str(), 19);
+    name[19] = 0;
+    strcpy(label, name);
+    iec_image_t kind = iec_image_type(name);
+    bool extension_given = (kind != e_image_none);
+    if (extension_given) {
+        label[strrchr(label, '.') - label] = 0;
+    } else {
+        kind = e_image_d64;
+        strcat(name, ".D64");
+    }
+
+    int idlen = strlen(id);
+    if (kind == e_image_dnp) {
+        if (idlen && ((idlen != 3) || !isdigit(id[0]) || !isdigit(id[1]) || !isdigit(id[2]))) {
+            return ERR_SYNTAX_ERROR_GEN;
+        }
+    } else if (idlen && ((idlen < 2) || (idlen > 3))) {
+        return ERR_SYNTAX_ERROR_GEN;
+    }
+
+    char host[52];
+    petscii_to_fat(name, host, sizeof(host));
+    mstring full(dir.c_str());
+    append_path_component(full, host);
+
+    File *f = NULL;
+    FileInfo existing(8);
+    if (fm->fstat(full.c_str(), existing) == FR_OK) {
+        if (!extension_given || (kind == e_image_dnp)) {
+            return ERR_FILE_EXISTS;
+        }
+        fres = fm->fopen(full.c_str(), FA_READ | FA_WRITE, &f);
+    } else {
+        if (!idlen) {
+            return ERR_SYNTAX_ERROR_GEN;
+        }
+        uint32_t size = 0;
+        switch (kind) {
+        case e_image_d64: size = 174848; break;
+        case e_image_d71: size = 349696; break;
+        case e_image_d81: size = 819200; break;
+        default: size = 65536 * (uint32_t)atoi(id); break;
+        }
+        if (size == 0) {
+            return ERR_FILE_NOT_FOUND;
+        }
+        Path dir_path(dir.c_str());
+        uint32_t free_clusters = 0, cluster_size = 0;
+        if ((fm->get_free(&dir_path, free_clusters, cluster_size) == FR_OK) &&
+            (((uint64_t)free_clusters * cluster_size) < size)) {
+            return ERR_DISK_FULL;
+        }
+        fres = fm->fopen(full.c_str(), FA_CREATE_NEW | FA_READ | FA_WRITE, &f);
+        if ((fres == FR_OK) && (kind == e_image_dnp)) {
+            fres = f->seek(size); // the space is claimed; the image is not formatted
+        } else if (fres == FR_OK) {
+            uint8_t empty[256];
+            memset(empty, 0, sizeof(empty));
+            for (uint32_t done = 0; (done < size) && (fres == FR_OK); done += sizeof(empty)) {
+                uint32_t transferred;
+                fres = f->write(empty, sizeof(empty), &transferred);
+            }
+        }
+    }
+
+    if ((fres == FR_OK) && (kind != e_image_dnp)) {
+        // The file system stack borrows f, so it goes out of scope before f is closed.
+        char volume[32];
+        snprintf(volume, sizeof(volume), "%s,%s", label, id);
+        BlockDevice_File blk(f, 256);
+        Partition prt(&blk, 0, 0, 0);
+        switch (kind) {
+        case e_image_d71: { FileSystemD71 fs(&prt, true); fres = fs.format(volume); break; }
+        case e_image_d81: { FileSystemD81 fs(&prt, true); fres = fs.format(volume); break; }
+        default:          { FileSystemD64 fs(&prt, true); fres = fs.format(volume); break; }
+        }
+    }
+    if (f) {
+        fm->fclose(f);
+    }
+    if (fres != FR_OK) {
+        drive->set_error_fres(fres);
+    }
     return 0;
 }
 
