@@ -3548,6 +3548,225 @@ static void s11_si103_resets(FileManager *fm, IecDrive *dr)
     expect_command_response(testname, dr, "XPWD\r", "40:/");
 }
 
+// A host file of `len` bytes: an x00 header naming `cbm_name` with `record_length` at
+// offset 25 when `cbm_name` is given, then `data`.
+static void s11_host_file(FileManager *fm, const char *dir, const char *host, const char *cbm_name,
+                          uint8_t record_length, const uint8_t *data, int len)
+{
+    const char *testname = "Suite11";
+    uint8_t content[600];
+    int n = 0;
+    if (cbm_name) {
+        memset(content, 0, 26);
+        memcpy(content, "C64File", 7);
+        memcpy(content + 8, cbm_name, strlen(cbm_name));
+        content[25] = record_length;
+        n = 26;
+    }
+    memcpy(content + n, data, len);
+    uint32_t tr;
+    REQUIRE(fm->save_file(true, dir, host, content, n + len, &tr) == FR_OK);
+}
+
+// The whole of a host file, or -1 when it does not exist.
+static int s11_read_host_file(FileManager *fm, const char *dir, const char *host, uint8_t *out, int size)
+{
+    uint32_t tr = 0;
+    if (fm->load_file(dir, host, out, size, &tr) != FR_OK) {
+        return -1;
+    }
+    return (int)tr;
+}
+
+// SI-144: a P00, S00, U00 or R00 file that starts with "C64File" lists under the CBM name
+// in its header, with the type of its extension and the size of what follows the 26 byte
+// header, and opens by that name with the header skipped. A file with such an extension
+// and no signature is an ordinary file. Scratch and rename work on the CBM name, and a
+// rename rewrites the name in the header.
+static void s11_si144_read_x00(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI144-ReadX00";
+    const char *path = s11_partition(fm, dr, "si144");
+    s11_host_file(fm, path, "GAME.P00", "MY GAME", 0, (const uint8_t *)"PAYLOAD", 7);
+    s11_host_file(fm, path, "TEXT.S00", "NOTES", 0, (const uint8_t *)"some text", 9);
+    s11_host_file(fm, path, "X.P00", NULL, 0, (const uint8_t *)"not wrapped", 11);
+
+    char type[8];
+    bool present;
+    s11_listing_type(dr, testname, "$", "MY GAME", type, &present);
+    printf("%s: MY GAME listed %d as '%s'\n", testname, present, type);
+    REQUIRE(present && !strcmp(type, "PRG "));
+    s11_listing_type(dr, testname, "$", "NOTES", type, &present);
+    REQUIRE(present && !strcmp(type, "SEQ "));
+    s11_listing_type(dr, testname, "$", "X.P00", type, &present);
+    printf("%s: X.P00 listed %d as '%s'\n", testname, present, type);
+    REQUIRE(present);
+    uint8_t listing[4096];
+    int got = read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    const uint8_t *line = s11_listing_line(listing, got, "MY GAME");
+    REQUIRE(line && (line[0] == (7 % 254) + 2));
+
+    expect_iec_file(testname, dr, 0, "MY GAME", "PAYLOAD");
+    expect_iec_file(testname, dr, 2, "NOTES,S", "some text");
+    expect_iec_file(testname, dr, 2, "X.P00,S", "not wrapped");
+
+    // An append lands after the data and P counts from the start of the data.
+    expect_iec_write_ok(testname, dr, 2, "NOTES,S,A", "!");
+    expect_iec_file(testname, dr, 2, "NOTES,S", "some text!");
+    open_file(dr, 3, "MY GAME,P");
+    get_status(dr);
+    expect_status_ok(testname, "MY GAME,P");
+    expect_rel_position_status(testname, dr, 3, 3, 0, "00, OK,00,00\r");
+    uint8_t rest[16];
+    int count = read_file(dr, 3, rest, sizeof(rest));
+    rest[(count > 0) && (count < 16) ? count : 0] = 0;
+    printf("%s: after P 3 the file reads '%s'\n", testname, (char *)rest);
+    REQUIRE((count == 4) && (memcmp(rest, "LOAD", 4) == 0));
+    close_file(dr, 3);
+
+    expect_command_ok(testname, dr, "R:TUNES=NOTES\r");
+    uint8_t host[64];
+    got = s11_read_host_file(fm, path, "TEXT.S00", host, sizeof(host));
+    printf("%s: after the rename TEXT.S00 is %d bytes, name '%s'\n", testname, got, (char *)host + 8);
+    REQUIRE((got == 36) && (memcmp(host + 8, "TUNES\0", 6) == 0));
+    expect_iec_file(testname, dr, 2, "TUNES,S", "some text!");
+    expect_command_response(testname, dr, "S:TUNES\r", "01, FILES SCRATCHED,01,00\r");
+    REQUIRE(s11_read_host_file(fm, path, "TEXT.S00", host, sizeof(host)) < 0);
+    expect_command_response(testname, dr, "S:MY*\r", "01, FILES SCRATCHED,01,00\r");
+    REQUIRE(s11_read_host_file(fm, path, "GAME.P00", host, sizeof(host)) < 0);
+}
+
+// SI-145: the x00 File Wrapper setting. Off writes plain files; "SEQ, USR and REL" wraps
+// those types and leaves PRG plain; "All files" wraps everything. A new wrapper takes the
+// next free two digit suffix, and a replace keeps the file it replaces.
+static void s11_si145_write_x00(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI145-WriteX00";
+    const char *path = s11_partition(fm, dr, "si145");
+    ConfigStore *cfg = ConfigManager::getConfigManager()->find_store((uint32_t)0x49454300);
+    REQUIRE(cfg);
+    uint8_t host[64];
+
+    expect_iec_write_ok(testname, dr, 2, "PLAIN,S,W", "plain");
+    REQUIRE(s11_read_host_file(fm, path, "PLAIN.seq", host, sizeof(host)) == 5);
+
+    cfg->set_value(0x54, 1);
+    expect_iec_write_ok(testname, dr, 2, "WRAPPED,S,W", "hello");
+    int got = s11_read_host_file(fm, path, "WRAPPED.S00", host, sizeof(host));
+    printf("%s: WRAPPED.S00 is %d bytes\n", testname, got);
+    REQUIRE((got == 31) && (memcmp(host, "C64File\0WRAPPED\0", 16) == 0) && (host[25] == 0));
+    REQUIRE(memcmp(host + 26, "hello", 5) == 0);
+    REQUIRE(s11_read_host_file(fm, path, "WRAPPED.seq", host, sizeof(host)) < 0);
+    expect_iec_file(testname, dr, 2, "WRAPPED,S", "hello");
+    expect_iec_write_ok(testname, dr, 1, "PROG", "prg");
+    REQUIRE(s11_read_host_file(fm, path, "PROG.prg", host, sizeof(host)) == 3);
+
+    // A replace writes the same host file again; a new name that collides takes S01.
+    expect_iec_write_ok(testname, dr, 2, "@:WRAPPED,S,W", "bye");
+    REQUIRE(s11_read_host_file(fm, path, "WRAPPED.S00", host, sizeof(host)) == 29);
+    REQUIRE(memcmp(host + 26, "bye", 3) == 0);
+    REQUIRE(s11_read_host_file(fm, path, "WRAPPED.S01", host, sizeof(host)) < 0);
+    s11_host_file(fm, path, "COLL.S00", "OTHER", 0, (const uint8_t *)"x", 1);
+    expect_iec_write_ok(testname, dr, 2, "COLL,S,W", "coll");
+    got = s11_read_host_file(fm, path, "COLL.S01", host, sizeof(host));
+    printf("%s: COLL.S01 is %d bytes\n", testname, got);
+    REQUIRE((got == 30) && (memcmp(host + 8, "COLL\0", 5) == 0));
+    expect_iec_file(testname, dr, 2, "COLL,S", "coll");
+    expect_iec_file(testname, dr, 2, "OTHER,S", "x");
+
+    cfg->set_value(0x54, 2);
+    expect_iec_write_ok(testname, dr, 1, "PROG2", "prg2");
+    got = s11_read_host_file(fm, path, "PROG2.P00", host, sizeof(host));
+    REQUIRE((got == 30) && (memcmp(host + 8, "PROG2\0", 6) == 0));
+    expect_iec_file(testname, dr, 0, "PROG2", "prg2");
+    cfg->set_value(0x54, 0);
+}
+
+// SI-084 and SI-146: a relative file is read in this firmware's two byte layout, sd2iec's
+// one byte layout, or inside an R00 wrapper, and a relative file created while x00 files
+// are written gets the wrapper, with its record length at offset 25.
+static void s11_si084_rel_layouts(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI084-RelLayouts";
+    const char *path = s11_partition(fm, dr, "si084");
+    const int lengths[] = { 2, 3, 127, 254 };
+    for (int i = 0; i < 4; i++) {
+        int r = lengths[i];
+        for (int layout = 1; layout <= 2; layout++) {
+            // A zero second byte first: that is the file the old reader misread silently.
+            for (int zero_first = 1; zero_first >= 0; zero_first--) {
+                uint8_t data[600];
+                memset(data, 0, sizeof(data));
+                data[0] = (uint8_t)r;
+                int n = layout;
+                for (int rec = 0; rec < 2; rec++) {
+                    for (int b = 0; b < r; b++) {
+                        data[n + b] = (uint8_t)('A' + rec);
+                    }
+                    if (zero_first && (rec == 0)) {
+                        data[n] = 0; // byte 1 of a one byte layout file is then zero too
+                    }
+                    n += r;
+                }
+                char host[24], name[16];
+                snprintf(name, sizeof(name), "R%dL%dZ%d", r, layout, zero_first);
+                snprintf(host, sizeof(host), "%s.rel", name);
+                uint32_t tr;
+                REQUIRE(fm->save_file(true, path, host, data, n, &tr) == FR_OK);
+                expect_rel_open(testname, dr, 2, name, 0);
+                expect_rel_position_status(testname, dr, 2, 2, 1, "00, OK,00,00\r");
+                uint8_t expected[256];
+                memset(expected, 'B', r);
+                uint8_t got[256];
+                memset(got, 0, sizeof(got));
+                int count = read_file(dr, 2, got, sizeof(got));
+                printf("%s: %s record 2 read %d bytes starting %02X\n", testname, name, count, got[0]);
+                REQUIRE((count == r) && (memcmp(got, expected, r) == 0));
+                close_file(dr, 2);
+            }
+        }
+    }
+
+    // A record length of 1 cannot be told apart by size; it is taken as the two byte layout.
+    uint32_t tr;
+    REQUIRE(fm->save_file(true, path, "ONEBYTE.rel", (const uint8_t *)"\x01\x00" "AB", 4, &tr) == FR_OK);
+    expect_rel_open(testname, dr, 2, "ONEBYTE", 0);
+    expect_rel_position_status(testname, dr, 2, 2, 1, "00, OK,00,00\r");
+    uint8_t one[4];
+    REQUIRE((read_file(dr, 2, one, sizeof(one)) == 1) && (one[0] == 'B'));
+    close_file(dr, 2);
+
+    // R00: the record length is at offset 25 and the records follow the header.
+    s11_host_file(fm, path, "WRAP.R00", "WRAPREL", 3, (const uint8_t *)"aaabbb", 6);
+    expect_rel_open(testname, dr, 2, "WRAPREL", 0);
+    expect_rel_position_status(testname, dr, 2, 2, 1, "00, OK,00,00\r");
+    uint8_t rec[8];
+    int count = read_file(dr, 2, rec, sizeof(rec));
+    rec[(count > 0) && (count < 8) ? count : 0] = 0;
+    printf("%s: WRAPREL record 2 read %d bytes '%s'\n", testname, count, (char *)rec);
+    REQUIRE((count == 3) && (memcmp(rec, "bbb", 3) == 0));
+    close_file(dr, 2);
+
+    ConfigStore *cfg = ConfigManager::getConfigManager()->find_store((uint32_t)0x49454300);
+    REQUIRE(cfg);
+    cfg->set_value(0x54, 1);
+    expect_rel_open(testname, dr, 2, "NEWREL", 4);
+    expect_rel_position_status(testname, dr, 2, 2, 1, "50,RECORD NOT PRESENT,00,00\r");
+    expect_rel_write(testname, dr, 2, (const uint8_t *)"WXYZ", 4);
+    close_file(dr, 2);
+    cfg->set_value(0x54, 0);
+    uint8_t host[64];
+    int size = s11_read_host_file(fm, path, "NEWREL.R00", host, sizeof(host));
+    printf("%s: NEWREL.R00 is %d bytes, record length %d\n", testname, size, host[25]);
+    REQUIRE((size == 26 + 8) && (memcmp(host + 8, "NEWREL\0", 7) == 0) && (host[25] == 4));
+    REQUIRE(memcmp(host + 30, "WXYZ", 4) == 0);
+    expect_rel_open(testname, dr, 2, "NEWREL", 0);
+    expect_rel_position_status(testname, dr, 2, 2, 1, "00, OK,00,00\r");
+    count = read_file(dr, 2, rec, sizeof(rec));
+    REQUIRE((count == 4) && (memcmp(rec, "WXYZ", 4) == 0));
+    close_file(dr, 2);
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -3601,6 +3820,9 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-SI137-RawDirectory",      s11_si137_raw_directory },
     { "Suite11-SI137-RawImage",          s11_si137_raw_image },
     { "Suite11-SI103-Resets",            s11_si103_resets },
+    { "Suite11-SI144-ReadX00",           s11_si144_read_x00 },
+    { "Suite11-SI145-WriteX00",          s11_si145_write_x00 },
+    { "Suite11-SI084-RelLayouts",        s11_si084_rel_layouts },
 };
 
 // Runs every case, or only those whose name contains `only`.

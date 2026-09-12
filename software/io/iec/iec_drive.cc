@@ -23,10 +23,15 @@
 #define CFG_IEC_ENABLE   0x51
 #define CFG_IEC_BUS_ID   0x52
 #define CFG_IEC_PATH     0x53
+#define CFG_IEC_X00      0x54
+
+// sd2iec's extension modes 0, 1 and 2 for new files (SI-145).
+static const char *x00_modes[] = { "Off", "SEQ, USR and REL", "All files" };
 
 static struct t_cfg_definition iec_config[] = {
     { CFG_IEC_ENABLE,    CFG_TYPE_ENUM,   "IEC Drive",         "%s", en_dis, 0,  1, 0 },
     { CFG_IEC_BUS_ID,    CFG_TYPE_VALUE,  "Soft Drive Bus ID", "%d", NULL,   8, 30, 11 },
+    { CFG_IEC_X00,       CFG_TYPE_ENUM,   "x00 File Wrapper",  "%s", x00_modes, 0, 2, 0 },
     { 0xFF, CFG_TYPE_END, "", "", NULL, 0, 0, 0 }
 };
 
@@ -228,6 +233,11 @@ void IecDrive :: effectuate_settings(void)
 
     intf->configure();
     trace_configuration("settings");
+}
+
+int IecDrive :: get_x00_mode(void)
+{
+    return cfg->get_value(CFG_IEC_X00);
 }
 
 void IecDrive :: create_task_items(void)

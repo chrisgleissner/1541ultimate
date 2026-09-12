@@ -25,6 +25,11 @@ class IecCommandChannel;
 
 #define MAX_PARTITIONS 256
 
+// x00 wrappers (SI-144): the header in front of the data of a P00, S00, U00 or R00 file.
+#define X00_HEADER_SIZE 26
+bool iec_x00_probe(FileManager *fm, const char *path, char *cbm_name, filetype_t *type, uint8_t *record_length);
+int iec_entry_name(FileManager *fm, const char *dir_path, FileInfo *info, char *cbm_name, filetype_t& type);
+
 static inline bool is_valid_partition_number(int p)
 {
     return (p > 0) && (p < MAX_PARTITIONS);
@@ -305,6 +310,9 @@ class IecChannel {
 
     uint32_t recordOffset;
     uint8_t recordSize;
+    // The bytes in front of the data of the open file: an x00 header, or the record length
+    // of a relative file in one of its layouts (SI-084).
+    uint32_t dataOffset;
     bool recordDirty;
 
     // A direct access channel (#): the partition that was current when it was opened, which
@@ -312,11 +320,12 @@ class IecChannel {
     int buffer_partition;
     int buffer_size;
 
-    // A raw directory, "$" on a secondary address other than 0 (SI-137). In a disk image
-    // raw_path is the image and raw_link the next directory sector, of which raw_sectors
-    // more may be read; elsewhere raw_count counts the entries of the current sector.
+    // The directory a listing reads, which x00 names are probed in (SI-144). A raw directory,
+    // "$" on a secondary address other than 0 (SI-137), in a disk image reads raw_link, the
+    // next directory sector, of which raw_sectors more may be read; elsewhere raw_count
+    // counts the entries of the current sector.
+    mstring dir_path;
     bool raw_dir;
-    mstring raw_path;
     uint8_t raw_link[2];
     int raw_sectors;
     int raw_count;
@@ -348,7 +357,7 @@ class IecChannel {
 private:
     int setup_partition_read();
     int setup_directory_read();
-    int setup_raw_directory(FileSystem *fs, const char *path);
+    int setup_raw_directory(FileSystem *fs);
     int read_raw_directory(void);
     int setup_file_access();
     int setup_buffer_access(void);

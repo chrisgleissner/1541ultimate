@@ -360,6 +360,72 @@ def check_compatibility(agent, api, password, folder, root):
         if where != "1:/":
             raise Failure(f"after U+shifted J the working directory is {where!r}")
 
+    def x00_header(name, record_length=0):
+        return b"C64File\0" + name.ljust(16, b"\0") + b"\0" + bytes([record_length])
+
+    def x00_read():
+        with ftp.session(api.host, password) as client:
+            ftp.store(client, f"{directory}/GAME.P00", x00_header(b"MY GAME") + b"PAYLOAD")
+        listing = listing_of(agent, f"$//{folder.upper()}/:MY*")
+        lines = [parse_directory_line(listing[i:i + LINE]) for i in range(LINE, len(listing) - LINE, LINE)]
+        detail(f"$:MY* lists {lines}")
+        if (1, "MY GAME", "PRG") not in lines:
+            raise Failure(f"GAME.P00 is not listed as MY GAME PRG: {lines}")
+        agent.call(1, channel=3, data=b"//" + here + b"/:MY GAME,P,R")
+        try:
+            agent.status()
+            data = agent.read_stream(channel=3)
+        finally:
+            agent.call(4, channel=3)
+        detail(f"MY GAME reads {data!r}")
+        if data != b"PAYLOAD":
+            raise Failure(f"MY GAME reads {data!r}")
+        agent.command(b"R//" + here + b"/:TUNE=//" + here + b"/:MY GAME\r")
+        with ftp.session(api.host, password) as client:
+            renamed = ftp.retrieve(client, f"{directory}/GAME.P00")
+        detail(f"after R:TUNE=MY GAME the header names {renamed[8:24]!r}")
+        if renamed[:26] != x00_header(b"TUNE"):
+            raise Failure(f"the rename left the header as {renamed[:26]!r}")
+        response = agent.command(b"S//" + here + b"/:TUNE\r", allowed=(1,))
+        with ftp.session(api.host, password) as client:
+            left = ftp.names(client, directory)
+        detail(f"S:TUNE answered {response!r}")
+        if not response.startswith("01, FILES SCRATCHED,01") or "GAME.P00" in left:
+            raise Failure(f"S:TUNE answered {response!r} and left {sorted(left)}")
+
+    def x00_write():
+        api.configs.set("SoftIEC Drive Settings", "x00 File Wrapper", "SEQ, USR and REL")
+        try:
+            agent.call(1, channel=3, data=b"//" + here + b"/:WRAPPED,S,W")
+            try:
+                agent.status()
+                agent.call(2, channel=3, data=b"hello")
+            finally:
+                agent.call(4, channel=3)
+        finally:
+            api.configs.set("SoftIEC Drive Settings", "x00 File Wrapper", "Off")
+        with ftp.session(api.host, password) as client:
+            entries = ftp.names(client, directory)
+            stored = ftp.retrieve(client, f"{directory}/WRAPPED.S00") if "WRAPPED.S00" in entries else b""
+        detail(f"WRAPPED is stored as {sorted(e for e in entries if e.startswith('WRAPPED'))}, {stored!r}")
+        if stored != x00_header(b"WRAPPED") + b"hello":
+            raise Failure(f"WRAPPED.S00 holds {stored!r}")
+
+    def rel_layouts():
+        # sd2iec's layout: the record length in one byte, then records of three bytes.
+        with ftp.session(api.host, password) as client:
+            ftp.store(client, f"{directory}/SDREL.rel", bytes([3]) + b"\0aabbb")
+        agent.call(1, channel=3, data=b"//" + here + b"/:SDREL,L")
+        try:
+            agent.status()
+            agent.command(bytes([ord("P"), 96 + 3, 2, 0, 1]))
+            record = agent.read_stream(channel=3)
+        finally:
+            agent.call(4, channel=3)
+        detail(f"record 2 of SDREL reads {record!r}")
+        if record != b"bbb":
+            raise Failure(f"record 2 of a one byte layout file reads {record!r}")
+
     # Each check reports on its own, so a firmware that fails one still shows the rest.
     failed = []
     for label, action in (
@@ -376,6 +442,9 @@ def check_compatibility(agent, api, password, folder, root):
             ("SI-137: $ on a secondary address other than 0 is the raw directory", raw_directory),
             ("SI-120: T-WI sets the clock, and an impossible date answers 30", clock_write),
             ("SI-103: UJ closes the channels and U+shifted J returns to the root, and the drive still answers", resets),
+            ("SI-144: a P00 file lists, loads, renames and scratches under the name in its header", x00_read),
+            ("SI-145: with the x00 File Wrapper on, a SEQ file is written as an S00 file", x00_write),
+            ("SI-084: a relative file in sd2iec's one byte layout reads its records", rel_layouts),
     ):
         try:
             with check(label):

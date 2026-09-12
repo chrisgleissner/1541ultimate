@@ -240,6 +240,7 @@ IecChannel::IecChannel(IecDrive *dr, int ch)
     flags = 0;
     recordSize = 0;
     recordOffset = 0;
+    dataOffset = 0;
     recordDirty = false;
     dir_free = 0;
     buffer_partition = 0;
@@ -794,6 +795,99 @@ static void append_path_component(mstring& path, const char *component)
     path += component;
 }
 
+// x00 wrappers (SI-144, SD fatops.c): a host file whose extension is P, S, U or R and two
+// digits, and which starts with "C64File" and a zero, carries its CBM name in the 16 bytes
+// at offset 8 and a relative file's record length at offset 25. The data follows the header.
+static bool x00_extension(const char *ext, filetype_t *type)
+{
+    if (!ext || !ext[0] || !isdigit((uint8_t)ext[1]) || !isdigit((uint8_t)ext[2]) || ext[3]) {
+        return false;
+    }
+    switch (toupper((uint8_t)ext[0])) {
+    case 'P': *type = e_prg; return true;
+    case 'S': *type = e_seq; return true;
+    case 'U': *type = e_usr; return true;
+    case 'R': *type = e_rel; return true;
+    }
+    return false;
+}
+
+static bool x00_path(const char *path, filetype_t *type)
+{
+    const char *dot = strrchr(path, '.');
+    return dot && !strchr(dot, '/') && x00_extension(dot + 1, type);
+}
+
+static bool x00_header(const uint8_t *header, uint32_t length, char *cbm_name, uint8_t *record_length)
+{
+    if ((length < X00_HEADER_SIZE) || (memcmp(header, "C64File", 8) != 0)) {
+        return false;
+    }
+    if (cbm_name) {
+        memcpy(cbm_name, header + 8, 16);
+        cbm_name[16] = 0;
+    }
+    if (record_length) {
+        *record_length = header[25];
+    }
+    return true;
+}
+
+static FRESULT x00_write_header(File *f, const char *cbm_name, uint8_t record_length)
+{
+    uint8_t header[X00_HEADER_SIZE];
+    memset(header, 0, sizeof(header));
+    memcpy(header, "C64File", 7);
+    strncpy((char *)header + 8, cbm_name, 16);
+    header[25] = record_length;
+    uint32_t tr;
+    return f->write(header, X00_HEADER_SIZE, &tr);
+}
+
+// The CBM name, and the type, of a host file that is a genuine x00 wrapper; false for any
+// other file, which is not opened unless its extension is an x00 one.
+bool iec_x00_probe(FileManager *fm, const char *path, char *cbm_name, filetype_t *type, uint8_t *record_length)
+{
+    filetype_t found;
+    if (!x00_path(path, &found)) {
+        return false;
+    }
+    File *file = NULL;
+    if (fm->fopen(path, FA_READ, &file) != FR_OK) {
+        return false;
+    }
+    uint8_t header[X00_HEADER_SIZE];
+    uint32_t got = 0;
+    FRESULT fres = file->read(header, X00_HEADER_SIZE, &got);
+    fm->fclose(file);
+    if ((fres != FR_OK) || !x00_header(header, got, cbm_name, record_length)) {
+        return false;
+    }
+    if (type) {
+        *type = found;
+    }
+    return true;
+}
+
+// The name and type a directory entry has on the bus: the name in its x00 header when it
+// is a wrapper, or the host name otherwise. Returns the size of the header, 0 or 26, which
+// the entry's size includes.
+int iec_entry_name(FileManager *fm, const char *dir_path, FileInfo *info, char *cbm_name, filetype_t& type)
+{
+    IecPartition::CreateIecName(info, cbm_name, type);
+    filetype_t wrapped;
+    if ((info->attrib & AM_DIR) || (info->name_format & NAME_FORMAT_CBM) || !dir_path ||
+        !x00_extension(info->extension, &wrapped)) {
+        return 0;
+    }
+    mstring path(dir_path);
+    append_path_component(path, info->lfname);
+    if (!iec_x00_probe(fm, path.c_str(), cbm_name, &type, NULL)) {
+        return 0;
+    }
+    return X00_HEADER_SIZE;
+}
+
 static void partition_relative_to_full_path(IecPartition *partition, Path& relative, mstring& full_path)
 {
     full_path = partition->GetRootPath();
@@ -828,7 +922,7 @@ static FRESULT find_rendered_iec_child(FileManager *fm, const char *full_dir,
 
         char iec_name[24];
         filetype_t found_type = e_any;
-        IecPartition::CreateIecName(&info, iec_name, found_type);
+        iec_entry_name(fm, full_dir, &info, iec_name, found_type);
         if (!is_dir && !iec_file_type_matches(ftype, found_type)) {
             continue;
         }
@@ -1175,10 +1269,10 @@ int IecChannel::read_dir_entry(void)
         return 1;
     }
 
-    // convert FAT name to CBM name
+    // convert FAT name to CBM name; an x00 wrapper lists as what it wraps (SI-144)
     char cbm_name[24];
     filetype_t ftype = e_any;
-    IecPartition::CreateIecName(&info, cbm_name, ftype);
+    info.size -= iec_entry_name(fm, (state == e_dir) ? dir_path.c_str() : NULL, &info, cbm_name, ftype);
     if (ftype == e_any) {
         ftype = e_seq;
     }
@@ -1311,6 +1405,7 @@ int IecChannel :: setup_directory_read()
     DBGIECV("Full Path = %s, filename = %s\n", work.c_str(), fatname);
 
     FileInfo info(40);
+    dir_path = work;
     fres = fm->open_directory(work.c_str(), &dir, &info);
     if (fres != FR_OK) {
         printf("opening dir failed %s\n", FileSystem::get_error_string(fres));
@@ -1386,7 +1481,7 @@ int IecChannel :: setup_directory_read()
             buffer[pos++] = toupper(*(pp++));
     }
     if (channel != 0) {
-        return setup_raw_directory(fs, work.c_str());
+        return setup_raw_directory(fs);
     }
     return 0;
 }
@@ -1397,7 +1492,7 @@ int IecChannel :: setup_directory_read()
 // the chain from the header sector on its directory track. Any other directory, a
 // DNP included, gets a made up BAM sector built from the header line above, then one
 // 32 byte entry per file. The header line is still in the buffer when this is called.
-int IecChannel :: setup_raw_directory(FileSystem *fs, const char *path)
+int IecChannel :: setup_raw_directory(FileSystem *fs)
 {
     raw_dir = true;
     raw_count = 0;
@@ -1410,7 +1505,6 @@ int IecChannel :: setup_raw_directory(FileSystem *fs, const char *path)
         }
     }
     if (header_track) {
-        raw_path = path;
         raw_link[0] = (uint8_t)header_track;
         raw_link[1] = 0;
         raw_sectors = 256; // a bound for a damaged chain that loops
@@ -1444,7 +1538,7 @@ int IecChannel :: setup_raw_directory(FileSystem *fs, const char *path)
 int IecChannel :: read_raw_directory(void)
 {
     if (raw_sectors > 0) {
-        Path path(raw_path.c_str());
+        Path path(dir_path.c_str());
         FRESULT fres = fm->fs_read_sector(&path, buffer, raw_link[0], raw_link[1]);
         raw_sectors--;
         if (fres != FR_OK) {
@@ -1490,7 +1584,7 @@ int IecChannel :: read_raw_directory(void)
     if (entry) {
         char cbm_name[24];
         filetype_t ftype = e_any;
-        IecPartition::CreateIecName(&info, cbm_name, ftype);
+        info.size -= iec_entry_name(fm, dir_path.c_str(), &info, cbm_name, ftype);
         const uint8_t codes[] = { 1, 2, 1, 3, 4, 6 }; // any lists as SEQ, as in a listing
         buffer[2] = 0x80 | codes[(int)ftype];
         if (info.attrib & AM_RDO) {
@@ -1599,7 +1693,9 @@ int IecChannel :: setup_file_access()
             return 0;
         }
         char cbm_name[24];
-        IecPartition::CreateIecName(&info, cbm_name, name_to_open.filetype);
+        if (!iec_x00_probe(fm, full_path, cbm_name, &name_to_open.filetype, NULL)) {
+            IecPartition::CreateIecName(&info, cbm_name, name_to_open.filetype);
+        }
     }
 
     // A save, a write, an append and the creation of a relative file change the medium.
@@ -1637,8 +1733,77 @@ int IecChannel :: setup_file_access()
 
     DBGIECV("Setup File Access %s %02x\n", full_path, flags);
 
-    FRESULT fres = fm->fopen(full_path, flags, &f);
-    if ((fres == FR_NO_FILE) && (name_to_open.access == e_read)) {
+    // A relative file that already exists is opened by its CBM name, which finds it in an
+    // x00 wrapper too (SI-146). With the x00 File Wrapper setting (SI-145), a new file of a
+    // type it covers is created as an x00 file on a host file system, while a file that
+    // exists under the name is replaced, with @, in the layout it has.
+    bool creates = (name_to_open.access == e_write) || ((name_to_open.filetype == e_rel) && name_to_open.record_size);
+    bool wrap = false;
+    bool rewrap = false;
+    FRESULT fres;
+    if (creates && !name_to_open.file.has_wildcard) {
+        int mode = drive->get_x00_mode();
+        bool covered = (name_to_open.filetype == e_seq) || (name_to_open.filetype == e_usr) ||
+                       (name_to_open.filetype == e_rel) || ((mode == 2) && (name_to_open.filetype == e_prg));
+        if (mode && covered) {
+            GETPARTITION(name_to_open.file.partition, partition, 0);
+            mstring dir;
+            FileInfo dir_info(4);
+            Directory *probe_dir = NULL;
+            if ((resolve_directory_path(fm, partition, name_to_open.file.path, dir) == FR_OK) &&
+                (fm->open_directory(dir.c_str(), &probe_dir, &dir_info) == FR_OK)) {
+                delete probe_dir;
+                wrap = dir_info.fs && !dir_info.fs->supports_direct_sector_access();
+            }
+            if (wrap) {
+                work = dir; // the name is chosen below, unless the file exists
+            }
+        }
+        if (wrap || (name_to_open.filetype == e_rel)) {
+            GETPARTITION(name_to_open.file.partition, partition, 0);
+            mstring existing;
+            if (resolve_existing_iec_path(fm, partition, name_to_open.file, name_to_open.filetype,
+                                          false, true, false, existing) == FR_OK) {
+                if ((name_to_open.access == e_write) && !name_to_open.replace) {
+                    drive->set_error(ERR_FILE_EXISTS, 0, 0);
+                    return 0;
+                }
+                rewrap = (name_to_open.access == e_write) && iec_x00_probe(fm, existing.c_str(), NULL, NULL, NULL);
+                work = existing;
+                full_path = work.c_str();
+                wrap = false;
+            }
+        }
+    }
+
+    if (wrap) {
+        // The host name is the CBM name with a P, S, U or R and the first two digits that
+        // are not taken.
+        char host[64];
+        petscii_to_fat(name_to_open.file.filename.c_str(), host, sizeof(host) - 5);
+        int len = strlen(host);
+        mstring dir = work;
+        fres = FR_EXIST;
+        for (int n = 0; (n < 100) && (fres == FR_EXIST); n++) {
+            snprintf(host + len, 5, ".%c%02d", "?PSUR"[(int)name_to_open.filetype], n);
+            work = dir;
+            append_path_component(work, host);
+            fres = fm->fopen(work.c_str(), flags | FA_CREATE_NEW, &f);
+        }
+        full_path = work.c_str();
+    } else {
+        fres = fm->fopen(full_path, flags, &f);
+    }
+    if (((fres == FR_OK) && (wrap || rewrap))) {
+        fres = x00_write_header(f, name_to_open.file.filename.c_str(),
+                                (name_to_open.filetype == e_rel) ? name_to_open.record_size : 0);
+        dataOffset = X00_HEADER_SIZE;
+        if (fres != FR_OK) {
+            fm->fclose(f);
+            f = NULL;
+        }
+    }
+    if ((fres == FR_NO_FILE) && ((name_to_open.access == e_read) || (name_to_open.access == e_append))) {
         GETPARTITION(name_to_open.file.partition, partition, 0);
         fres = open_by_rendered_iec_name(fm, partition, name_to_open.file,
                                          name_to_open.filetype, flags, &f, work);
@@ -1658,6 +1823,22 @@ int IecChannel :: setup_file_access()
     prefetch_max = 512;
     state = e_file;
 
+    // An existing file with an x00 name is read past its header when it has one (SI-144).
+    uint8_t head[X00_HEADER_SIZE];
+    uint32_t head_bytes = 0;
+    uint8_t wrapped_length = 0;
+    filetype_t wrapped_type;
+    bool wrapped = false;
+    if (!dataOffset && f->get_size() && x00_path(full_path, &wrapped_type) && (name_to_open.access != e_write)) {
+        if ((f->read(head, X00_HEADER_SIZE, &head_bytes) == FR_OK) &&
+            x00_header(head, head_bytes, NULL, &wrapped_length)) {
+            dataOffset = X00_HEADER_SIZE;
+            wrapped = true;
+        } else {
+            f->seek(0);
+        }
+    }
+
     if (name_to_open.filetype == e_rel) {
         uint32_t tr;
         if (!f->get_size()) { // the file must be newly created, because its size is 0.
@@ -1666,19 +1847,40 @@ int IecChannel :: setup_file_access()
             drive->set_error_fres(fres);
             if (fres == FR_OK) {
                 recordSize = name_to_open.record_size;
+                dataOffset = 2;
                 recordOffset = 2; // First record follows the REL header, also on a reused channel.
                 state = e_record;
             }
+        } else if (dataOffset && !wrapped) { // just created, with an R00 header
+            recordSize = name_to_open.record_size;
+            recordOffset = dataOffset;
+            state = e_record;
         } else { // file already exists
-            uint16_t wrd;
-            fres = f->read(&wrd, 2, &tr);
-            if (wrd >= 256) {
-                DBGIECV("WARNING: Illegal record size in .rel file...Is it a REL file at all? (%d)\n", wrd);
+            // The record length is at offset 25 of an R00 header, or the first byte of a
+            // plain file, which is this firmware's two byte layout or sd2iec's one byte
+            // layout (SI-084): a non-zero second byte can only be the one byte layout, and
+            // otherwise the size leaves 2 mod r over for the one and 1 mod r for the other.
+            // A record length of 1 leaves both the same and is read as the two byte layout.
+            int length = wrapped_length;
+            fres = FR_OK;
+            if (!wrapped) {
+                fres = f->read(head, 2, &head_bytes);
+                length = head[0];
+                uint32_t size = f->get_size();
+                dataOffset = 2;
+                if ((head_bytes >= 2) && head[1]) {
+                    dataOffset = 1;
+                } else if ((length > 1) && ((size % length) != (2 % length)) && ((size % length) == (1 % length))) {
+                    dataOffset = 1;
+                }
+            }
+            if ((fres != FR_OK) || (length == 0)) {
+                DBGIECV("WARNING: Illegal record size in .rel file...Is it a REL file at all? (%d)\n", length);
                 state = e_error;
                 drive->set_error(ERR_RECORD_NOT_PRESENT, 0, 0);
                 return ERR_RECORD_NOT_PRESENT;
             }
-            recordSize = (uint8_t) wrd;
+            recordSize = (uint8_t) length;
             DBGIECV("Opened existing relative file. Record size found is: %d. Expected: %d\n", recordSize, name_to_open.record_size);
             if ((name_to_open.record_size != 0) && (recordSize != name_to_open.record_size)) {
                 state = e_error;
@@ -1769,6 +1971,7 @@ int IecChannel::open_file(void)  // name should be in buffer
 
     IecPartition *partition = drive->vfs->GetPartition(name_to_open.file.partition);
     recordSize = 0;
+    dataOffset = 0;
     raw_dir = false;
 
     int result = -1;
@@ -1844,7 +2047,7 @@ int IecChannel::ext_close_file(void)
 
 int IecChannel::seek_record(int recordNumber, int offset)
 {
-    const uint32_t c_header = 2; // 2 bytes for record size in the beginning of the file
+    const uint32_t c_header = dataOffset; // the record length in front of the records (SI-084)
     // flush
     write_record();
 
@@ -2463,10 +2666,13 @@ int IecCommandChannel::do_rename(filename_t &src, filename_t &dest)
         drive->set_error_fres(fres);
         return 0;
     }
-    // convert FAT name to CBM name
+    // convert FAT name to CBM name, or take it from an x00 header (SI-144)
     char cbm_name[24];
     filetype_t ftype = e_any;
-    IecPartition::CreateIecName(&info, cbm_name, ftype);
+    bool wrapped = iec_x00_probe(fm, src_path, cbm_name, &ftype, NULL);
+    if (!wrapped) {
+        IecPartition::CreateIecName(&info, cbm_name, ftype);
+    }
     // ftype is now set to the type of the original file.
     
     // A rename does not move a file to another directory (SI-074, SD parse_rename()), and
@@ -2486,6 +2692,27 @@ int IecCommandChannel::do_rename(filename_t &src, filename_t &dest)
                                     true, true, false, taken, NULL) == FR_OK) {
             return ERR_FILE_EXISTS;
         }
+    }
+
+    // An x00 file keeps its host name and gets the new name in its header.
+    if (wrapped) {
+        File *file = NULL;
+        fres = fm->fopen(src_path, FA_READ | FA_WRITE, &file);
+        if (fres == FR_OK) {
+            char name[16];
+            uint32_t tr;
+            memset(name, 0, sizeof(name));
+            strncpy(name, dest.filename.c_str(), sizeof(name));
+            fres = file->seek(8);
+            if (fres == FR_OK) {
+                fres = file->write(name, sizeof(name), &tr);
+            }
+            fm->fclose(file);
+        }
+        if (fres != FR_OK) {
+            drive->set_error_fres(fres);
+        }
+        return 0;
     }
 
     const char *dest_path = ConstructPath(workd, dest, ftype, e_write);
@@ -2519,7 +2746,7 @@ static int scratch_matching(FileManager *fm, const char *dir_path, const char *p
         }
         char cbm_name[24];
         filetype_t ftype = e_any;
-        IecPartition::CreateIecName(&info, cbm_name, ftype);
+        iec_entry_name(fm, dir_path, &info, cbm_name, ftype);
         if (pattern_match(pattern, cbm_name, false)) {
             // Inside a disk image an entry is found by its name with the type extension,
             // which generate_fat_name() adds; on a host file system it is the name itself.
@@ -2687,7 +2914,7 @@ int IecCommandChannel::do_set_position(int chan, uint32_t pos, int recnr, int re
             state = e_idle;
             return 0;
         }
-        fres = channel->f->seek(pos);
+        fres = channel->f->seek(pos + channel->dataOffset); // past an x00 header
         if (fres != FR_OK) {
             drive->set_error_fres(fres);
             return 0;

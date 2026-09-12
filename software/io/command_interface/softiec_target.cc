@@ -605,13 +605,19 @@ void SoftIECTarget :: cmd_get_iecname(Message *command, Message **reply, Message
     command->message[command->length] = 0; // make sure it's null terminated
     FileInfo info(128);
     info.lfname[127] = 0;
-    strncpy(info.lfname, (const char *)&command->message[2], 127);
+    const char *given = (const char *)&command->message[2];
+    const char *base = strrchr(given, '/');
+    strncpy(info.lfname, base ? (base + 1) : given, 127);
     get_extension(info.lfname, info.extension, true);
 
     filetype_t found_type = e_any;
     char iec_name[24];
 
     IecPartition::CreateIecName(&info, iec_name, found_type);
+    // Given a full path, an x00 wrapper names the file the way the drive lists it (SI-144).
+    if (base) {
+        iec_x00_probe(FileManager::getFileManager(), given, iec_name, &found_type, NULL);
+    }
     data_message.message[0] = (uint8_t)found_type;
     data_message.length = 1 + strlen(iec_name);
     strcpy((char *)&data_message.message[1], iec_name);
