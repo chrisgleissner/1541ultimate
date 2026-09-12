@@ -494,7 +494,7 @@ t_channel_retval IecChannel::push_data(uint8_t b)
 
     switch (state) {
     case e_filename:
-        if (pointer < 64) {
+        if (pointer < CBMDOS_COMMAND_BUFFER_SIZE) { // names up to 254 bytes (SI-021)
             buffer[pointer++] = b;
         } else {
             trace_dropped++; // #877: the name is longer than the channel buffer
@@ -1695,7 +1695,7 @@ t_channel_retval IecCommandChannel::pop_more(int pop_size)
 
 t_channel_retval IecCommandChannel::push_data(uint8_t b)
 {
-    if (wr_pointer < 64) {
+    if (wr_pointer < CBMDOS_COMMAND_BUFFER_SIZE) {
         wr_buffer[wr_pointer++] = b;
         return IEC_OK;
     }
@@ -2379,8 +2379,8 @@ int IecCommandChannel::do_write_protect(bool on)
 
 int IecCommandChannel::ext_open_file(const char *filenameOrCommand)
 {
-    strncpy((char *) wr_buffer, filenameOrCommand, 63);
-    wr_buffer[63] = 0;
+    strncpy((char *) wr_buffer, filenameOrCommand, CBMDOS_COMMAND_BUFFER_SIZE - 1);
+    wr_buffer[CBMDOS_COMMAND_BUFFER_SIZE - 1] = 0;
     wr_pointer = strlen((char *) wr_buffer);
     push_command(0x60);
     return push_command(0x00);

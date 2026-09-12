@@ -480,15 +480,21 @@ int IecParser :: position_command(const uint8_t *buffer, int len)
     int chan = (int)buffer[1];
     len -= 2; buffer += 2;
 
-    if ((len < 1) || (len > 4)) {
+    if (len < 1) {
         return ERR_SYNTAX;
+    }
+    // The length is the one from before the terminator was stripped (SI-018), so what
+    // follows four parameter bytes, which from BASIC is the terminator, is ignored, as
+    // SD parse_position() ignores it.
+    if (len > 4) {
+        len = 4;
     }
     for(int i=0; i<len; i++) {
         pos |= ((uint32_t)buffer[i]) << (8*i);
     }
     int recnr = 0;
     int recoffset = 0;
-    if (len == 3) {
+    if (len >= 3) {
         recnr = (int)(pos & 0xFFFF);
         recoffset = (int)buffer[2];
     }
@@ -793,6 +799,9 @@ int IecParser :: extended_command(const uint8_t *buffer, int len)
 // byte that happens to be a carriage return is that parameter. CMD DOS has the same
 // ambiguity wherever the last parameter is optional, and its manual answers it by
 // telling programmers to send the terminator themselves when they want partition 13.
+//
+// The ROM also ends a command at a carriage return second to last, dropping it and the
+// byte behind it (SI-016).
 static int strip_terminator(const uint8_t *buffer, int len)
 {
     if ((len > 1) && (buffer[0] == 'C') && (buffer[1] == 0xD0)) {
@@ -801,11 +810,18 @@ static int strip_terminator(const uint8_t *buffer, int len)
     if (len && (buffer[len - 1] == 0x0D)) {
         return len - 1;
     }
+    if ((len > 2) && (buffer[len - 2] == 0x0D)) {
+        return len - 2;
+    }
     return len;
 }
 
 int IecParser :: execute_command(const uint8_t *buffer, int len)
 {
+    if (len >= CBMDOS_COMMAND_BUFFER_SIZE) {
+        return ERR_CMD_TOO_LONG; // SI-022: refused, not executed cut short
+    }
+    const int original_len = len;
     len = strip_terminator(buffer, len);
     if (len <= 0) { // an empty command line is not a command
         return 0;
@@ -829,7 +845,7 @@ int IecParser :: execute_command(const uint8_t *buffer, int len)
         }
         return dir_command(buffer, len);
     case 'N': return format_command(buffer, len);
-    case 'P': return position_command(buffer, len);
+    case 'P': return position_command(buffer, original_len); // its last byte is data (SI-018)
     case 'R':
         if ((len > 2) && (buffer[1] == '-')) {
             return rename_sub_command(buffer, len);

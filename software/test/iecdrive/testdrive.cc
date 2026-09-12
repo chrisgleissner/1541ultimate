@@ -1682,13 +1682,15 @@ static void run_suite10_command_terminator(FileManager *fm, IecDrive *dr)
     close_file(dr, chan);
     expect_status_ok("Suite10-RelClose", "12:RELPOS");
 
-    // A command that fills the 64 byte command buffer still has to be executed: the
-    // zero written after its last byte must not reach the byte count itself. Z is not
-    // a command letter, so the answer is 31 (SI-031).
+    // A 64 byte command, which filled the buffer before it held 254 bytes, is executed
+    // with its 64th byte: the partition number ends there. A command that fills the
+    // buffer now is refused (SI-022), which Suite11-SI022-TooLong checks.
     char full[65];
-    memset(full, 'Z', 64);
+    memset(full, ' ', 64);
+    memcpy(full, "CP", 2);
+    memcpy(full + 62, "12", 2);
     full[64] = 0;
-    expect_command_status_prefix("Suite10-FullBuffer", dr, full, "31,SYNTAX ERROR");
+    expect_command_response("Suite10-FullBuffer", dr, full, "02,PARTITION SELECTED,12,00\r");
 
     // A command that is nothing but a carriage return carries no command at all, and
     // has to leave the command channel usable.
@@ -2581,6 +2583,80 @@ static void s11_si105_memory_commands(FileManager *fm, IecDrive *dr)
     expect_command_data_response(testname, dr, me, sizeof(me), "00, OK,00,00\r");
 }
 
+// SI-021: a command, and the name of a file opened on a data channel, can be longer
+// than 64 bytes. C64 OS paths reach 232 characters.
+static void s11_si021_long_names(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI021-LongNames";
+    s11_partition(fm, dr, "si021");
+    expect_command_ok(testname, dr, "MD:DIRECTORYNAMENUMBERONEXYZ\r");
+    expect_command_ok(testname, dr, "MD/DIRECTORYNAMENUMBERONEXYZ/:DIRECTORYNAMENUMBERTWOXYZ\r");
+    const char *file = "/DIRECTORYNAMENUMBERONEXYZ/DIRECTORYNAMENUMBERTWOXYZ/:VICTIMFILE";
+    char name[128];
+    snprintf(name, sizeof(name), "%s,S,W", file);
+    REQUIRE(strlen(name) > 64);
+    expect_iec_write_ok(testname, dr, 2, name, "long");
+    snprintf(name, sizeof(name), "%s,S,R", file);
+    expect_iec_file(testname, dr, 2, name, "long");
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "S%s\r", file);
+    REQUIRE(strlen(cmd) > 64);
+    expect_command_response(testname, dr, cmd, "01, FILES SCRATCHED,01,00\r");
+}
+
+// SI-022: a command longer than the buffer answers 32 and is not executed. Cut short
+// and executed, a scratch removes what its first bytes name.
+static void s11_si022_too_long(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI022-TooLong";
+    const char *path = s11_partition(fm, dr, "si022");
+    expect_iec_write_ok(testname, dr, 2, "VICTIM,S,W", "keep me");
+    char cmd[300];
+    memset(cmd, 'A', sizeof(cmd));
+    memcpy(cmd, "S:VICTIM,", 9);
+    cmd[255] = 0;
+    expect_command_response(testname, dr, cmd, "32,SYNTAX ERROR,00,00\r");
+    expect_iec_file(testname, dr, 2, "VICTIM,S,R", "keep me");
+    cmd[254] = 0; // a command that fills the buffer is refused as well
+    expect_command_response(testname, dr, cmd, "32,SYNTAX ERROR,00,00\r");
+    expect_iec_file(testname, dr, 2, "VICTIM,S,R", "keep me");
+    cmd[253] = 0; // one byte shorter fits
+    expect_command_response(testname, dr, cmd, "01, FILES SCRATCHED,01,00\r");
+}
+
+// SI-016: a command whose second to last byte is a carriage return ends there.
+static void s11_si016_second_terminator(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI016-SecondTerminator";
+    s11_partition(fm, dr, "si016");
+    expect_command_ok(testname, dr, "MD:SUB\r");
+    expect_command_ok(testname, dr, "CD:SUB\rX");
+    expect_command_response(testname, dr, "XPWD\r", "40:/SUB/");
+}
+
+// SI-018: the position command keeps a last byte of 13, because it is an offset and
+// not a terminator.
+static void s11_si018_position_exempt(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI018-PositionExempt";
+    s11_partition(fm, dr, "si018");
+    const uint8_t chan = 3;
+    const uint8_t record[16] = { 'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P' };
+    expect_rel_open(testname, dr, chan, "RECORDS", sizeof(record));
+    expect_rel_write(testname, dr, chan, record, sizeof(record));
+    close_file(dr, chan);
+    expect_rel_open(testname, dr, chan, "RECORDS", sizeof(record));
+    // P, the channel, record 1, offset 13, and no terminator: JiffyDOS's @ sends this.
+    const uint8_t p13[5] = { 'P', chan, 1, 0, 13 };
+    expect_command_data_response(testname, dr, p13, sizeof(p13), "00, OK,00,00\r");
+    expect_rel_read(testname, dr, chan, record + 12, 4);
+    // The same from BASIC, with the terminator behind it.
+    const uint8_t p13_basic[6] = { 'P', (uint8_t)(96 + chan), 1, 0, 13, 0x0D };
+    expect_command_data_response(testname, dr, p13_basic, sizeof(p13_basic), "00, OK,00,00\r");
+    expect_rel_read(testname, dr, chan, record + 12, 4);
+    close_file(dr, chan);
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -2603,6 +2679,10 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-SI101-Swap",              s11_si101_swap },
     { "Suite11-SI102-WriteProtect",      s11_si102_write_protect },
     { "Suite11-SI105-MemoryCommands",    s11_si105_memory_commands },
+    { "Suite11-SI021-LongNames",         s11_si021_long_names },
+    { "Suite11-SI022-TooLong",           s11_si022_too_long },
+    { "Suite11-SI016-SecondTerminator",  s11_si016_second_terminator },
+    { "Suite11-SI018-PositionExempt",    s11_si018_position_exempt },
 };
 
 // Runs every case, or only those whose name contains `only`.
@@ -2668,7 +2748,8 @@ static void trace_capture_end(int saved_fd, FILE *sink)
 static void expect_trace_line(const char *testname, const char *what, const char *needle)
 {
     if (strstr(trace_capture, needle) == NULL) {
-        printf("%s: %s: no SOFTIEC-TRACE line containing '%s'\n", testname, what, needle);
+        printf("%s: %s: no SOFTIEC-TRACE line containing '%s' in:\n%s\n", testname, what, needle,
+               trace_capture);
     }
     REQUIRE(strstr(trace_capture, needle) != NULL);
 }
@@ -2763,6 +2844,18 @@ static void run_softiec_trace_suite(FileManager *fm, IecDrive *dr)
 
     // The error channel read the host performs after each operation.
     expect_trace_line(testname, "status read", "STATUS dev=");
+
+    // SI-152: a command longer than the rendering still reports its real length, and
+    // the rendering says where it was cut.
+    char long_cmd[201];
+    memset(long_cmd, ' ', 200);
+    memcpy(long_cmd, "B-P:2,144", 9);
+    long_cmd[200] = 0;
+    trace_capture_begin(saved_fd, sink);
+    send_command(dr, long_cmd);
+    trace_capture_end(saved_fd, sink);
+    expect_trace_line(testname, "long command length", "CMD dev=11 sa=$6F chan=15 len=200 ");
+    expect_trace_line(testname, "long command cut", "20 20 20..] txt=");
 
     printf("SoftIecTrace completed successfully!\n");
 }

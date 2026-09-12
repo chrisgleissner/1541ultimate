@@ -66,8 +66,14 @@ typedef struct {
 // The syntax errors of CBM and CMD DOS (HD B-2, 1541 User's Guide).
 #define ERR_SYNTAX        30 // the command was recognised, its arguments were not
 #define ERR_UNKNOWN_CMD   31 // the first character is not a command letter
+#define ERR_CMD_TOO_LONG  32 // the command filled the command buffer
 #define ERR_ILLEGAL_NAME  33 // a wildcard or a character a name cannot carry
 #define ERR_NO_NAME       34 // no name, or a colon with nothing after it
+
+// The command buffer holds 254 bytes, as on the CMD HD (HD 4-6) and on sd2iec's uIEC
+// (CONFIG_COMMAND_BUFFER_SIZE). A command that fills it is refused, because whether
+// anything followed cannot be told (SI-021, SI-022).
+#define CBMDOS_COMMAND_BUFFER_SIZE 254
 
 class IecCommandExecuter
 {

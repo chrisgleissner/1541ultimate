@@ -249,11 +249,12 @@ void test_command_terminator(void)
     // drive.
     test_dispatch("G-P\x0D\x0D", 5, 0, "partition info", 13);
 
-    // The position command has the same optional last parameter. Sent from BASIC the
-    // terminator is there and the offset of 13 arrives; without it the offset is
-    // taken as the terminator and the command positions to a record instead.
-    test_dispatch("P\x02\x0A\x00\x0D\x0D", 6, 0, "set position", 2, 0xD000A, 10, 13);
-    test_dispatch("P\x02\x0A\x00\x0D", 5, 0, "set position", 2, 10, 0, 0);
+    // The position command is exempt from the terminator rule, because its last
+    // parameter byte is data (SI-018, SD parse_position() restores the length from
+    // before the strip): an offset of 13 arrives with or without a terminator, and a
+    // terminator behind the parameters is ignored.
+    test_dispatch("P\x02\x0A\x00\x0D\x0D", 6, 0, "set position", 2, 0xD0D000A, 10, 13);
+    test_dispatch("P\x02\x0A\x00\x0D", 5, 0, "set position", 2, 0xD000A, 10, 13);
 
     // A command whose parameters are text loses the terminator rather than reading
     // it as a value.
@@ -341,6 +342,21 @@ void test_added_commands(void)
     test_dispatch("M-E\x00\x05", 5, 0, NULL);
     test_dispatch("M-X", 3, 30, NULL);
     test_dispatch("MD:DIR", 6, 0, NULL); // still a directory command
+}
+
+// SI-021, SI-022 and SI-016: the command buffer holds 254 bytes, a command that fills
+// it answers 32 and is not executed, and a carriage return second to last ends the
+// command, as the 1541 ROM does at $C2B3.
+void test_command_length_and_terminator(void)
+{
+    char cmd[300];
+    memset(cmd, ' ', sizeof(cmd));
+    memcpy(cmd, "B-P:2,144", 9);
+    test_dispatch(cmd, 253, 0, "buffer position", 2, 144);
+    test_dispatch(cmd, 254, 32, NULL);
+    test_dispatch(cmd, 255, 32, NULL);
+
+    test_dispatch_text("R-H:WORK\rX", 10, 0, "rename header", "-1||WORK");
 }
 
 void test_error_codes(void)
@@ -653,6 +669,7 @@ int main(int argc, const char *argv[])
     test_command_terminator();
     test_error_codes();
     test_added_commands();
+    test_command_length_and_terminator();
     test_command(34, (const uint8_t *)"C99:EMPTY=", 10);
     test_command( 0, (const uint8_t *)"C1:FCOPY=3:FCOPY", 16);
     test_command( 0, (const uint8_t *)"C:FULLSTATS=STAT1,3:STAT3", 25);
@@ -667,8 +684,9 @@ int main(int argc, const char *argv[])
     test_command( 0, (const uint8_t *)"P\x02\xC8\0", 4);
     test_command( 0, (const uint8_t *)"P\x02\x2C\x01\0", 5);
     test_command( 0, (const uint8_t *)"P\x02\x90\x01\0\0", 6);
-    // A position is at most four bytes wide, so five parameter bytes is a syntax error.
-    test_command(ERR_SYNTAX, (const uint8_t *)"P\x02\xF4\x01\0\0\0", 7);
+    // A position is at most four bytes wide; what follows them, which from BASIC is the
+    // terminator, is ignored (SI-018).
+    test_dispatch("P\x02\xF4\x01\0\0\r", 7, 0, "set position", 2, 0x1F4, 500, 0);
     test_command( 0, (const uint8_t *)"CD:TEMP", 7);
     test_command( 0, (const uint8_t *)"CD1//TEMP", 9);
     test_command( 0, (const uint8_t *)"CD1//TEMP/TEMP2", 15);

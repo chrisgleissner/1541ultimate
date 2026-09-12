@@ -34,8 +34,9 @@
 // Shared by every diagnostic line. Grep for it in a device log.
 #define SOFTIEC_TRACE_PREFIX "SOFTIEC-TRACE"
 
-// The command buffer holds 64 bytes and so does a file name, so a payload is
-// normally rendered whole. Anything longer is cut and the cut is marked.
+// The command buffer and a file name hold up to 254 bytes, more than a log line should
+// carry, so a payload is rendered up to this many bytes; a longer one is cut, the cut is
+// marked with "..", and the line still reports the real length (SI-152).
 #define SOFTIEC_TRACE_MAX_BYTES 64
 
 // Room a caller has to provide for the two renderings of SOFTIEC_TRACE_MAX_BYTES.

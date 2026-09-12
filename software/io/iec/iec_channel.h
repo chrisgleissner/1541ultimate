@@ -313,7 +313,7 @@ class IecChannel {
     // #877 diagnostics only: what has crossed this channel since it was opened. The
     // first sixteen bytes and the last sixteen are kept so a log line can show that
     // the right data went by without carrying the data itself. trace_dropped counts
-    // the bytes the 64 byte name buffer had no room for, and trace_faulted keeps a
+    // the bytes the name buffer had no room for, and trace_faulted keeps a
     // channel that fails on every byte to one line.
     uint32_t trace_rd;
     uint32_t trace_wr;
@@ -376,12 +376,13 @@ public:
 
 class IecCommandChannel: public IecChannel, public IecCommandExecuter {
     IecParser *parser;
-    // 64 command bytes, plus the zero push_command writes after the last one.
-    uint8_t wr_buffer[65];
+    // CBMDOS_COMMAND_BUFFER_SIZE command bytes, plus the zero push_command writes after
+    // the last one.
+    uint8_t wr_buffer[CBMDOS_COMMAND_BUFFER_SIZE + 1];
     int wr_pointer;
     // #877 diagnostics only: the secondary address that carried the command bytes,
     // so a log line can tell an OPEN 15,dev,15,"..." from a PRINT#15, and the count
-    // of command bytes the 64 byte buffer had no room for.
+    // of command bytes the command buffer had no room for.
     uint8_t trace_secondary;
     uint16_t trace_cmd_dropped;
 
