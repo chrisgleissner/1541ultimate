@@ -37,9 +37,11 @@ Software IEC partition numbered 1. It temporarily uses device 11, restores the
 Software IEC settings and working directory, and deletes only its own fixtures.
 """
 import argparse
+import datetime
 import io
 import re
 import sys
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -300,6 +302,64 @@ def check_compatibility(agent, api, password, folder, root):
         if len(image) != 174848 or image[BAM_OFFSET + 144:BAM_OFFSET + 148] != b"MADE":
             raise Failure("N did not create a formatted 1541 image")
 
+    def raw_directory():
+        agent.command(b"CD//" + here + b"\r")
+        agent.call(1, channel=3, data=b"$", secondary=3)
+        try:
+            agent.status()
+            raw = agent.read_stream(channel=3)
+        finally:
+            agent.call(4, channel=3)
+            agent.command(b"CD//\r")
+        detail(f"{len(raw)} bytes, starting {raw[:4].hex()}, label {raw[0x8E:0x9E]!r}")
+        if len(raw) < 508 or len(raw) % 254 or raw[0] != ord("A"):
+            raise Failure(f"$ on secondary address 3 returned {len(raw)} bytes starting {raw[:4].hex()}")
+        if not raw[0x8E:0x9E].rstrip(b"\xa0") == here[:16]:
+            raise Failure(f"the made up BAM sector names {raw[0x8E:0x9E]!r}")
+
+    def clock_write():
+        def clock():
+            return agent.command_reply(b"T-RI\r", 24).decode("ascii").strip()
+
+        before = clock()
+        started = time.monotonic()
+        detail(f"the clock read {before!r}")
+        try:
+            agent.command(b"T-WI2031-01-02T03:04:05\r")
+            after = clock()
+            detail(f"after T-WI2031-01-02T03:04:05 it reads {after!r}")
+            if not after.startswith("2031-01-02T03:04:0") or not after.endswith("THU"):
+                raise Failure(f"the clock reads {after!r} after T-W")
+            agent.command(b"T-WI2031-01-02T24:04:05\r", allowed=(30,))
+        finally:
+            restored = datetime.datetime.strptime(before[:19], "%Y-%m-%dT%H:%M:%S")
+            restored += datetime.timedelta(seconds=round(time.monotonic() - started))
+            agent.command(b"T-WI" + restored.strftime("%Y-%m-%dT%H:%M:%S").encode("ascii") + b"\r")
+
+    def resets():
+        agent.call(1, channel=4, data=b"//" + here + b"/:KEPT,S,W")
+        try:
+            agent.status()
+            agent.call(2, channel=4, data=b"abc")
+            response = agent.command(b"UJ\r", allowed=(73,))
+            detail(f"UJ answered {response!r} with a file open for writing")
+        finally:
+            agent.call(4, channel=4)
+        agent.call(1, channel=3, data=b"//" + here + b"/:KEPT,S,R")
+        try:
+            agent.status()
+            kept = agent.read_stream(channel=3)
+        finally:
+            agent.call(4, channel=3)
+        if kept != b"abc":
+            raise Failure(f"the file UJ closed holds {kept!r}")
+        agent.command(b"CD//" + here + b"\r")
+        response = agent.command(bytes([ord("U"), 0xCA]) + b"\r", allowed=(73,))
+        where = agent.command_reply(b"XPWD\r", 32).decode("ascii").strip()
+        detail(f"U+shifted J answered {response!r}, then XPWD {where!r}")
+        if where != "1:/":
+            raise Failure(f"after U+shifted J the working directory is {where!r}")
+
     # Each check reports on its own, so a firmware that fails one still shows the rest.
     failed = []
     for label, action in (
@@ -313,6 +373,9 @@ def check_compatibility(agent, api, password, folder, root):
             ("SI-147, SI-148: a shifted space in a name, on this CPU", shifted_space),
             ("SI-021, SI-022: a 253 byte command runs, a 254 byte one is refused", command_length),
             ("SI-071: N creates a D64 image", format_image),
+            ("SI-137: $ on a secondary address other than 0 is the raw directory", raw_directory),
+            ("SI-120: T-WI sets the clock, and an impossible date answers 30", clock_write),
+            ("SI-103: UJ closes the channels and U+shifted J returns to the root, and the drive still answers", resets),
     ):
         try:
             with check(label):

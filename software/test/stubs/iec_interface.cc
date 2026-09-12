@@ -28,8 +28,11 @@ IecInterface :: ~IecInterface()
 {
 }
 
+int iec_interface_configure_calls = 0; // lets a test show a command did not reconfigure
+
 void IecInterface :: configure(void)
 {
+    iec_interface_configure_calls++;
     // printf("IEC Interface configure.\n");
 }
 

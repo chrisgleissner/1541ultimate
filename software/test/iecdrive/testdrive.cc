@@ -218,11 +218,13 @@ static void open_buffer_channel(const char *testname, IecDrive *dr, uint8_t chan
 static void read_buffer_channel(const char *testname, IecDrive *dr, uint8_t chan,
                                 uint8_t *buffer, int len);
 
+// U1 and U2 move whole blocks; B-R and B-W use the first byte as a length (SI-094). The
+// partition number is ignored: the channel uses the partition current at its open (SI-093).
 static void capture_block_sector(const char *testname, IecDrive *dr, uint8_t chan,
                                  int part, int track, int sector, uint8_t *out)
 {
     char cmd[64];
-    snprintf(cmd, sizeof(cmd), "B-R %u %d %d %d", chan, part, track, sector);
+    snprintf(cmd, sizeof(cmd), "U1 %u %d %d %d", chan, part, track, sector);
     expect_command_ok(testname, dr, cmd);
     read_buffer_channel(testname, dr, chan, out, 256);
 }
@@ -243,7 +245,7 @@ static void expect_buffer_sector(const char *testname, IecDrive *dr, uint8_t cha
                                  int part, int track, int sector, const uint8_t *expected)
 {
     char cmd[64];
-    snprintf(cmd, sizeof(cmd), "B-R %u %d %d %d", chan, part, track, sector);
+    snprintf(cmd, sizeof(cmd), "U1 %u %d %d %d", chan, part, track, sector);
     expect_command_ok(testname, dr, cmd);
     uint8_t actual[256];
     read_buffer_channel(testname, dr, chan, actual, sizeof(actual));
@@ -258,10 +260,10 @@ static void expect_block_write_sector(const char *testname, IecDrive *dr, uint8_
                                       int part, int track, int sector, const uint8_t *payload)
 {
     char cmd[64];
-    snprintf(cmd, sizeof(cmd), "B-W %u %d %d %d", chan, part, track, sector);
+    snprintf(cmd, sizeof(cmd), "U2 %u %d %d %d", chan, part, track, sector);
     expect_command_ok(testname, dr, cmd);
     uint8_t actual[256];
-    snprintf(cmd, sizeof(cmd), "B-R %u %d %d %d", chan, part, track, sector);
+    snprintf(cmd, sizeof(cmd), "U1 %u %d %d %d", chan, part, track, sector);
     expect_command_ok(testname, dr, cmd);
     read_buffer_channel(testname, dr, chan, actual, sizeof(actual));
     if (memcmp(actual, payload, sizeof(actual)) != 0) {
@@ -276,7 +278,7 @@ static void expect_bam_sector_state(const char *testname, IecDrive *dr, uint8_t 
                                     bool expect_allocated, int expected_free_delta)
 {
     char cmd[64];
-    snprintf(cmd, sizeof(cmd), "B-R %u %d %d %d", chan, c.partition, c.bam_track, c.bam_sector);
+    snprintf(cmd, sizeof(cmd), "U1 %u %d %d %d", chan, c.partition, c.bam_track, c.bam_sector);
     expect_command_ok(testname, dr, cmd);
     uint8_t now[256];
     read_buffer_channel(testname, dr, chan, now, sizeof(now));
@@ -1506,6 +1508,9 @@ static void run_suite9_block_matrix(FileManager *fm, IecDrive *dr)
         const BlockCase &c = cases[i];
         c.create_fixture(c.source);
         prepare_disk_partition(c.source, c.mount, dr, c.partition, c.label);
+        char select[16];
+        snprintf(select, sizeof(select), "CP%d", c.partition);
+        expect_command_status_prefix("Suite9-SelectPartition", dr, select, "02,PARTITION SELECTED");
 
         uint8_t expected_read[256];
         make_sector_payload(expected_read, "BASIC:PRG");
@@ -1517,6 +1522,7 @@ static void run_suite9_block_matrix(FileManager *fm, IecDrive *dr)
         uint8_t write_payload[256];
         make_increment_pattern(write_payload);
         open_buffer_channel("Suite9-OpenBufferWrite", dr, 2);
+        expect_command_ok("Suite9-RewindBuffer", dr, "B-P 2 0"); // a new buffer starts at byte 1 (SI-090)
         send_channel_data(dr, 2, write_payload, sizeof(write_payload));
         expect_block_write_sector("Suite9-BlockWrite", dr, 2, c.partition, c.write_track, c.write_sector, write_payload);
         close_file(dr, 2);
@@ -1535,10 +1541,13 @@ static void run_suite9_block_matrix(FileManager *fm, IecDrive *dr)
 
     print_scenario(suite, "Block commands on FAT fail");
     prepare_fat_partition(fm, dr, fat_path, 8, "FAT-BLOCK");
+    expect_command_status_prefix("Suite9-FAT-Select", dr, "CP8", "02,PARTITION SELECTED");
+    open_buffer_channel("Suite9-FAT-OpenBuffer", dr, 2);
     expect_command_status_prefix("Suite9-FAT-BlockRead", dr, "B-R 2 8 17 0", "78,BLOCK ACCESS DENIED");
     expect_command_status_prefix("Suite9-FAT-BlockWrite", dr, "B-W 2 8 17 0", "78,BLOCK ACCESS DENIED");
     expect_command_status_prefix("Suite9-FAT-BlockAllocate", dr, "B-A 8 17 0", "78,BLOCK ACCESS DENIED");
     expect_command_status_prefix("Suite9-FAT-BlockFree", dr, "B-F 8 17 0", "78,BLOCK ACCESS DENIED");
+    close_file(dr, 2);
 
     printf("Suite9 completed successfully!\n");
 }
@@ -1915,12 +1924,21 @@ static void run_suite10_block_commands(FileManager *fm, IecDrive *dr)
     // Refusals. Too few parameters is a syntax error whatever the separators are, a
     // track or sector outside the disk is refused, and a partition that is a plain
     // directory has no sectors to address at all.
+    open_buffer_channel("Suite10-ReopenBuffer", dr, chan);
     expect_command_status_prefix("Suite10-U1-TooFew", dr, "U1: 2  0 \r", "30,SYNTAX ERROR");
     expect_command_status_prefix("Suite10-BR-NoParams", dr, "B-R:\r", "30,SYNTAX ERROR");
     expect_command_status_prefix("Suite10-BR-NotNumeric", dr, "B-R:X,0,18,0\r", "30,SYNTAX ERROR");
     expect_command_status_prefix("Suite10-U1-BadTrack", dr, "U1:2,0,99,0\r", "66,ILLEGAL TRACK OR SECTOR");
     expect_command_status_prefix("Suite10-U1-BadSector", dr, "U1:2,0,18,99\r", "66,ILLEGAL TRACK OR SECTOR");
-    expect_command_status_prefix("Suite10-U1-OnDirectory", dr, "U1:2,12,18,0\r", "78,BLOCK ACCESS DENIED");
+    close_file(dr, chan);
+    // A channel opened while a directory partition is current has no sectors to address;
+    // the partition number in the command does not change which partition it uses.
+    expect_command_response("Suite10-CP12", dr, "CP12\r", "02,PARTITION SELECTED,12,00\r");
+    open_buffer_channel("Suite10-OpenBufferOnDirectory", dr, chan);
+    expect_command_status_prefix("Suite10-U1-OnDirectory", dr, "U1:2,13,18,0\r", "78,BLOCK ACCESS DENIED");
+    close_file(dr, chan);
+    // A block command on a channel that is not a direct access channel names no buffer.
+    expect_command_status_prefix("Suite10-U1-NoBuffer", dr, "U1:2,0,18,0\r", "70,NO CHANNEL");
     expect_command_response("Suite10-CP13-Again", dr, "CP13\r", "02,PARTITION SELECTED,13,00\r");
 }
 
@@ -3179,6 +3197,357 @@ static void s11_si142_escaped_wildcards(FileManager *fm, IecDrive *dr)
     expect_command_response(testname, dr, "S46:GAME?\r", "01, FILES SCRATCHED,02,00\r");
 }
 
+// The type field of the listing line for `name`, and the character behind it, which is
+// the lock marker.
+static void s11_listing_type(IecDrive *dr, const char *testname, const char *dir, const char *name,
+                             char *type, bool *present)
+{
+    uint8_t listing[4096];
+    int got = read_directory_stream(testname, dr, dir, listing, sizeof(listing));
+    const uint8_t *line = s11_listing_line(listing, got, name);
+    *present = (line != NULL);
+    type[0] = 0;
+    if (line) {
+        int blocks = line[2] | (line[3] << 8);
+        int digits = (blocks >= 100) ? 3 : (blocks >= 10) ? 2 : 1;
+        memcpy(type, line + 27 - digits, 4);
+        type[4] = 0;
+    }
+}
+
+// SI-076 and SI-132: L toggles the lock of a file or a directory. A locked file lists
+// with < behind its type and is not scratched; a locked directory is not removed.
+static void s11_si076_lock(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI076-Lock";
+    s11_partition(fm, dr, "si076");
+    char type[8];
+    bool present;
+    expect_iec_write_ok(testname, dr, 1, "LOCKME", "keep");
+    expect_command_ok(testname, dr, "L:LOCKME\r");
+    s11_listing_type(dr, testname, "$", "LOCKME", type, &present);
+    printf("%s: locked file lists as '%s'\n", testname, type);
+    REQUIRE(present && !strcmp(type, "PRG<"));
+    expect_command_response(testname, dr, "S:LOCKME\r", "01, FILES SCRATCHED,00,00\r");
+    expect_iec_file(testname, dr, 0, "LOCKME", "keep");
+    expect_command_ok(testname, dr, "L:LOCKME\r");
+    s11_listing_type(dr, testname, "$", "LOCKME", type, &present);
+    REQUIRE(present && !strcmp(type, "PRG "));
+    expect_command_response(testname, dr, "S:LOCKME\r", "01, FILES SCRATCHED,01,00\r");
+
+    expect_command_ok(testname, dr, "MD:LOCKDIR\r");
+    expect_command_ok(testname, dr, "L:LOCKDIR\r");
+    expect_command_status_prefix(testname, dr, "RD:LOCKDIR\r", "63,");
+    expect_command_ok(testname, dr, "L:LOCKDIR\r");
+    expect_command_ok(testname, dr, "RD:LOCKDIR\r");
+    expect_command_response(testname, dr, "L:NOSUCH\r", "62,FILE NOT FOUND,00,00\r");
+
+    // Inside a disk image the lock is the CBM lock bit.
+    create_formatted_image(fm, "/Fat/s11_si076.d64", "LOCKS", 683, e_image_d64);
+    dr->add_partition(47, "/Fat/s11_si076.d64", "LOCKS");
+    expect_iec_write_ok(testname, dr, 1, "47:INIMAGE", "img");
+    expect_command_ok(testname, dr, "L47:INIMAGE\r");
+    s11_listing_type(dr, testname, "$47", "INIMAGE", type, &present);
+    printf("%s: locked file in a D64 lists as '%s'\n", testname, type);
+    REQUIRE(present && !strcmp(type, "PRG<"));
+    expect_command_response(testname, dr, "S47:INIMAGE\r", "01, FILES SCRATCHED,00,00\r");
+}
+
+// SI-077 and SI-134: sd2iec's EL:, EU:, EH, A: and the header forms. A hidden file is
+// left out of a listing unless H asks for hidden files.
+static void s11_si077_attributes(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI077-Attributes";
+    s11_partition(fm, dr, "si077");
+    char type[8];
+    bool present;
+    expect_iec_write_ok(testname, dr, 1, "ONE", "1");
+    expect_iec_write_ok(testname, dr, 1, "TWO", "2");
+    expect_command_ok(testname, dr, "EL:ONE,TWO\r");
+    s11_listing_type(dr, testname, "$", "ONE", type, &present);
+    REQUIRE(present && !strcmp(type, "PRG<"));
+    s11_listing_type(dr, testname, "$", "TWO", type, &present);
+    REQUIRE(present && !strcmp(type, "PRG<"));
+    expect_command_ok(testname, dr, "EU:ONE\r");
+    s11_listing_type(dr, testname, "$", "ONE", type, &present);
+    REQUIRE(present && !strcmp(type, "PRG "));
+
+    // A: sets exactly the attributes it names: TWO is no longer locked but hidden.
+    expect_command_ok(testname, dr, "A:H=TWO\r");
+    s11_listing_type(dr, testname, "$", "TWO", type, &present);
+    printf("%s: hidden file present in $: %d\n", testname, present);
+    REQUIRE(!present);
+    s11_listing_type(dr, testname, "$:*=H", "TWO", type, &present);
+    REQUIRE(present && !strcmp(type, "PRG "));
+    // EH toggles the hidden flag back.
+    expect_command_ok(testname, dr, "EH/:TWO\r");
+    s11_listing_type(dr, testname, "$", "TWO", type, &present);
+    REQUIRE(present);
+    expect_command_ok(testname, dr, "A:RH=TWO\r");
+    s11_listing_type(dr, testname, "$:*=H", "TWO", type, &present);
+    REQUIRE(present && !strcmp(type, "PRG<"));
+    expect_command_ok(testname, dr, "A:=TWO\r");
+    s11_listing_type(dr, testname, "$", "TWO", type, &present);
+    REQUIRE(present && !strcmp(type, "PRG "));
+
+    // The header forms rename the directory, as R-H does.
+    expect_command_ok(testname, dr, "MD:SUB\r");
+    expect_command_ok(testname, dr, "CD:SUB\r");
+    expect_command_ok(testname, dr, "XH:SUBX\r");
+    expect_command_ok(testname, dr, "D:SUBD,ID\r");
+    expect_command_ok(testname, dr, "EH:SUBE,ID\r");
+    expect_command_response(testname, dr, "XPWD\r", "40:/SUBE/");
+
+    // EL:$ and EU:$ lock and unlock the disk image the working directory is in.
+    const char *image = "/Fat/s11_si077.d64";
+    create_formatted_image(fm, image, "WHOLE", 683, e_image_d64);
+    dr->add_partition(48, image, "WHOLE");
+    expect_command_response(testname, dr, "CP48\r", "02,PARTITION SELECTED,48,00\r");
+    FileInfo info(16);
+    expect_command_ok(testname, dr, "EL:$\r");
+    REQUIRE((fm->fstat(image, info) == FR_OK) && (info.attrib & AM_RDO));
+    expect_command_ok(testname, dr, "EU:$\r");
+    REQUIRE((fm->fstat(image, info) == FR_OK) && !(info.attrib & AM_RDO));
+    expect_command_response(testname, dr, "CP40\r", "02,PARTITION SELECTED,40,00\r");
+    expect_command_response(testname, dr, "EL:$\r", "30,SYNTAX ERROR,00,00\r");
+}
+
+// A 1541 image on partition `part`, selected, with a buffer channel open on `chan`.
+static void s11_block_partition(FileManager *fm, IecDrive *dr, const char *testname, int part,
+                                const char *image, uint8_t chan)
+{
+    char cmd[16];
+    create_formatted_image(fm, image, "BLOCKS", 683, e_image_d64);
+    dr->add_partition(part, image, "BLOCKS");
+    snprintf(cmd, sizeof(cmd), "CP%d\r", part);
+    expect_command_status_prefix(testname, dr, cmd, "02,PARTITION SELECTED");
+    open_buffer_channel(testname, dr, chan);
+}
+
+// SI-090: a standard buffer starts with its pointer at byte 1, so what is written right
+// after the open lands from byte 1 on.
+static void s11_si090_buffer_pointer(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI090-BufferPointer";
+    s11_block_partition(fm, dr, testname, 49, "/Fat/s11_si090.d64", 2);
+    send_channel_data(dr, 2, (const uint8_t *)"ABC", 3);
+    expect_command_ok(testname, dr, "U2:2,0,1,0\r");
+    expect_command_ok(testname, dr, "U1:2,0,1,0\r");
+    uint8_t sector[256];
+    read_buffer_channel(testname, dr, 2, sector, sizeof(sector));
+    printf("%s: bytes 1 to 3 are %02X %02X %02X\n", testname, sector[1], sector[2], sector[3]);
+    REQUIRE(memcmp(sector + 1, "ABC", 3) == 0);
+    close_file(dr, 2);
+}
+
+// SI-090 and SI-092: "##n" chains n 256 byte buffers with the pointer at 0, B-P takes
+// the high byte of the position, and a buffer too large for the channel is refused.
+static void s11_si090_large_buffer(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI090-LargeBuffer";
+    s11_partition(fm, dr, "si090l");
+    const uint8_t chan = 3;
+    open_file(dr, chan, "##2");
+    get_status(dr);
+    expect_status_ok(testname, "##2");
+    uint8_t pattern[512];
+    for (int i = 0; i < 512; i++) {
+        pattern[i] = (uint8_t)(i % 251);
+    }
+    send_channel_data(dr, chan, pattern, sizeof(pattern));
+    expect_command_ok(testname, dr, "B-P 3 4 1\r");
+    uint8_t one[1];
+    read_buffer_channel(testname, dr, chan, one, 1);
+    printf("%s: byte at 260 is %02X, expected %02X\n", testname, one[0], pattern[260]);
+    REQUIRE(one[0] == pattern[260]);
+    expect_command_ok(testname, dr, "B-P 3 0 0\r");
+    uint8_t all[512];
+    read_buffer_channel(testname, dr, chan, all, sizeof(all));
+    REQUIRE(memcmp(all, pattern, sizeof(all)) == 0);
+    close_file(dr, chan);
+    expect_iec_open_status_prefix(testname, dr, chan, "##9", "70,NO CHANNEL");
+    close_file(dr, chan);
+}
+
+// SI-093 and SI-013: a direct access channel keeps the partition that was current when
+// it was opened, and the partition number in a block command is ignored.
+static void s11_si093_bound_partition(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI093-BoundPartition";
+    s11_partition(fm, dr, "si093");
+    s11_block_partition(fm, dr, testname, 50, "/Fat/s11_si093.d64", 2);
+    expect_command_response(testname, dr, "CP40\r", "02,PARTITION SELECTED,40,00\r");
+    expect_command_ok(testname, dr, "U1:2,0,18,0\r");
+    uint8_t bam[256];
+    read_buffer_channel(testname, dr, 2, bam, sizeof(bam));
+    printf("%s: the channel read %02X %02X %02X from 18/0\n", testname, bam[0], bam[1], bam[2]);
+    REQUIRE((bam[0] == 18) && (bam[1] == 1) && (bam[2] == 'A'));
+    expect_command_ok(testname, dr, "U1:2,40,18,0\r");
+    read_buffer_channel(testname, dr, 2, bam, sizeof(bam));
+    REQUIRE((bam[0] == 18) && (bam[1] == 1) && (bam[2] == 'A'));
+    close_file(dr, 2);
+}
+
+// SI-094: B-R takes the number of bytes from the first byte of the block and starts at
+// the second; B-W stores the buffer pointer minus one there. U1 and U2 do neither.
+static void s11_si094_block_length(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI094-BlockLength";
+    s11_block_partition(fm, dr, testname, 51, "/Fat/s11_si094.d64", 2);
+    uint8_t block[256];
+    memset(block, 0, sizeof(block));
+    block[0] = 5;
+    memcpy(block + 1, "HELLO", 5);
+    expect_command_ok(testname, dr, "B-P 2 0\r");
+    send_channel_data(dr, 2, block, sizeof(block));
+    expect_command_ok(testname, dr, "U2:2,0,1,1\r");
+    expect_command_ok(testname, dr, "B-R:2,0,1,1\r");
+    uint8_t got[256];
+    int n = read_file(dr, 2, got, sizeof(got));
+    printf("%s: B-R made %d bytes available\n", testname, n);
+    REQUIRE((n == 5) && (memcmp(got, "HELLO", 5) == 0));
+
+    expect_command_ok(testname, dr, "B-P 2 1\r");
+    send_channel_data(dr, 2, (const uint8_t *)"ABC", 3);
+    expect_command_ok(testname, dr, "B-W:2,0,1,2\r");
+    expect_command_ok(testname, dr, "U1:2,0,1,2\r");
+    read_buffer_channel(testname, dr, 2, got, 256);
+    printf("%s: B-W stored %d in byte 0\n", testname, got[0]);
+    REQUIRE((got[0] == 3) && (memcmp(got + 1, "ABC", 3) == 0));
+    close_file(dr, 2);
+}
+
+// The whole stream of "$" opened on data channel `chan`.
+static int s11_raw_directory(const char *testname, IecDrive *dr, uint8_t chan, uint8_t *raw, int size)
+{
+    memset(raw, 0, size);
+    open_file(dr, chan, "$");
+    get_status(dr);
+    expect_status_ok(testname, "$");
+    int got = read_file(dr, chan, raw, size);
+    close_file(dr, chan);
+    return got;
+}
+
+// SI-137: "$" on a secondary address other than 0 reads the directory as the sectors of a
+// 1541 directory without their link bytes. A host directory gets a made up BAM sector of
+// 254 bytes, 'A' first, the header name at $8E and the id at $A0, padded with $A0. One
+// entry per file follows; an entry is 32 bytes, except the first of every eight, which
+// loses the two link bytes, and dummy entries complete the last sector.
+static void s11_si137_raw_directory(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI137-RawDirectory";
+    s11_partition(fm, dr, "si137");
+    expect_iec_write_ok(testname, dr, 1, "ONE", "1");
+    expect_iec_write_ok(testname, dr, 2, "TWO,S,W", "2");
+    expect_command_ok(testname, dr, "L:ONE\r");
+
+    uint8_t raw[2048];
+    int got = s11_raw_directory(testname, dr, 2, raw, sizeof(raw));
+    printf("%s: %d bytes, starting %02X %02X %02X\n", testname, got, raw[0], raw[1], raw[2]);
+    REQUIRE(got == 254 + 30 + 7 * 32);
+    REQUIRE(raw[0] == 'A');
+    REQUIRE(memcmp(raw + 0x8E, "SUITE11\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0", 16) == 0);
+    REQUIRE(memcmp(raw + 0xA0, "00\xA0" "2A", 5) == 0);
+
+    // Entry i starts 2 bytes before its type byte, as in a directory sector.
+    bool one = false, two = false;
+    for (int i = 0; i < 2; i++) {
+        const uint8_t *e = raw + 254 + 32 * i - 2;
+        printf("%s: entry %d type %02X track %d blocks %d\n", testname, i, e[2], e[3], e[30] | (e[31] << 8));
+        REQUIRE((e[3] == 1) && (e[30] == 1) && (e[31] == 0));
+        if (memcmp(e + 5, "ONE\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0", 16) == 0) {
+            REQUIRE(e[2] == 0xC2); // closed, locked PRG
+            one = true;
+        } else if (memcmp(e + 5, "TWO\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0\xA0", 16) == 0) {
+            REQUIRE(e[2] == 0x81); // closed SEQ
+            two = true;
+        }
+    }
+    REQUIRE(one && two);
+    for (int i = 254 + 30 + 32; i < got; i++) {
+        REQUIRE(raw[i] == 0);
+    }
+    expect_command_ok(testname, dr, "L:ONE\r");
+
+    // No files is one empty sector; eight files fill a sector and an empty one follows.
+    expect_command_ok(testname, dr, "MD:EIGHT\r");
+    expect_command_ok(testname, dr, "CD:EIGHT\r");
+    got = s11_raw_directory(testname, dr, 2, raw, sizeof(raw));
+    printf("%s: an empty directory is %d bytes\n", testname, got);
+    REQUIRE(got == 508);
+    for (int i = 254; i < got; i++) {
+        REQUIRE(raw[i] == 0);
+    }
+    for (int i = 0; i < 8; i++) {
+        char name[8];
+        snprintf(name, sizeof(name), "F%d", i);
+        expect_iec_write_ok(testname, dr, 1, name, "x");
+    }
+    got = s11_raw_directory(testname, dr, 2, raw, sizeof(raw));
+    printf("%s: eight files are %d bytes\n", testname, got);
+    REQUIRE(got == 254 * 3);
+    REQUIRE((raw[254 + 32 * 7 - 2 + 5] == 'F') && (raw[254 * 2] == 0));
+    expect_command_ok(testname, dr, "CD//\r");
+}
+
+// SI-137 inside a disk image: the directory track itself, from the BAM sector on.
+static void s11_si137_raw_image(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI137-RawImage";
+    create_formatted_image(fm, "/Fat/s11_si137.d64", "RAWDIR", 683, e_image_d64);
+    dr->add_partition(52, "/Fat/s11_si137.d64", "RAWDIR");
+    expect_command_status_prefix(testname, dr, "CP52\r", "02,PARTITION SELECTED");
+    expect_iec_write_ok(testname, dr, 1, "INIMAGE", "img");
+
+    uint8_t bam[256], dir[256];
+    open_buffer_channel(testname, dr, 3);
+    expect_command_ok(testname, dr, "U1:3,0,18,0\r");
+    read_buffer_channel(testname, dr, 3, bam, sizeof(bam));
+    expect_command_ok(testname, dr, "U1:3,0,18,1\r");
+    read_buffer_channel(testname, dr, 3, dir, sizeof(dir));
+    close_file(dr, 3);
+
+    uint8_t raw[2048];
+    int got = s11_raw_directory(testname, dr, 2, raw, sizeof(raw));
+    printf("%s: %d bytes, starting %02X %02X %02X; 18/1 links to %d/%d\n", testname, got,
+           raw[0], raw[1], raw[2], dir[0], dir[1]);
+    REQUIRE(got == 508);
+    REQUIRE(memcmp(raw, bam + 2, 254) == 0);
+    REQUIRE(memcmp(raw + 254, dir + 2, 254) == 0);
+}
+
+extern int iec_interface_configure_calls; // counted by the interface stub
+
+// SI-103: UJ closes the data channels, keeping the partition and its directory, and
+// U+shifted J also returns every partition to its root and selects partition 1. Both
+// answer 73. Neither may reconfigure the IEC interface, which on the device holds the
+// IEC processor in reset, so the command channel has to go on answering.
+static void s11_si103_resets(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI103-Resets";
+    s11_partition(fm, dr, "si103");
+    expect_command_ok(testname, dr, "MD:SUB\r");
+    expect_command_ok(testname, dr, "CD:SUB\r");
+    open_file(dr, 1, "KEPT");
+    get_status(dr);
+    expect_status_ok(testname, "KEPT");
+    send_channel_data(dr, 1, (const uint8_t *)"abc", 3);
+
+    int configured = iec_interface_configure_calls;
+    expect_command_status_prefix(testname, dr, "UJ\r", "73,");
+    printf("%s: interface configured %d times by UJ\n", testname, iec_interface_configure_calls - configured);
+    REQUIRE(iec_interface_configure_calls == configured);
+    expect_command_response(testname, dr, "XPWD\r", "40:/SUB/");
+    expect_iec_file(testname, dr, 0, "KEPT", "abc");
+
+    expect_command_status_prefix(testname, dr, "U\xCA\r", "73,");
+    REQUIRE(iec_interface_configure_calls == configured);
+    expect_command_response(testname, dr, "XPWD\r", "1:/");
+    expect_command_response(testname, dr, "CP40\r", "02,PARTITION SELECTED,40,00\r");
+    expect_command_response(testname, dr, "XPWD\r", "40:/");
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -3223,6 +3592,15 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-SI071-Format",            s11_si071_format },
     { "Suite11-SI147-ShiftedSpace",      s11_si147_shifted_space },
     { "Suite11-SI142-EscapedWildcards",  s11_si142_escaped_wildcards },
+    { "Suite11-SI076-Lock",              s11_si076_lock },
+    { "Suite11-SI077-Attributes",        s11_si077_attributes },
+    { "Suite11-SI090-BufferPointer",     s11_si090_buffer_pointer },
+    { "Suite11-SI090-LargeBuffer",       s11_si090_large_buffer },
+    { "Suite11-SI093-BoundPartition",    s11_si093_bound_partition },
+    { "Suite11-SI094-BlockLength",       s11_si094_block_length },
+    { "Suite11-SI137-RawDirectory",      s11_si137_raw_directory },
+    { "Suite11-SI137-RawImage",          s11_si137_raw_image },
+    { "Suite11-SI103-Resets",            s11_si103_resets },
 };
 
 // Runs every case, or only those whose name contains `only`.

@@ -36,10 +36,7 @@
 // T-RI -> "YYYY-MM-DDThh:mm:ss dow\r"
 // T-RD -> "{WD}{Y}{M}{D}{h}{m}{s}{am/pm}\r"  Documentation says it's decimal, but it is actually binary h in 12 hour format, Y+1900
 // T-RB -> "{WD}{Y}{M}{D}{h}{m}{s}{am/pm}\r"  BCD format Y<80:+2000, else+1900, also 12 hour format for some strange reason
-// T-WA -> not supported, as the RTC is not part of the drive, but of the system
-// T-WI -> not supported, as the RTC is not part of the drive, but of the system
-// T-WD -> not supported, as the RTC is not part of the drive, but of the system
-// T-WB -> not supported, as the RTC is not part of the drive, but of the system
+// T-WA, T-WI, T-WD, T-WB -> set the system clock, in the formats above (SI-120)
 
 // Directories
 // $ [=T] [[n][path]:] [= commalist([TP|OPTION])], OPTION = { L, N, <stamp, >stamp }, stamp = MM/DD/YY HH:MM xM, x = {A | P}
@@ -58,6 +55,12 @@ extern "C" {
     void get_current_time(int& wd, int& year, int& month, int& day, int& hour, int& min, int& sec)
     {
         wd = 3; year = 2025; month = 6; day = 26; hour = 0; min = 41; sec = 1;
+    }
+    // Sets the clock; non-zero when there is no clock to set.
+    int set_current_time(int wd, int year, int month, int day, int hour, int min, int sec) __attribute__((weak));
+    int set_current_time(int wd, int year, int month, int day, int hour, int min, int sec)
+    {
+        return -1;
     }
 }
 int parse_full_path(const char *buf, filename_t& name, bool *replace = NULL, bool path_only = false)
@@ -320,15 +323,16 @@ int IecParser :: block_command(const uint8_t *buffer, int len)
     case 'R':
         n = parse_block_parameters(params, param_len, p, 4);
         if (n != 4) return ERR_SYNTAX;
-        return exec->do_block_read(p[0], p[1], p[2], p[3]);
+        return exec->do_block_read(p[0], p[1], p[2], p[3], true);
     case 'W':
         n = parse_block_parameters(params, param_len, p, 4);
         if (n != 4) return ERR_SYNTAX;
-        return exec->do_block_write(p[0], p[1], p[2], p[3]);
+        return exec->do_block_write(p[0], p[1], p[2], p[3], true);
     case 'P':
-        n = parse_block_parameters(params, param_len, p, 2);
-        if (n != 2) return ERR_SYNTAX;
-        return exec->do_buffer_position(p[0], p[1]);
+        // The optional third number is the high byte of the position (SI-092).
+        n = parse_block_parameters(params, param_len, p, 3);
+        if (n < 2) return ERR_SYNTAX;
+        return exec->do_buffer_position(p[0], p[1] + ((n == 3) ? (p[2] << 8) : 0));
     case 'A':
     case 'F':
         // Allocate and free take the partition, the track and the sector. They do
@@ -598,29 +602,123 @@ int IecParser :: rename_sub_command(const uint8_t *buffer, int len)
         }
         return exec->do_rename_partition(names.c_str(), oldname);
     }
+    case 'H':
+        return header_command(cmd.c_str());
+    default:
+        return ERR_SYNTAX;
+    }
+}
+
+// [n][path]:name[,id], the header of a directory, for R-H and for sd2iec's EH:, XH: and
+// D: (SI-064, SI-077, SD parse_set_header()).
+int IecParser :: header_command(const char *text)
+{
+    filename_t dest;
+    int err = parse_full_path(text, dest, NULL, false);
+    if (err) {
+        return err;
+    }
+    // A header may carry an id after a comma, which a host directory has no place for;
+    // sd2iec limits it to five characters.
+    const char *id;
+    if (dest.filename.split(',', &id) && (strlen(id) > 5)) {
+        return ERR_NO_NAME;
+    }
+    if ((dest.filename.length() == 0) || (dest.filename.length() > 16)) {
+        return ERR_NO_NAME;
+    }
+    if (dest.filename.contains_any("*?")) {
+        return ERR_ILLEGAL_NAME;
+    }
+    return exec->do_rename_header(dest);
+}
+
+// L[n][path]:name toggles the lock of one file or directory (SI-076, HD 9-30).
+int IecParser :: lock_command(const uint8_t *buffer, int len)
+{
+    mstring cmd((const char *)buffer, 1, len-1);
+    filename_t name;
+    int err = parse_full_path(cmd.c_str(), name, NULL, false);
+    if (err) {
+        return err;
+    }
+    return exec->do_attributes(&name, 1, CBMDOS_ATTR_LOCKED, CBMDOS_ATTR_LOCKED, true);
+}
+
+// A:[R][H][A]=name sets exactly the attributes it names on one entry (SI-077,
+// SD parse_attr()).
+int IecParser :: attribute_command(const uint8_t *buffer, int len)
+{
+    mstring cmd((const char *)buffer, 0, len-1);
+    const char *name_text;
+    if (!cmd.split('=', &name_text)) {
+        return ERR_SYNTAX;
+    }
+    uint8_t attrib = 0;
+    for (const char *p = cmd.c_str() + ((len > 2) ? 2 : len); *p; p++) {
+        if (*p == 'R') attrib |= CBMDOS_ATTR_LOCKED;
+        if (*p == 'H') attrib |= CBMDOS_ATTR_HIDDEN;
+        if (*p == 'A') attrib |= CBMDOS_ATTR_ARCHIVE;
+    }
+    filename_t name;
+    int err = parse_full_path(name_text, name, NULL, false);
+    if (err) {
+        return err;
+    }
+    return exec->do_attributes(&name, 1, attrib,
+                               CBMDOS_ATTR_LOCKED | CBMDOS_ATTR_HIDDEN | CBMDOS_ATTR_ARCHIVE, false);
+}
+
+// EL:name[,name...] locks and EU:name[,name...] unlocks every file each pattern matches;
+// EH with a colon straight after the partition number sets a header, and otherwise
+// toggles the hidden flag of one entry (SI-077, SD parse_ecommand()).
+int IecParser :: e_command(const uint8_t *buffer, int len)
+{
+    mstring cmd((const char *)buffer, 2, len-1);
+    switch (buffer[1]) {
+    case 'L':
+    case 'U': {
+        filename_t names[16];
+        const char *parts[16] = { NULL };
+        int n = cmd.split(',', parts, 16);
+        for (int i = 0; i < n; i++) {
+            int err = parse_full_path(parts[i], names[i], NULL, false);
+            if (err) {
+                return err;
+            }
+        }
+        return exec->do_attributes(names, n, (buffer[1] == 'L') ? CBMDOS_ATTR_LOCKED : 0,
+                                   CBMDOS_ATTR_LOCKED, false);
+    }
     case 'H': {
-        filename_t dest;
-        int err = parse_full_path(cmd.c_str(), dest, NULL, false);
+        const char *p = cmd.c_str();
+        while (isdigit(*p)) {
+            p++;
+        }
+        if (*p == ':') {
+            return header_command(cmd.c_str());
+        }
+        filename_t name;
+        int err = parse_full_path(cmd.c_str(), name, NULL, false);
         if (err) {
             return err;
         }
-        // A header may carry an id after a comma, which a host directory has no
-        // place for; sd2iec limits it to five characters.
-        const char *id;
-        if (dest.filename.split(',', &id) && (strlen(id) > 5)) {
-            return ERR_NO_NAME;
-        }
-        if ((dest.filename.length() == 0) || (dest.filename.length() > 16)) {
-            return ERR_NO_NAME;
-        }
-        if (dest.filename.contains_any("*?")) {
-            return ERR_ILLEGAL_NAME;
-        }
-        return exec->do_rename_header(dest);
+        return exec->do_attributes(&name, 1, CBMDOS_ATTR_HIDDEN, CBMDOS_ATTR_HIDDEN, true);
     }
     default:
         return ERR_SYNTAX;
     }
+}
+
+// D:name[,id] sets a header, as sd2iec does; the direct sector commands DI, DR and DW
+// are out of scope (SI-096).
+int IecParser :: direct_command(const uint8_t *buffer, int len)
+{
+    if (buffer[1] != ':') {
+        return ERR_SYNTAX;
+    }
+    mstring cmd((const char *)buffer, 1, len-1);
+    return header_command(cmd.c_str());
 }
 
 // S-8, S-9 and S-D, the software swap of HD 9-34 (SI-101). Only the exact three byte
@@ -754,9 +852,134 @@ int IecParser :: time_command(const uint8_t *buffer, int len)
         return exec->do_cmd_response(result, reslen);
         break;
     case 'W':
-        return 0; // just assume OK
+        return time_write(buffer, len);
     }
     return ERR_SYNTAX;
+}
+
+// A decimal number at p, which is moved past it and the one separator after it, as
+// SD parse_timewrite() reads its fields. -1 when there is no digit.
+static int clock_number(const uint8_t *&p, const uint8_t *end)
+{
+    int n = -1;
+    while ((p < end) && (*p >= '0') && (*p <= '9')) {
+        n = (n < 0) ? (*p - '0') : ((n < 1000) ? (n * 10 + *p - '0') : n);
+        p++;
+    }
+    if (p < end) {
+        p++;
+    }
+    return n;
+}
+
+// A two digit year as the clock keeps it, 1980 to 2079; -1 for anything else.
+static int clock_year(int yy)
+{
+    if ((yy < 0) || (yy > 99)) {
+        return -1;
+    }
+    return (yy < 80) ? (2000 + yy) : (1900 + yy);
+}
+
+// T-WA, T-WB, T-WD and T-WI (SI-120), in the formats T-R reads, following SD
+// parse_timewrite(): the A form may leave out the AM/PM marker for a 24 hour time, and
+// the I form has its day of the week calculated. What is not a time, or a year the clock
+// cannot keep, answers 30, and so does a device without a clock.
+int IecParser :: time_write(const uint8_t *buffer, int len)
+{
+    int wd = -1, year = -1, month = -1, day = -1, hour = -1, min = -1, sec = -1;
+    bool twelve_hour = false;
+    bool pm = false;
+    const uint8_t *end = buffer + len;
+    const uint8_t *p;
+
+    switch((len >= 4) ? buffer[3] : 0) {
+    case 'A': {
+        if (len < 26) {
+            return ERR_SYNTAX;
+        }
+        const char *days = "SUMOTUWETHFRSA";
+        for (wd = 0; wd < 7; wd++) {
+            if ((buffer[4] == days[2 * wd]) && (buffer[5] == days[2 * wd + 1])) {
+                break;
+            }
+        }
+        p = buffer + 9;
+        month = clock_number(p, end);
+        day = clock_number(p, end);
+        year = clock_year(clock_number(p, end));
+        hour = clock_number(p, end);
+        min = clock_number(p, end);
+        sec = clock_number(p, end);
+        if ((len >= 29) && (buffer[28] == 'M')) {
+            twelve_hour = true;
+            pm = (buffer[27] == 'P');
+        }
+        break;
+    }
+    case 'B':
+    case 'D': {
+        if (len < 12) {
+            return ERR_SYNTAX;
+        }
+        bool bcd = (buffer[3] == 'B');
+        int v[6];
+        for (int i = 0; i < 6; i++) {
+            uint8_t b = buffer[5 + i];
+            v[i] = bcd ? (((b >> 4) * 10) + (b & 0x0F)) : b;
+        }
+        wd = buffer[4];
+        // The binary year counts from 1900, and from 2000 below 80, as T-RD reads it.
+        year = bcd ? clock_year(v[0]) : (v[0] + ((v[0] < 80) ? 2000 : 1900));
+        month = v[1];
+        day = v[2];
+        hour = v[3];
+        min = v[4];
+        sec = v[5];
+        twelve_hour = true;
+        pm = (buffer[11] != 0);
+        break;
+    }
+    case 'I':
+        if (len < 23) {
+            return ERR_SYNTAX;
+        }
+        p = buffer + 4;
+        year = clock_number(p, end);
+        month = clock_number(p, end);
+        day = clock_number(p, end);
+        hour = clock_number(p, end);
+        min = clock_number(p, end);
+        sec = clock_number(p, end);
+        break;
+    default:
+        return ERR_SYNTAX;
+    }
+
+    if (twelve_hour && (hour >= 0)) {
+        if (hour == 12) {
+            hour = 0;
+        }
+        if (pm) {
+            hour += 12;
+        }
+    }
+    if ((year < 1980) || (year > 2079) || (month < 1) || (month > 12) || (day < 1) || (day > 31) ||
+        (hour < 0) || (hour > 23) || (min < 0) || (min > 59) || (sec < 0) || (sec > 59)) {
+        return ERR_SYNTAX;
+    }
+    if (buffer[3] == 'I') {
+        static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+        int y = (month < 3) ? (year - 1) : year;
+        wd = (y + y / 4 - y / 100 + y / 400 + t[month - 1] + day) % 7;
+    }
+    if ((wd < 0) || (wd > 6)) {
+        return ERR_SYNTAX;
+    }
+    if (set_current_time(wd, year, month, day, hour, min, sec)) {
+        return ERR_SYNTAX;
+    }
+    return 0;
 }
 
 int IecParser :: user_command(const uint8_t *buffer, int len)
@@ -774,12 +997,12 @@ int IecParser :: user_command(const uint8_t *buffer, int len)
     case 'A':
         n = parse_block_parameters(params, param_len, p, 4);
         if (n != 4) return ERR_SYNTAX;
-        return exec->do_block_read(p[0], p[1], p[2], p[3]);
+        return exec->do_block_read(p[0], p[1], p[2], p[3], false);
     case '2':
     case 'B':
         n = parse_block_parameters(params, param_len, p, 4);
         if (n != 4) return ERR_SYNTAX;
-        return exec->do_block_write(p[0], p[1], p[2], p[3]);
+        return exec->do_block_write(p[0], p[1], p[2], p[3], false);
     case '9':
     case 'I':
         // UI+ and UI- only select the serial bus timing. They are not a reset, so
@@ -790,7 +1013,9 @@ int IecParser :: user_command(const uint8_t *buffer, int len)
         return exec->do_initialize();
     case ':':
     case 'J':
-        return exec->do_initialize();
+        return exec->do_reset(false);
+    case 0xCA: // U+shifted J
+        return exec->do_reset(true);
     case '0':
         // U0>+CHR$(d) changes the device number (SI-100). CBM DOS takes the > from its
         // low five bits, as sd2iec does. The other U0 forms select serial timing and
@@ -810,6 +1035,12 @@ int IecParser :: extended_command(const uint8_t *buffer, int len)
     mstring cmd((const char *)buffer, 1, len-1);
     if (cmd == "PWD") {
         return exec->do_pwd_command();
+    }
+    // XH:name[,id] sets a header (SI-077); XH+ and XH- select a D64 hidden file mode this
+    // drive does not have.
+    if ((len > 3) && (buffer[1] == 'H')) {
+        mstring header((const char *)buffer, 2, len-1);
+        return header_command(header.c_str());
     }
     return ERR_SYNTAX;
 }
@@ -885,8 +1116,15 @@ int IecParser :: execute_command(const uint8_t *buffer, int len)
     case 'V': return 0; // validate: a host file system has nothing to validate
     case 'W': return write_protect_command(buffer, len);
     case 'X':
-    case 'E':
         return extended_command(buffer, len);
+    case 'E':
+        return e_command(buffer, len);
+    case 'A':
+        return attribute_command(buffer, len);
+    case 'D':
+        return direct_command(buffer, len);
+    case 'L':
+        return lock_command(buffer, len);
     }
     return ERR_UNKNOWN_CMD;
 }

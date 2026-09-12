@@ -108,6 +108,7 @@ public:
     FRESULT file_open(const char *filename, uint8_t flags, File **);  // Opens file (creates file object)
     FRESULT file_rename(const char *old_name, const char *new_name);  // Renames a file
     FRESULT file_delete(const char *path); // deletes a file
+    FRESULT file_attrib(const char *path, uint8_t attrib, uint8_t mask);
 
     bool     needs_sorting() { return true; }
 };

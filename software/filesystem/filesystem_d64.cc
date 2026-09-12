@@ -562,6 +562,35 @@ FRESULT FileSystemCBM::file_rename(const char *old_name, const char *new_name)
     return res;
 }
 
+// A CBM directory entry has one attribute a host file system also has: the lock, bit 6
+// of the file type byte, which reads back as AM_RDO.
+FRESULT FileSystemCBM::file_attrib(const char *path, uint8_t attrib, uint8_t mask)
+{
+    if (mask & ~AM_RDO) {
+        return FR_NOT_ENABLED;
+    }
+    PathInfo pi(this);
+    pi.init(path);
+    PathStatus_t pres = walk_path(pi);
+    if (pres == e_DirNotFound) {
+        return FR_NO_PATH;
+    }
+    if (pres != e_EntryFound) {
+        return FR_NO_FILE;
+    }
+    DirInCBM *dd = new DirInCBM(this, pi.getParentInfo()->cluster);
+    FileInfo info(56);
+    FRESULT res = find_file(pi.getFileName(), dd, &info);
+    if ((res == FR_OK) && (mask & AM_RDO)) {
+        DirEntryCBM *p = dd->get_pointer();
+        p->std_fileType = (attrib & AM_RDO) ? (p->std_fileType | 0x40) : (p->std_fileType & ~0x40);
+        dirty = 1;
+        res = sync();
+    }
+    delete dd;
+    return res;
+}
+
 FRESULT FileSystemCBM::deallocate_vlir_records(uint8_t track, uint8_t sector, uint8_t *visited)
 {
 	uint8_t *rblk = new uint8_t[256];

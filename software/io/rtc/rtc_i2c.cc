@@ -404,5 +404,12 @@ extern "C" void get_current_time(int& wd, int& year, int& month, int& day, int& 
     year += RTC_EPOCH_YEAR; // get_time() counts years from the epoch, callers do not
 }
 
+// The Software IEC drive's T-W commands set the clock through this (SI-120).
+extern "C" int set_current_time(int wd, int year, int month, int day, int hour, int min, int sec)
+{
+    rtc.set_time(year - RTC_EPOCH_YEAR, month, day, wd, hour, min, sec);
+    return 0;
+}
+
 #include "init_function.h"
 InitFunction init_rtc("RTC", [](void *_obj, void *_param) { rtc.init(); }, NULL, NULL, 2);

@@ -34,8 +34,8 @@ static void record_stub_name(filename_t& name)
 class IecCommandExecuterStubs : public IecCommandExecuter
 {
 public:
-    int do_block_read(int chan, int part, int track, int sector);
-    int do_block_write(int chan, int part, int track, int sector);
+    int do_block_read(int chan, int part, int track, int sector, bool length_byte);
+    int do_block_write(int chan, int part, int track, int sector, bool length_byte);
     int do_block_allocate(int part, int track, int sector, bool allocate);
     int do_buffer_position(int chan, int pos);
     int do_set_current_partition(int part);
@@ -45,6 +45,7 @@ public:
     int do_copy(filename_t& dest, filename_t sources[], int n);
     int do_initialize();
     int do_initialize_buffers();
+    int do_reset(bool cold);
     int do_format(filename_t& dest, const char *id);
     int do_rename(filename_t &src, filename_t &dest);
     int do_scratch(filename_t filenames[], int n);
@@ -56,19 +57,22 @@ public:
     int do_rename_header(filename_t& dest);
     int do_set_device_number(int dev);
     int do_write_protect(bool on);
+    int do_attributes(filename_t names[], int n, uint8_t attrib, uint8_t mask, bool toggle);
 };
 
 
-int IecCommandExecuterStubs::do_block_read(int chan, int part, int track, int sector)
+int IecCommandExecuterStubs::do_block_read(int chan, int part, int track, int sector, bool length_byte)
 {
     record_stub_call("block read", chan, part, track, sector);
+    strcpy(last_stub_call.text, length_byte ? "length" : "no length");
     printf("Block read: Channel %d, Partition %d, T/S %d/%d\n", chan, part, track, sector);
     return 0;
 }
 
-int IecCommandExecuterStubs::do_block_write(int chan, int part, int track, int sector)
+int IecCommandExecuterStubs::do_block_write(int chan, int part, int track, int sector, bool length_byte)
 {
     record_stub_call("block write", chan, part, track, sector);
+    strcpy(last_stub_call.text, length_byte ? "length" : "no length");
     printf("Block write: Channel %d, Partition %d, T/S %d/%d\n", chan, part, track, sector);
     return 0;
 }
@@ -126,6 +130,12 @@ int IecCommandExecuterStubs::do_copy(filename_t& dest, filename_t sources[], int
 int IecCommandExecuterStubs::do_initialize()
 {
     record_stub_call("initialize");
+    return 73;
+}
+
+int IecCommandExecuterStubs::do_reset(bool cold)
+{
+    record_stub_call("reset", cold ? 1 : 0);
     return 73;
 }
 
@@ -190,6 +200,17 @@ int IecCommandExecuterStubs::do_rename_header(filename_t& dest)
 int IecCommandExecuterStubs::do_set_device_number(int dev)
 {
     record_stub_call("device number", dev);
+    return 0;
+}
+
+int IecCommandExecuterStubs::do_attributes(filename_t names[], int n, uint8_t attrib, uint8_t mask, bool toggle)
+{
+    record_stub_call("attributes", attrib, mask, toggle ? 1 : 0);
+    int used = 0;
+    for (int i = 0; i < n; i++) {
+        used += snprintf(last_stub_call.text + used, sizeof(last_stub_call.text) - used, "%s%d|%s|%s",
+                         i ? "," : "", names[i].partition, names[i].path.c_str(), names[i].filename.c_str());
+    }
     return 0;
 }
 

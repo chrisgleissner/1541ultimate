@@ -72,6 +72,11 @@ typedef struct {
 #define ERR_NO_NAME       34 // no name, or a colon with nothing after it
 #define ERR_REPLACE_TYPE  64 // FILE TYPE MISMATCH: @ names nothing that can be replaced
 
+// The attributes L, EL, EU, EH and A: set, in the bits the FAT file system uses for them.
+#define CBMDOS_ATTR_LOCKED   0x01 // AM_RDO; the lock bit of a CBM directory entry
+#define CBMDOS_ATTR_HIDDEN   0x02 // AM_HID
+#define CBMDOS_ATTR_ARCHIVE  0x20 // AM_ARC
+
 // The command buffer holds 254 bytes, as on the CMD HD (HD 4-6) and on sd2iec's uIEC
 // (CONFIG_COMMAND_BUFFER_SIZE). A command that fills it is refused, because whether
 // anything followed cannot be told (SI-021, SI-022).
@@ -80,8 +85,10 @@ typedef struct {
 class IecCommandExecuter
 {
 public:
-    virtual int do_block_read(int chan, int part, int track, int sector) { return 0; }
-    virtual int do_block_write(int chan, int part, int track, int sector) { return 0; }
+    // length_byte: B-R and B-W, which use the first byte of the block as a length (SI-094);
+    // U1 and U2 do not.
+    virtual int do_block_read(int chan, int part, int track, int sector, bool length_byte) { return 0; }
+    virtual int do_block_write(int chan, int part, int track, int sector, bool length_byte) { return 0; }
     virtual int do_block_allocate(int part, int track, int sector, bool allocate) { return 0; }
     virtual int do_buffer_position(int chan, int pos) { return 0; }
     virtual int do_set_current_partition(int part) { return 0; }
@@ -91,6 +98,9 @@ public:
     virtual int do_copy(filename_t& dest, filename_t sources[], int n) { return 0; }
     virtual int do_initialize() { return 0; }
     virtual int do_initialize_buffers() { return 0; }
+    // UJ closes the data channels; cold, for U+shifted J, also returns every partition to
+    // its root and selects the default one (SI-103).
+    virtual int do_reset(bool cold) { return 0; }
     virtual int do_format(filename_t& dest, const char *id) { return 0; }
     virtual int do_rename(filename_t &src, filename_t &dest) { return 0; }
     virtual int do_scratch(filename_t filenames[], int n) { return 0; }
@@ -102,6 +112,8 @@ public:
     virtual int do_rename_header(filename_t& dest) { return 0; }
     virtual int do_set_device_number(int dev) { return 0; } // 0: the configured number
     virtual int do_write_protect(bool on) { return 0; }
+    // Sets, or with toggle flips, the attribute bits in mask on the entries named.
+    virtual int do_attributes(filename_t names[], int n, uint8_t attrib, uint8_t mask, bool toggle) { return 0; }
 };
 
 class IecParser
@@ -118,6 +130,7 @@ class IecParser
     int rename_command(const uint8_t *buffer, int len);
     int scratch_command(const uint8_t *buffer, int len);
     int time_command(const uint8_t *buffer, int len);
+    int time_write(const uint8_t *buffer, int len);
     int user_command(const uint8_t *buffer, int len);
     int extended_command(const uint8_t *buffer, int len);
     int get_command(const uint8_t *buffer, int len);
@@ -125,6 +138,11 @@ class IecParser
     int swap_command(const uint8_t *buffer, int len);
     int write_protect_command(const uint8_t *buffer, int len);
     int memory_command(const uint8_t *buffer, int len);
+    int header_command(const char *text);
+    int lock_command(const uint8_t *buffer, int len);
+    int attribute_command(const uint8_t *buffer, int len);
+    int e_command(const uint8_t *buffer, int len);
+    int direct_command(const uint8_t *buffer, int len);
 
 public:
     IecParser(IecCommandExecuter *e) : exec(e) { }

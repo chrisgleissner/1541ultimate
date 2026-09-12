@@ -65,6 +65,7 @@ public:
     virtual FRESULT file_open(const char *filename, uint8_t flags, File **);  // Opens file (creates file object)
     virtual FRESULT file_rename(const char *old_name, const char *new_name);  // Renames a file
 	virtual FRESULT file_delete(const char *path); // deletes a file
+    virtual FRESULT file_attrib(const char *path, uint8_t attrib, uint8_t mask) { return FR_NOT_ENABLED; } // sets the attribute bits in mask to those in attrib
 
 
 	virtual void    file_print_info(File *f) { } // debug

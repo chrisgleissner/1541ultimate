@@ -176,6 +176,17 @@ FRESULT FileSystemFAT :: file_delete(const TCHAR *path)
 #endif
 }
 
+FRESULT FileSystemFAT :: file_attrib(const TCHAR *path, uint8_t attrib, uint8_t mask)
+{
+#if	(FF_FS_MINIMIZE >= 1) || (FF_USE_CHMOD == 0)
+	return FR_NOT_ENABLED;
+#else
+    mstring prefixedPath(prefix);
+    prefixedPath += path;
+    return f_chmod(prefixedPath.c_str(), attrib, mask);
+#endif
+}
+
 FRESULT FileFAT :: read(void *buffer, uint32_t len, uint32_t *transferred)
 {
     if (!get_file_system()) {

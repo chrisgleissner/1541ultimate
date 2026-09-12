@@ -307,6 +307,20 @@ class IecChannel {
     uint8_t recordSize;
     bool recordDirty;
 
+    // A direct access channel (#): the partition that was current when it was opened, which
+    // its block commands use (SI-093), and its size, 256 bytes or n times that for ##n (SI-090).
+    int buffer_partition;
+    int buffer_size;
+
+    // A raw directory, "$" on a secondary address other than 0 (SI-137). In a disk image
+    // raw_path is the image and raw_link the next directory sector, of which raw_sectors
+    // more may be read; elsewhere raw_count counts the entries of the current sector.
+    bool raw_dir;
+    mstring raw_path;
+    uint8_t raw_link[2];
+    int raw_sectors;
+    int raw_count;
+
     // temporaries
     uint8_t flags;
     IecPartition *partition;
@@ -334,6 +348,8 @@ class IecChannel {
 private:
     int setup_partition_read();
     int setup_directory_read();
+    int setup_raw_directory(FileSystem *fs, const char *path);
+    int read_raw_directory(void);
     int setup_file_access();
     int setup_buffer_access(void);
     int init_iec_transfer(void);
@@ -392,8 +408,10 @@ class IecCommandChannel: public IecChannel, public IecCommandExecuter {
     void mem_write(void);
     void get_error_string(void);
 
-    int do_block_read(int chan, int part, int track, int sector);
-    int do_block_write(int chan, int part, int track, int sector);
+    IecChannel *buffer_channel(int chan);
+    void sector_error(FRESULT fres, int track, int sector);
+    int do_block_read(int chan, int part, int track, int sector, bool length_byte);
+    int do_block_write(int chan, int part, int track, int sector, bool length_byte);
     int do_block_allocate(int part, int track, int sector, bool alloc);
     int do_buffer_position(int chan, int pos);
     int do_set_current_partition(int part);
@@ -403,6 +421,7 @@ class IecCommandChannel: public IecChannel, public IecCommandExecuter {
     int do_copy(filename_t& dest, filename_t sources[], int n);
     int do_initialize();
     int do_initialize_buffers();
+    int do_reset(bool cold);
     int do_format(filename_t& dest, const char *id);
     int do_rename(filename_t &src, filename_t &dest);
     int do_scratch(filename_t filenames[], int n);
@@ -414,6 +433,7 @@ class IecCommandChannel: public IecChannel, public IecCommandExecuter {
     int do_rename_header(filename_t& dest);
     int do_set_device_number(int dev);
     int do_write_protect(bool on);
+    int do_attributes(filename_t names[], int n, uint8_t attrib, uint8_t mask, bool toggle);
 public:
     IecCommandChannel(IecDrive *dr, int ch);
     virtual ~IecCommandChannel();

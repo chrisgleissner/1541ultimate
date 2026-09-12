@@ -192,8 +192,12 @@ void test_block_command_forms(void)
     // serial bus timing, so they must not reset anything.
     test_dispatch("UI", 2, 73, "initialize");
     test_dispatch("U9", 2, 73, "initialize");
-    test_dispatch("UJ", 2, 73, "initialize");
-    test_dispatch("U:", 2, 73, "initialize");
+    // UJ and U: close the data channels; U+shifted J also returns every partition to its
+    // root (SI-103). Both answer with the DOS version.
+    test_dispatch("UJ", 2, 73, "reset", 0);
+    test_dispatch("U:", 2, 73, "reset", 0);
+    test_dispatch("U\xCA", 2, 73, "reset", 1);
+    test_dispatch("UJ\r", 3, 73, "reset", 0);
     test_dispatch("UI+", 3, 0, NULL);
     test_dispatch("UI-", 3, 0, NULL);
     test_dispatch("U9+", 3, 0, NULL);
@@ -414,6 +418,51 @@ void test_name_mapping(void)
     check_fat_name("escaped length guard", "A\xC1\xC2\xC3\xC4\xC5\xC6", 12, "A{C1C2C3C4}");
 }
 
+// SI-076 and SI-077: the lock and attribute commands, and the header forms sd2iec also
+// accepts. The stub records the attribute bits asked for and which of them are set:
+// a = value, b = mask, c = 1 for a toggle.
+void test_attribute_commands(void)
+{
+    test_dispatch_text("L:TEST", 6, 0, "attributes", "-1||TEST", 0x01);
+    test_dispatch_text("L1//:TEST\r", 10, 0, "attributes", "1|//|TEST", 0x01);
+    test_dispatch("L:", 2, 34, NULL);
+    test_dispatch_text("EL:ONE,TWO", 10, 0, "attributes", "-1||ONE,-1||TWO", 0x01);
+    test_dispatch_text("EU:ONE", 6, 0, "attributes", "-1||ONE", 0x00);
+    test_dispatch_text("EH/:FILE", 8, 0, "attributes", "-1|/|FILE", 0x02);
+    test_dispatch_text("A:RH=FILE", 9, 0, "attributes", "-1||FILE", 0x03);
+    test_dispatch_text("A:=FILE\r", 8, 0, "attributes", "-1||FILE", 0x00);
+    test_dispatch("A:RH", 4, 30, NULL);
+    // The header forms: EH with a colon straight after the partition, XH and D.
+    test_dispatch_text("EH:WORK,AB", 10, 0, "rename header", "-1||WORK");
+    test_dispatch_text("XH:WORK", 7, 0, "rename header", "-1||WORK");
+    test_dispatch_text("D:WORK,AB\r", 10, 0, "rename header", "-1||WORK");
+    test_dispatch("DI", 2, 30, NULL);
+}
+
+// SI-092: B-P takes an optional third number, the high byte of the position.
+void test_buffer_position_high_byte(void)
+{
+    test_dispatch("B-P 9 4 1", 9, 0, "buffer position", 9, 260);
+    test_dispatch("B-P:2,144", 9, 0, "buffer position", 2, 144);
+    // SI-094: B-R and B-W use the first byte of the block as a length, U1 and U2 do not.
+    test_dispatch("B-R:2,0,18,1", 12, 0, "block read", 2, 0, 18, 1);
+    test_dispatch("U1:2,0,18,1", 11, 0, "block read", 2, 0, 18, 1);
+    if (!last_stub_call.text[0] || strcmp(last_stub_call.text, "no length")) {
+        printf("U1 was not dispatched as a read without the length byte: '%s'\n", last_stub_call.text);
+        failures++;
+    }
+    test_dispatch("B-R:2,0,18,1", 12, 0, "block read", 2, 0, 18, 1);
+    if (strcmp(last_stub_call.text, "length")) {
+        printf("B-R was not dispatched as a read with the length byte: '%s'\n", last_stub_call.text);
+        failures++;
+    }
+    test_dispatch("B-W:2,0,18,1", 12, 0, "block write", 2, 0, 18, 1);
+    if (strcmp(last_stub_call.text, "length")) {
+        printf("B-W was not dispatched as a write with the length byte: '%s'\n", last_stub_call.text);
+        failures++;
+    }
+}
+
 void test_error_codes(void)
 {
     // SI-031: not a command letter. CHR$(0) and A are what the reporter measured on
@@ -518,6 +567,68 @@ void test_trace_formatters(void)
     test_trace_truncation();
 }
 /* ==================== end of the #877 diagnostics tests ==================== */
+
+// The clock a T-W command sets. The firmware's set_current_time() sets the real time
+// clock; this one records what it was given, and has_clock chooses whether there is a
+// clock at all.
+static int clock_values[7];
+static bool has_clock = true;
+extern "C" int set_current_time(int wd, int year, int month, int day, int hour, int min, int sec)
+{
+    if (!has_clock) {
+        return -1;
+    }
+    int v[7] = { wd, year, month, day, hour, min, sec };
+    memcpy(clock_values, v, sizeof(v));
+    return 0;
+}
+
+static void expect_clock(const char *cmd, int len, int exp_retval, int wd, int year, int month, int day,
+                         int hour, int min, int sec)
+{
+    memset(clock_values, 0xFF, sizeof(clock_values));
+    int retval = parser.execute_command((const uint8_t *)cmd, len);
+    int v[7] = { wd, year, month, day, hour, min, sec };
+    bool ok = (retval == exp_retval);
+    if (exp_retval == 0) {
+        ok = ok && (memcmp(clock_values, v, sizeof(v)) == 0);
+    }
+    if (!ok) {
+        printf("Clock command '%.4s' returned %d and set %d %d-%d-%d %d:%d:%d, expected %d and %d %d-%d-%d %d:%d:%d\n",
+               cmd, retval, clock_values[0], clock_values[1], clock_values[2], clock_values[3],
+               clock_values[4], clock_values[5], clock_values[6],
+               exp_retval, wd, year, month, day, hour, min, sec);
+        failures++;
+    } else {
+        printf("Clock command '%.4s' => OK!\n", cmd);
+    }
+}
+
+// SI-120: T-WA, T-WB, T-WD and T-WI set the clock in the formats T-R reads it in, with the
+// year taken as 1980 to 2079, and answer 30 when the time is not one or there is no clock.
+static void test_clock_write(void)
+{
+    expect_clock("T-WATUES 09/12/26 01:02:03 PM\r", 30, 0, 2, 2026, 9, 12, 13, 2, 3);
+    expect_clock("T-WAMON. 01/01/80 12:00:00 AM", 29, 0, 1, 1980, 1, 1, 0, 0, 0);
+    expect_clock("T-WASAT. 09/12/26 12:30:00 PM", 29, 0, 6, 2026, 9, 12, 12, 30, 0);
+    expect_clock("T-WAFRI. 12/31/79 23:59:58", 26, 0, 5, 2079, 12, 31, 23, 59, 58); // 24 hour, no marker
+    expect_clock("T-WB\x06\x26\x09\x12\x01\x02\x03\x01\r", 13, 0, 6, 2026, 9, 12, 13, 2, 3);
+    expect_clock("T-WD\x06\x7E\x09\x0C\x0C\x02\x03\x00\r", 13, 0, 6, 2026, 9, 12, 0, 2, 3);
+    expect_clock("T-WI2026-09-12T13:02:03 SAT\r", 28, 0, 6, 2026, 9, 12, 13, 2, 3);
+    expect_clock("T-WI1980-01-01T00:00:00", 23, 0, 2, 1980, 1, 1, 0, 0, 0);
+
+    expect_clock("T-WASUN. 13/07/25 09:34:13 PM", 29, 30, 0, 0, 0, 0, 0, 0, 0); // month 13
+    expect_clock("T-WAXYZ. 09/12/26 01:02:03 PM", 29, 30, 0, 0, 0, 0, 0, 0, 0); // no such day
+    expect_clock("T-WA", 4, 30, 0, 0, 0, 0, 0, 0, 0);
+    expect_clock("T-WB\x06\x26\x09", 7, 30, 0, 0, 0, 0, 0, 0, 0);
+    expect_clock("T-WD\x06\x7E\x09\x00\x0C\x02\x03\x00", 12, 30, 0, 0, 0, 0, 0, 0, 0); // day 0
+    expect_clock("T-WI2026-09-12T24:00:00", 23, 30, 0, 0, 0, 0, 0, 0, 0);
+    expect_clock("T-WI1979-12-31T23:59:59", 23, 30, 0, 0, 0, 0, 0, 0, 0); // before the clock's epoch
+    expect_clock("T-WX", 4, 30, 0, 0, 0, 0, 0, 0, 0);
+    has_clock = false;
+    expect_clock("T-WI2026-09-12T13:02:03", 23, 30, 0, 0, 0, 0, 0, 0, 0);
+    has_clock = true;
+}
 
 int main(int argc, const char *argv[])
 {
@@ -740,6 +851,9 @@ int main(int argc, const char *argv[])
     test_command_length_and_terminator();
     test_md_rd_grammar();
     test_name_mapping();
+    test_attribute_commands();
+    test_clock_write();
+    test_buffer_position_high_byte();
     test_command(34, (const uint8_t *)"C99:EMPTY=", 10);
     test_command( 0, (const uint8_t *)"C1:FCOPY=3:FCOPY", 16);
     test_command( 0, (const uint8_t *)"C:FULLSTATS=STAT1,3:STAT3", 25);
@@ -767,7 +881,6 @@ int main(int argc, const char *argv[])
     test_command( 0, (const uint8_t *)"T-RI", 4);
     test_command( 0, (const uint8_t *)"T-RD", 4);
     test_command( 0, (const uint8_t *)"T-RB", 4);
-    test_command( 0, (const uint8_t *)"T-WASUN. 13/07/25 09:34:13 PM", 29);
     test_command( 0, (const uint8_t *)"CP", 2);
     test_command( 0, (const uint8_t *)"CP1", 3);
     test_command( 0, (const uint8_t *)"CP12", 4);

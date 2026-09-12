@@ -1132,6 +1132,24 @@ FRESULT FileManager::delete_file(const char *pathname)
     return fres;
 }
 
+// Sets the attribute bits in mask to those in attrib, for the file systems that keep any.
+FRESULT FileManager::set_attributes(const char *pathname, uint8_t attrib, uint8_t mask)
+{
+    PathInfo pathInfo(rootfs);
+    pathInfo.init(pathname);
+    lock();
+    FRESULT fres = find_pathentry(pathInfo, false);
+    if (fres == FR_OK) {
+        fres = pathInfo.getLastInfo()->fs->file_attrib(pathInfo.getPathFromLastFS(), attrib, mask);
+        if (fres == FR_OK) {
+            mstring work;
+            sendEventToObservers(eRefreshDirectory, pathInfo.getFullPath(work, -1), "");
+        }
+    }
+    unlock();
+    return fres;
+}
+
 FRESULT FileManager::delete_file(Path *path, const char *name)
 {
     PathInfo pathInfo(rootfs);

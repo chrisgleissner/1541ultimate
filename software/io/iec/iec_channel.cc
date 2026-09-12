@@ -242,6 +242,11 @@ IecChannel::IecChannel(IecDrive *dr, int ch)
     recordOffset = 0;
     recordDirty = false;
     dir_free = 0;
+    buffer_partition = 0;
+    buffer_size = 256;
+    raw_dir = false;
+    raw_sectors = 0;
+    raw_count = 0;
     pingpong = true;
     swap_buffers();
 }
@@ -537,7 +542,7 @@ t_channel_retval IecChannel::push_data(uint8_t b)
         break;
 
     case e_buffer:
-        if (pointer < 256) {
+        if (pointer < buffer_size) {
             buffer[pointer++] = b;
             trace_record_write(b);
         }
@@ -834,7 +839,14 @@ static FRESULT find_rendered_iec_child(FileManager *fm, const char *full_dir,
             continue;
         }
 
-        actual_name = info.lfname;
+        // Inside a disk image a file is found again by its name with the type extension;
+        // on a host file system, and for any directory, by the name itself.
+        if (!is_dir && (info.name_format & NAME_FORMAT_CBM)) {
+            char entry[80];
+            actual_name = info.generate_fat_name(entry, sizeof(entry));
+        } else {
+            actual_name = info.lfname;
+        }
         if (out_info) {
             out_info->copyfrom(&info);
         }
@@ -1080,6 +1092,9 @@ int IecChannel::read_dir_entry(void)
     FileInfo info(40);
     const char *partition_type = NULL;
     FRESULT fres;
+    if (raw_dir && (state == e_dir)) {
+        return read_raw_directory();
+    }
     if (state == e_dir) {
         if (!dir) {
             return -1;
@@ -1155,6 +1170,10 @@ int IecChannel::read_dir_entry(void)
     if (info.attrib & AM_VOL) {
         return 1;
     }    
+    // A hidden entry is listed only when H asks for hidden files (SI-134, SI-077).
+    if ((state == e_dir) && (info.attrib & (AM_HID | AM_SYS)) && !name_to_open.dir_opt.show_hidden) {
+        return 1;
+    }
 
     // convert FAT name to CBM name
     char cbm_name[24];
@@ -1224,6 +1243,9 @@ int IecChannel::read_dir_entry(void)
 
     const char *types[] = { "ANY", "PRG", "SEQ", "USR", "REL", "DIR" };
     memcpy(&buffer[27 - chars], partition_type ? partition_type : types[(int)ftype], 3);
+    if (!partition_type && (info.attrib & AM_RDO)) {
+        buffer[30 - chars] = '<'; // locked (SI-132)
+    }
 
     pointer = 0;
     prefetch = 0;
@@ -1311,7 +1333,9 @@ int IecChannel :: setup_directory_read()
 
     IecPartition *part = drive->vfs->GetPartition(name_to_open.file.partition);
 
-    if (info.fs->supports_direct_sector_access()) { // might be CBM image!
+    FileSystem *fs = info.fs;
+    bool labelled = false;
+    if (fs->supports_direct_sector_access()) { // might be CBM image!
         dir->get_entry(info); // first one SHOULD be the volume label
         if ((info.attrib & AM_VOL) && (info.name_format & NAME_FORMAT_CBM)) {
             printf("Volume label found: %s\n", info.lfname);
@@ -1319,7 +1343,7 @@ int IecChannel :: setup_directory_read()
                 buffer[8 + i] = info.lfname[i] & 0x7F;
             }
             buffer[8 + 16] = 0x22;
-            return 0;
+            labelled = true;
         }
     }
 
@@ -1330,7 +1354,9 @@ int IecChannel :: setup_directory_read()
     while ((rel_len > 0) && (rel[rel_len - 1] == '/')) {
         rel_len--;
     }
-    if (rel_len > 0) {
+    if (labelled) {
+        // the image's own label and id
+    } else if (rel_len > 0) {
         int start = rel_len;
         while ((start > 0) && (rel[start - 1] != '/')) {
             start--;
@@ -1349,17 +1375,144 @@ int IecChannel :: setup_directory_read()
         for (int i = 0; (i < 16) && cbm_name[i]; i++) {
             buffer[8 + i] = cbm_name[i];
         }
+    } else {
+        const char *pp = partition->GetName();
+        int pos = 8;
+        int len = strlen(pp);
+        if (len > 16) {
+            pp += (len - 16);
+        }
+        while ((pos < 24) && (*pp))
+            buffer[pos++] = toupper(*(pp++));
+    }
+    if (channel != 0) {
+        return setup_raw_directory(fs, work.c_str());
+    }
+    return 0;
+}
+
+// SI-137: "$" on a secondary address other than 0 reads the directory the way a 1541
+// stores it, as directory sectors without their two link bytes, following SD
+// load_directory(). A D64, D71 or D81 image has those sectors, so the stream follows
+// the chain from the header sector on its directory track. Any other directory, a
+// DNP included, gets a made up BAM sector built from the header line above, then one
+// 32 byte entry per file. The header line is still in the buffer when this is called.
+int IecChannel :: setup_raw_directory(FileSystem *fs, const char *path)
+{
+    raw_dir = true;
+    raw_count = 0;
+    raw_sectors = 0;
+    int header_track = 0;
+    if (fs->supports_direct_sector_access()) {
+        switch (fs->get_sectors_in_track(1)) {
+        case 21: header_track = 18; break; // D64 and D71
+        case 40: header_track = 40; break; // D81
+        }
+    }
+    if (header_track) {
+        raw_path = path;
+        raw_link[0] = (uint8_t)header_track;
+        raw_link[1] = 0;
+        raw_sectors = 256; // a bound for a damaged chain that loops
+        return read_raw_directory();
+    }
+
+    uint8_t header[32];
+    memcpy(header, buffer, 32);
+    memset(buffer, 0, 256);
+    buffer[0] = 'A';
+    memset(buffer + 0x8E, 0xA0, 27);
+    for (int i = 0; i < 16; i++) {
+        buffer[0x8E + i] = header[8 + i];
+    }
+    for (int i = 15; (i >= 0) && (buffer[0x8E + i] == ' '); i--) {
+        buffer[0x8E + i] = 0xA0;
+    }
+    memcpy(buffer + 0xA0, header + 26, 5);
+    if (buffer[0xA2] == ' ') {
+        buffer[0xA2] = 0xA0;
+    }
+    pointer = 0;
+    prefetch = 0;
+    prefetch_max = 254;
+    last_byte = -1;
+    return 0;
+}
+
+// The next piece of a raw directory: a directory sector of a disk image, or one entry
+// of a made up sector. Returns what read_dir_entry() returns.
+int IecChannel :: read_raw_directory(void)
+{
+    if (raw_sectors > 0) {
+        Path path(raw_path.c_str());
+        FRESULT fres = fm->fs_read_sector(&path, buffer, raw_link[0], raw_link[1]);
+        raw_sectors--;
+        if (fres != FR_OK) {
+            drive->set_error_fres(fres);
+            state = e_complete;
+            return -1;
+        }
+        raw_link[0] = buffer[0];
+        raw_link[1] = buffer[1];
+        pointer = 2;
+        prefetch = 2;
+        prefetch_max = 256;
+        last_byte = -1;
+        if (!buffer[0]) { // the last sector, which says where its data ends
+            last_byte = (buffer[1] < 2) ? 2 : buffer[1];
+        } else if (!raw_sectors) {
+            last_byte = 255;
+        }
         return 0;
     }
 
-    const char *pp = partition->GetName();
-    int pos = 8;
-    int len = strlen(pp);
-    if (len > 16) {
-        pp += (len - 16);
+    FileInfo info(40);
+    bool entry = false;
+    while (dir) {
+        if (dir->get_entry(info) != FR_OK) {
+            delete dir;
+            dir = NULL;
+            break;
+        }
+        if (info.attrib & AM_VOL) {
+            continue;
+        }
+        if ((info.attrib & (AM_HID | AM_SYS)) && !name_to_open.dir_opt.show_hidden) {
+            continue;
+        }
+        entry = true;
+        break;
     }
-    while ((pos < 24) && (*pp))
-        buffer[pos++] = toupper(*(pp++));
+    // After the last file, empty entries complete the sector, and a whole empty sector
+    // follows when the last one was full or there were no files, as in SD
+    // rawdir_dummy_refill().
+    memset(buffer, 0, 32);
+    if (entry) {
+        char cbm_name[24];
+        filetype_t ftype = e_any;
+        IecPartition::CreateIecName(&info, cbm_name, ftype);
+        const uint8_t codes[] = { 1, 2, 1, 3, 4, 6 }; // any lists as SEQ, as in a listing
+        buffer[2] = 0x80 | codes[(int)ftype];
+        if (info.attrib & AM_RDO) {
+            buffer[2] |= 0x40;
+        }
+        buffer[3] = 1;
+        memset(buffer + 5, 0xA0, 16);
+        for (int i = 0; (i < 16) && cbm_name[i]; i++) {
+            buffer[5 + i] = cbm_name[i];
+        }
+        uint32_t blocks = (info.size + 253) / 254;
+        if (blocks > 65535) {
+            blocks = 65535;
+        }
+        buffer[30] = (uint8_t)blocks;
+        buffer[31] = (uint8_t)(blocks >> 8);
+    }
+    pointer = (raw_count == 0) ? 2 : 0;
+    prefetch = pointer;
+    prefetch_max = 32;
+    raw_count = (raw_count + 1) % 8;
+    last_byte = (!entry && (raw_count == 0)) ? 31 : -1;
     return 0;
 }
 
@@ -1562,12 +1715,29 @@ int IecChannel :: setup_file_access()
     return 0;
 }
 
+// "#" opens a 256 byte buffer with its pointer at byte 1; "##n", exactly three bytes, a
+// buffer of n times 256 bytes with its pointer at 0 (SI-090, SD README "Large buffers").
+// The channel's own block holds 512 bytes, so n is 1 or 2, and anything else is refused
+// with 70. The channel keeps the partition that is current now (SI-093).
 int IecChannel::setup_buffer_access(void)
 {
-    last_byte = 255;
-    pointer = 0;
-    prefetch = 0;
-    prefetch_max = 256;
+    const char *name = (const char *)buffer;
+    int blocks = 1;
+    pointer = 1;
+    if ((strlen(name) == 3) && (name[1] == '#')) {
+        blocks = name[2] - '0';
+        pointer = 0;
+        if ((blocks < 1) || (blocks > 2)) {
+            state = e_error;
+            drive->set_error(ERR_NO_CHANNEL, 0, 0);
+            return -1;
+        }
+    }
+    buffer_size = 256 * blocks;
+    buffer_partition = drive->vfs->GetTargetPartitionNumber(0);
+    last_byte = buffer_size - 1;
+    prefetch = pointer;
+    prefetch_max = buffer_size;
     state = e_buffer;
 
     return 0;
@@ -1599,6 +1769,7 @@ int IecChannel::open_file(void)  // name should be in buffer
 
     IecPartition *partition = drive->vfs->GetPartition(name_to_open.file.partition);
     recordSize = 0;
+    raw_dir = false;
 
     int result = -1;
     switch(name_to_open.dir_opt.stream) {
@@ -1856,21 +2027,20 @@ const char *IecChannel :: ConstructPath(mstring& work, filename_t& name, filetyp
 }
 
 
-int IecCommandChannel :: do_block_read(int chan, int part, int track, int sector)
+// The direct access channel a block command names, or NULL with 70 set when the channel
+// was not opened with #.
+IecChannel *IecCommandChannel::buffer_channel(int chan)
 {
-    if ((chan < 0) || (chan > 14)) {
-        set_error(ERR_SYNTAX_ERROR_CMD);
-        return ERR_SYNTAX_ERROR_CMD;
+    if ((chan < 0) || (chan > 14) || (drive->get_data_channel(chan)->state != e_buffer)) {
+        drive->set_error(ERR_NO_CHANNEL, 0, 0);
+        return NULL;
     }
-    if (part >= MAX_PARTITIONS) {
-        set_error(ERR_SYNTAX_ERROR_CMD);
-        return ERR_SYNTAX_ERROR_CMD;
-    }
-    IecChannel *channel = drive->get_data_channel(chan);
-    GETPARTITION(part, partition, -1);
-    Path path(partition->GetFullPath());
-    FRESULT fres;
-    fres = fm->fs_read_sector(&path, channel->buffer, track, sector);
+    return drive->get_data_channel(chan);
+}
+
+// The result of a sector access, as the error channel reports it.
+void IecCommandChannel::sector_error(FRESULT fres, int track, int sector)
+{
     if (fres == FR_DENIED) {
         drive->set_error(ERR_DENIED, track, sector);
     } else if (fres == FR_INVALID_PARAMETER) { // outside the disk (SI-036)
@@ -1878,74 +2048,75 @@ int IecCommandChannel :: do_block_read(int chan, int part, int track, int sector
     } else {
         drive->set_error_fres(fres);
     }
-    channel->pointer = 0;
+}
+
+// U1 and B-R. The partition parameter is ignored: the channel reads from the partition that
+// was current when it was opened (SI-093). U1 makes all 256 bytes readable from byte 0;
+// B-R takes the count from byte 0 and starts at byte 1 (SI-094).
+int IecCommandChannel :: do_block_read(int chan, int part, int track, int sector, bool length_byte)
+{
+    IecChannel *channel = buffer_channel(chan);
+    if (!channel) {
+        return 0;
+    }
+    GETPARTITION(channel->buffer_partition, partition, -1);
+    Path path(partition->GetFullPath());
+    FRESULT fres = fm->fs_read_sector(&path, channel->buffer, track, sector);
+    sector_error(fres, track, sector);
+    channel->pointer = length_byte ? 1 : 0;
+    channel->last_byte = length_byte ? channel->buffer[0] : (channel->buffer_size - 1);
     channel->reset_prefetch();
     state = e_idle;
     return 0;
 }
 
-int IecCommandChannel::do_block_write(int chan, int part, int track, int sector)
+// U2 and B-W, to the partition the channel was opened on; B-W first stores the buffer
+// pointer minus one in byte 0 (SI-094).
+int IecCommandChannel::do_block_write(int chan, int part, int track, int sector, bool length_byte)
 {
     if (int err = drive->refuse_write()) {
         return err;
     }
-    if ((chan < 0) || (chan > 14)) {
-        set_error(ERR_SYNTAX_ERROR_CMD);
-        return ERR_SYNTAX_ERROR_CMD;
+    IecChannel *channel = buffer_channel(chan);
+    if (!channel) {
+        return 0;
     }
-    if (part >= MAX_PARTITIONS) {
-        set_error(ERR_SYNTAX_ERROR_CMD);
-        return ERR_SYNTAX_ERROR_CMD;
+    GETPARTITION(channel->buffer_partition, partition, -1);
+    if (length_byte) {
+        channel->buffer[0] = (uint8_t)(channel->pointer - 1);
     }
-    IecChannel *channel = drive->get_data_channel(chan);
-    GETPARTITION(part, partition, -1);
     Path path(partition->GetFullPath());
-    FRESULT fres;
-    fres = fm->fs_write_sector(&path, channel->buffer, track, sector);
-    if (fres == FR_DENIED) {
-        drive->set_error(ERR_DENIED, track, sector);
-    } else if (fres == FR_INVALID_PARAMETER) { // outside the disk (SI-036)
-        drive->set_error(ERR_ILLEGAL_TRACK_SECTOR, track, sector);
-    } else {
-        drive->set_error_fres(fres);
-    }
+    FRESULT fres = fm->fs_write_sector(&path, channel->buffer, track, sector);
+    sector_error(fres, track, sector);
     state = e_idle;
     return 0;
 }
 
+// B-A and B-F have no channel, so they act on the current partition; the partition
+// parameter is ignored like that of the other direct access commands (SI-013).
 int IecCommandChannel::do_block_allocate(int part, int track, int sector, bool alloc)
 {
     if (int err = drive->refuse_write()) {
         return err;
     }
-    if (part >= MAX_PARTITIONS) {
-        set_error(ERR_SYNTAX_ERROR_CMD);
-        return ERR_SYNTAX_ERROR_CMD;
-    }
-    GETPARTITION(part, partition, -1);
+    GETPARTITION(0, partition, -1);
     Path path(partition->GetFullPath());
-    FRESULT fres;
-    fres = fm->fs_allocate_sector(&path, track, sector, alloc);
-    if (fres == FR_DENIED) {
-        drive->set_error(ERR_DENIED, track, sector);
-    } else if (fres == FR_INVALID_PARAMETER) { // outside the disk (SI-036)
-        drive->set_error(ERR_ILLEGAL_TRACK_SECTOR, track, sector);
-    } else {
-        drive->set_error_fres(fres);
-    }
+    FRESULT fres = fm->fs_allocate_sector(&path, track, sector, alloc);
+    sector_error(fres, track, sector);
     state = e_idle;
     return 0;
 }
 
+// B-P and P on a buffer channel. The low byte positions within a 256 byte block and the
+// high byte selects the block of a large buffer, wrapping at its end (SI-092).
 int IecCommandChannel :: do_buffer_position(int chan, int pos)
 {
-    if ((chan < 0) || (chan > 14)) {
-        set_error(ERR_SYNTAX_ERROR_CMD);
-        return ERR_SYNTAX_ERROR_CMD;
+    IecChannel *channel = buffer_channel(chan);
+    if (!channel) {
+        return 0;
     }
-    IecChannel *channel;
-    channel = drive->get_data_channel(chan);
-    channel->pointer = pos & 0xFF; // CBM DOS keeps only the low byte, so it wraps
+    int blocks = channel->buffer_size / 256;
+    channel->pointer = (((pos >> 8) % blocks) * 256) + (pos & 0xFF);
     channel->reset_prefetch();
     set_error(ERR_ALL_OK);
     return ERR_ALL_OK;
@@ -2145,6 +2316,26 @@ int IecCommandChannel::do_initialize_buffers()
     return 0;
 }
 
+// UJ and U+shifted J (SI-103). Both close the data channels as I does, and U+shifted J
+// also returns every partition to its root and selects partition 1, which is what
+// IecDrive::reset() does to the partitions. Neither calls IecDrive::reset(): that reaches
+// IecInterface::configure(), which holds the IEC processor in reset while the host is
+// still addressing this drive.
+int IecCommandChannel::do_reset(bool cold)
+{
+    do_initialize_buffers();
+    if (cold) {
+        for (int i = 1; i < MAX_PARTITIONS; i++) {
+            IecPartition *p = drive->vfs->GetPartition(i);
+            if (p) {
+                p->cd("/");
+            }
+        }
+        drive->vfs->SetCurrentPartition(1);
+    }
+    return ERR_DOS;
+}
+
 // N[n][path]:name[,id] (SI-071). This drive has no medium of its own to format, so like
 // sd2iec it creates a disk image, or formats one that exists, chosen by the extension:
 // .D64 or .D41, .D71, .D81, and .DNP, whose id is a three digit track count and which is
@@ -2322,7 +2513,8 @@ static int scratch_matching(FileManager *fm, const char *dir_path, const char *p
     IndexedList<mstring *> victims(8, NULL);
     FileInfo info(INFO_SIZE);
     while (dir->get_entry(info) == FR_OK) {
-        if ((info.attrib & (AM_DIR | AM_VOL)) || !info.lfname[0]) {
+        // Directories are not scratched, and neither are locked files (SI-076).
+        if ((info.attrib & (AM_DIR | AM_VOL | AM_RDO)) || !info.lfname[0]) {
             continue;
         }
         char cbm_name[24];
@@ -2373,6 +2565,10 @@ int IecCommandChannel::do_scratch(filename_t filenames[], int n)
             DBGIECV("  %d. unresolved by canonical path\n", i);
         }
         FRESULT fres = FR_NO_PATH;
+        FileInfo locked(8);
+        if (fp && (fm->fstat(fp, locked) == FR_OK) && (locked.attrib & AM_RDO)) {
+            continue; // a locked file is not scratched (SI-076)
+        }
         if (fp) {
             do {
                 fres = fm->delete_file(fp);
@@ -2721,6 +2917,116 @@ int IecCommandChannel::do_rename_header(filename_t& dest)
         moved += "/";
         moved += cwd + rlen;
         partition->cd(moved.c_str());
+    }
+    return 0;
+}
+
+// The host file of the disk image a partition's working directory is inside, or false
+// when it is on the host file system.
+static bool image_of_working_directory(FileManager *fm, IecPartition *partition, mstring& image)
+{
+    mstring path(partition->GetFullPath());
+    while (path.length() > 1) {
+        const char *p = path.c_str();
+        int len = path.length();
+        if (p[len - 1] == '/') {
+            len--;
+        }
+        mstring trimmed(p, 0, len - 1);
+        FileInfo info(8);
+        if ((fm->fstat(trimmed.c_str(), info) == FR_OK) && !(info.attrib & AM_DIR)) {
+            image = trimmed;
+            return true;
+        }
+        const char *slash = strrchr(trimmed.c_str(), '/');
+        if (!slash) {
+            break;
+        }
+        mstring parent(trimmed.c_str(), 0, slash - trimmed.c_str());
+        path = parent;
+    }
+    return false;
+}
+
+// L, EL, EU, EH and A: (SI-076, SI-077). A toggle (L, EH) and A: act on the first entry
+// that matches, file or directory; EL and EU on every file each pattern matches, and
+// with $ on the disk image the working directory is in.
+int IecCommandChannel::do_attributes(filename_t names[], int n, uint8_t attrib, uint8_t mask, bool toggle)
+{
+    if (int err = drive->refuse_write()) {
+        return err;
+    }
+    for (int i = 0; i < n; i++) {
+        GETPARTITION(names[i].partition, partition, -1);
+        FRESULT fres = FR_OK;
+        if (names[i].filename == "$") {
+            mstring image;
+            if (!image_of_working_directory(fm, partition, image)) {
+                return ERR_SYNTAX_ERROR_GEN;
+            }
+            fres = fm->set_attributes(image.c_str(), attrib, mask);
+        } else if (toggle || (mask != CBMDOS_ATTR_LOCKED)) {
+            mstring work;
+            FileInfo info(48);
+            // The canonical host name first, which also finds a hidden entry; then the
+            // rendered names, which find what the canonical mapping cannot produce.
+            const char *direct = names[i].has_wildcard ? NULL : ConstructPath(work, names[i], e_any, e_read);
+            fres = direct ? fm->fstat(direct, info) : FR_NO_FILE;
+            if (fres == FR_OK) {
+                mstring dir;
+                resolve_directory_path(fm, partition, names[i].path, dir);
+                char entry[80];
+                work = dir.c_str();
+                append_path_component(work, (info.name_format & NAME_FORMAT_CBM) ?
+                                      info.generate_fat_name(entry, sizeof(entry)) : info.lfname);
+            } else {
+                fres = resolve_existing_iec_path(fm, partition, names[i], e_any, true, true, true, work, &info);
+            }
+            if (fres == FR_OK) {
+                uint8_t value = toggle ? (info.attrib ^ attrib) : attrib;
+                fres = fm->set_attributes(work.c_str(), value, mask);
+            }
+        } else {
+            mstring dir;
+            fres = resolve_directory_path(fm, partition, names[i].path, dir);
+            Directory *listing = NULL;
+            if (fres == FR_OK) {
+                fres = fm->open_directory(dir.c_str(), &listing);
+            }
+            if (fres == FR_OK) {
+                IndexedList<mstring *> matched(8, NULL);
+                FileInfo info(INFO_SIZE);
+                while (listing->get_entry(info) == FR_OK) {
+                    if ((info.attrib & (AM_DIR | AM_VOL)) || !info.lfname[0]) {
+                        continue;
+                    }
+                    char cbm_name[24];
+                    filetype_t ftype = e_any;
+                    IecPartition::CreateIecName(&info, cbm_name, ftype);
+                    if (pattern_match(names[i].filename.c_str(), cbm_name, false)) {
+                        char entry[80];
+                        mstring *full = new mstring(dir.c_str());
+                        append_path_component(*full, info.generate_fat_name(entry, sizeof(entry)));
+                        matched.append(full);
+                    }
+                }
+                delete listing;
+                for (int m = 0; m < matched.get_elements(); m++) {
+                    FRESULT one = fm->set_attributes(matched[m]->c_str(), attrib, mask);
+                    if (one != FR_OK) {
+                        fres = one;
+                    }
+                    delete matched[m];
+                }
+            }
+        }
+        if (fres == FR_NOT_ENABLED) {
+            return ERR_SYNTAX_ERROR_GEN; // the medium has no such attribute
+        }
+        if (fres != FR_OK) {
+            drive->set_error_fres(fres);
+            return 0;
+        }
     }
     return 0;
 }
