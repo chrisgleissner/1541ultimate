@@ -260,7 +260,9 @@ int parse_open(const char *buf, open_t& fn)
     if (fn.replace && ((uint8_t)fn.file.filename.c_str()[0] == 0xA0)) {
         return ERR_REPLACE_TYPE;
     }
-    if (fn.file.filename.contains_any(",=:\xA0\r")) {
+    // A shifted space is a legal byte inside a name (SI-148); only a name that starts
+    // with one is refused, and only when a file is to be created (setup_file_access()).
+    if (fn.file.filename.contains_any(",=:\r")) {
         return ERR_ILLEGAL_NAME;
     }
     return 0;

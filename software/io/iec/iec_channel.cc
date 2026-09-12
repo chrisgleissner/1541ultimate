@@ -883,7 +883,7 @@ FRESULT resolve_directory_path(FileManager *fm, IecPartition *partition,
             continue;
         } 
 
-        petscii_to_fat(component, fat_component, 52);
+        petscii_to_fat(component, fat_component, sizeof(fat_component) - 1);
         // printf("Fat component: %s\n", fat_component);
         direct_component = fat_component;
 
@@ -967,7 +967,7 @@ static FRESULT resolve_directory_target(FileManager *fm, IecPartition *partition
     }
 
     char fatname[52];
-    petscii_to_fat(name.filename.c_str(), fatname, 52);
+    petscii_to_fat(name.filename.c_str(), fatname, sizeof(fatname) - 1);
 
     Path direct_relative(relative_path.c_str());
     if (!name.has_wildcard && direct_relative.cd(fatname)) {
@@ -1275,7 +1275,7 @@ int IecChannel :: setup_directory_read()
     }    
 
     GETPARTITION(name_to_open.file.partition, partition, -1);
-    petscii_to_fat(name_to_open.file.filename.c_str(), fatname, 48);
+    petscii_to_fat(name_to_open.file.filename.c_str(), fatname, sizeof(fatname) - 1);
 
     mstring work;
     mstring relative;
@@ -1397,6 +1397,12 @@ int IecChannel :: setup_file_access()
     // first match is replaced under its own name if its type is the one asked for; any
     // other type, a relative file, or no match at all answers 64, which is the check the
     // 1541 ROM makes at $D8F5.
+    // A name that starts with a shifted space is no name to create (SI-148): 33, or 64 with
+    // @, which parse_open() has already answered.
+    if ((name_to_open.access == e_write) && ((uint8_t)name_to_open.file.filename.c_str()[0] == 0xA0)) {
+        drive->set_error(name_to_open.replace ? ERR_FILE_TYPE_MISMATCH : ERR_SYNTAX_ERROR_NAME, 0, 0);
+        return 0;
+    }
     if ((name_to_open.access == e_write) && name_to_open.file.has_wildcard) {
         if (!name_to_open.replace) {
             drive->set_error(ERR_SYNTAX_ERROR_NAME, 0, 0);
@@ -1833,7 +1839,7 @@ const char *IecChannel :: ConstructPath(mstring& work, filename_t& name, filetyp
 
     GETPARTITION(name.partition, partition, NULL);
     char fatname[52];
-    petscii_to_fat(name.filename.c_str(), fatname, 52);
+    petscii_to_fat(name.filename.c_str(), fatname, sizeof(fatname) - 1);
     // printf("After petscii_to_fat: '%s'\n", fatname);
     const char *ext = types[(int)ftype];
     if (((acc == e_read) || (ftype != e_any)) && // for reads, .??? is allowed, but for writes it is not
@@ -2013,10 +2019,12 @@ int IecCommandChannel::do_remove_dir(filename_t& dest)
     if (fullpath) {
         DBGIECV("Directory to remove: %s\n", fullpath);
         FRESULT fres = fm->delete_file(fullpath);
-        if ((fres == FR_NO_FILE || fres == FR_NO_PATH) && !dest.has_wildcard) {
+        if (fres == FR_NO_FILE || fres == FR_NO_PATH) {
+            // A pattern names the first directory that matches it; its host name escapes
+            // the wildcards, so only the directory scan can find it (SI-142).
             GETPARTITION(dest.partition, partition, 0);
             fres = resolve_existing_iec_path(fm, partition, dest, e_folder,
-                                             true, false, false, work);
+                                             true, false, true, work);
             if (fres == FR_OK) {
                 DBGIECV("Directory-assisted RD resolved to %s\n", work.c_str());
                 fres = fm->delete_file(work.c_str());
@@ -2179,7 +2187,7 @@ int IecCommandChannel::do_format(filename_t& dest, const char *id)
     }
 
     char host[52];
-    petscii_to_fat(name, host, sizeof(host));
+    petscii_to_fat(name, host, sizeof(host) - 1);
     mstring full(dir.c_str());
     append_path_component(full, host);
 
@@ -2301,6 +2309,46 @@ int IecCommandChannel::do_rename(filename_t &src, filename_t &dest)
     return 0;
 }
 
+// Scratches every file in a directory whose CBM name matches a pattern, and returns how
+// many went. The names are collected before anything is deleted, so the directory is
+// not changed while it is being read. The host name of a pattern escapes its wildcards
+// (SI-142), so the pattern is matched here rather than by the host file system.
+static int scratch_matching(FileManager *fm, const char *dir_path, const char *pattern)
+{
+    Directory *dir = NULL;
+    if (fm->open_directory(dir_path, &dir) != FR_OK) {
+        return 0;
+    }
+    IndexedList<mstring *> victims(8, NULL);
+    FileInfo info(INFO_SIZE);
+    while (dir->get_entry(info) == FR_OK) {
+        if ((info.attrib & (AM_DIR | AM_VOL)) || !info.lfname[0]) {
+            continue;
+        }
+        char cbm_name[24];
+        filetype_t ftype = e_any;
+        IecPartition::CreateIecName(&info, cbm_name, ftype);
+        if (pattern_match(pattern, cbm_name, false)) {
+            // Inside a disk image an entry is found by its name with the type extension,
+            // which generate_fat_name() adds; on a host file system it is the name itself.
+            char entry[80];
+            mstring *full = new mstring(dir_path);
+            append_path_component(*full, info.generate_fat_name(entry, sizeof(entry)));
+            victims.append(full);
+        }
+    }
+    delete dir;
+
+    int scratched = 0;
+    for (int i = 0; i < victims.get_elements(); i++) {
+        if (fm->delete_file(victims[i]->c_str()) == FR_OK) {
+            scratched++;
+        }
+        delete victims[i];
+    }
+    return scratched;
+}
+
 int IecCommandChannel::do_scratch(filename_t filenames[], int n)
 {
     if (int err = drive->refuse_write()) {
@@ -2311,6 +2359,13 @@ int IecCommandChannel::do_scratch(filename_t filenames[], int n)
     int scratched = 0;
     for(int i=0;i<n;i++) {
         int scratched_this_file = 0;
+        if (filenames[i].has_wildcard) {
+            GETPARTITION(filenames[i].partition, partition, 0);
+            if (resolve_directory_path(fm, partition, filenames[i].path, work) == FR_OK) {
+                scratched += scratch_matching(fm, work.c_str(), filenames[i].filename.c_str());
+            }
+            continue;
+        }
         const char *fp = ConstructPath(work, filenames[i], e_any, e_read); // If read is not set, the extension will not be set to .???
         if (fp) {
             DBGIECV("  %d. %s\n", i, fp);
@@ -2591,7 +2646,7 @@ int IecCommandChannel::do_rename_partition(const char *newname, const char *oldn
         return ERR_FILE_NOT_FOUND;
     }
     char host[52];
-    petscii_to_fat(newname, host, sizeof(host));
+    petscii_to_fat(newname, host, sizeof(host) - 1);
     found->SetName(host);
     drive->trace_configuration("rename-partition"); // #877 diagnostics only
     return 0;
@@ -2608,7 +2663,7 @@ int IecCommandChannel::do_rename_header(filename_t& dest)
     }
     GETPARTITION(dest.partition, partition, -1);
     char host[52];
-    petscii_to_fat(dest.filename.c_str(), host, sizeof(host));
+    petscii_to_fat(dest.filename.c_str(), host, sizeof(host) - 1);
 
     mstring full_path, relative;
     FRESULT fres = resolve_directory_path(fm, partition, dest.path, full_path, &relative);

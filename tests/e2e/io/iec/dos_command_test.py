@@ -190,6 +190,140 @@ def check_timestamp_filter(agent, api, password, folder, root):
             raise Failure(f"the file is reported newer than {date} {clock} PM")
 
 
+def check_compatibility(agent, api, password, folder, root):
+    """doc/softiec_compatibility_spec.md, in the bytes a Commodore sends.
+
+    The host suites check each requirement against the same code; these are the ones
+    whose answer depends on something only the device has: the IEC processor's device
+    number slots (U0> and S-D), the CPU the firmware runs on, whose char is signed on
+    the Nios II of an Ultimate 64 and unsigned on the RISC-V of an Ultimate 64 II and an
+    Ultimate II+L (the shifted space rule, SI-147), and the real bus timing of a command
+    that fills the 254 byte buffer.
+    """
+    here = folder.upper().encode("ascii")
+    directory = f"{root.rstrip('/')}/{folder}"
+
+    def unrecognised_command():
+        response = agent.command(bytes([0]), allowed=(31,))
+        detail(response)
+
+    def scratch_nothing():
+        response = agent.command(b"S//" + here + b"/:NOSUCHFILE\r", allowed=(1,))
+        if not response.startswith("01, FILES SCRATCHED,00"):
+            raise Failure(f"answered {response!r}")
+
+    def initialize():
+        agent.command(b"I\r", allowed=(0,))
+        agent.command(b"UI\r", allowed=(73,))
+
+    def memory_read():
+        probe = agent.command_reply(b"M-R" + bytes([0xA4, 0xFE, 2]) + b"\r", 2)
+        detail(f"M-R $FEA4,2 answered {probe.hex()}")
+        if probe != bytes(2):
+            raise Failure(f"M-R answered {probe!r}")
+        agent.status((0,))
+
+    def partition_directory():
+        listing = listing_of(agent, "$=P")
+        detail(f"{len(listing)} bytes, header {listing[:6].hex()}")
+        if listing[:4] != bytes([1, 4, 1, 1]):
+            raise Failure(f"the listing starts {listing[:4].hex()}, expected 01040101")
+        if listing[4] != 1:
+            raise Failure(f"the header counts {listing[4]} partitions, expected 1")
+        if b"BLOCKS FREE" in listing or listing[-2:] != bytes(2):
+            raise Failure("the partition directory ends with a blocks free line")
+
+    def device_number():
+        def close_quietly(device):
+            # Closing the command channel addresses the device the logical file was
+            # opened on. Once the drive has moved, that device is not present, and the
+            # KERNAL says so in ST; the file is closed all the same.
+            try:
+                agent.call(4, channel=15, device=device)
+            except Failure:
+                pass
+
+        agent.call(2, 15, b"U0>" + bytes([12]) + b"\r")
+        close_quietly(11)
+        agent.softiec_device = 12
+        try:
+            agent.call(1, channel=15, device=12)
+            reply = agent.call(3, 15, device=12, expect=STATUS_BYTES).decode("ascii").strip()
+            detail(f"device 12 answered {reply!r}")
+            if not reply.startswith("00,"):
+                raise Failure(f"device 12 answered {reply!r}")
+        finally:
+            # Back to device 11 whatever happened, so the checks after this one still
+            # have their drive: S-D to 12 is harmless when the drive never moved.
+            try:
+                agent.call(2, 15, b"S-D\r", device=12)
+            except Failure:
+                pass
+            close_quietly(12)
+            agent.softiec_device = 11
+            agent.call(1, channel=15)
+        agent.status((0,))
+
+    def left_arrow():
+        agent.command(b"CD//" + here + b"\r")
+        agent.command(b"MD:_\r")
+        agent.command(b"CD/_\r")
+        agent.command(b"CD:_\r")
+        agent.command(b"RD:_\r")
+        agent.command(b"CD//\r")
+
+    def shifted_space():
+        for name, host in ((b"PAD\xa0", "PAD.seq"), (b"IN\xa0SIDE", "IN{A0}SIDE.seq")):
+            agent.call(1, channel=3, data=b"//" + here + b"/:" + name + b",S,W")
+            try:
+                agent.status((0,))
+                agent.call(2, channel=3, data=b"X")
+            finally:
+                agent.call(4, channel=3)
+            with ftp.session(api.host, password) as client:
+                entries = ftp.names(client, directory)
+            detail(f"{name!r} is stored as one of {sorted(entries)}")
+            if host not in entries:
+                raise Failure(f"{name!r} was not stored as {host}: {entries}")
+
+    def command_length():
+        pad = 253 - len(b"S//" + here + b"/:")
+        agent.command(b"S//" + here + b"/:" + b"N" * pad, allowed=(1,))
+        response = agent.command(b"S//" + here + b"/:" + b"N" * (pad + 1), allowed=(32,))
+        detail(response)
+
+    def format_image():
+        agent.command(b"N//" + here + b"/:MADE.D64,AB\r")
+        with ftp.session(api.host, password) as client:
+            image = ftp.retrieve(client, f"{directory}/MADE.D64")
+        detail(f"MADE.D64 is {len(image)} bytes, label {image[BAM_OFFSET + 144:BAM_OFFSET + 148]!r}")
+        if len(image) != 174848 or image[BAM_OFFSET + 144:BAM_OFFSET + 148] != b"MADE":
+            raise Failure("N did not create a formatted 1541 image")
+
+    # Each check reports on its own, so a firmware that fails one still shows the rest.
+    failed = []
+    for label, action in (
+            ("SI-031: a command that is not a command letter answers 31", unrecognised_command),
+            ("SI-033: a scratch that matches nothing answers 01", scratch_nothing),
+            ("SI-053: I answers OK, UI the DOS version", initialize),
+            ("SI-105: M-R answers the two bytes C64 OS asks for, all zero", memory_read),
+            ("SI-045, SI-046, SI-130: the partition directory", partition_directory),
+            ("SI-100, SI-101: U0> moves the drive to device 12 on the bus, S-D moves it back", device_number),
+            ("SI-014: a left arrow between slashes is a directory name", left_arrow),
+            ("SI-147, SI-148: a shifted space in a name, on this CPU", shifted_space),
+            ("SI-021, SI-022: a 253 byte command runs, a 254 byte one is refused", command_length),
+            ("SI-071: N creates a D64 image", format_image),
+    ):
+        try:
+            with check(label):
+                action()
+        except Failure as exc:
+            failed.append(str(exc))
+            agent.call(4, channel=3)
+    if failed:
+        raise Failure(f"{len(failed)} compatibility checks failed")
+
+
 def listing_of(agent, name):
     """The whole of one directory stream, read in mailbox sized pieces."""
     agent.call(1, channel=3, data=name.encode("ascii"), secondary=0)
@@ -296,7 +430,8 @@ def run(args):
                 ("block commands", lambda: check_block_commands(agent, api, args.password, folder, image)),
                 ("time stamp filter", lambda: check_timestamp_filter(agent, api, args.password, folder, root)),
                 ("partition directory", lambda: check_partition_directory(agent, api)),
-                ("partition commands", lambda: check_partition_commands(agent))):
+                ("partition commands", lambda: check_partition_commands(agent)),
+                ("compatibility specification", lambda: check_compatibility(agent, api, args.password, folder, root))):
             section(label)
             try:
                 agent.command("CD//")

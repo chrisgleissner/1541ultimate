@@ -3120,6 +3120,65 @@ static void s11_si071_format(FileManager *fm, IecDrive *dr)
     expect_command_response(testname, dr, "S:*\r", "01, FILES SCRATCHED,05,00\r");
 }
 
+// SI-147 and SI-148: a shifted space ($A0) is a legal byte inside a name and maps to
+// {A0}; a trailing run is padding and is dropped; a file an older build named with the
+// padding kept is still found by its CBM name; and a listing shows the name up to its
+// terminator, not up to the first $A0. testdrive is also built with -funsigned-char
+// (target/pc/linux/iecdrive_unsigned), because the rule depended on char signedness.
+static void s11_si147_shifted_space(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI147-ShiftedSpace";
+    const char *path = s11_partition(fm, dr, "si147");
+    FileInfo info(16);
+    char host[80];
+
+    expect_iec_write_ok(testname, dr, 2, "AB\xA0,S,W", "padded");
+    snprintf(host, sizeof(host), "%s/AB.seq", path);
+    if (fm->fstat(host, info) != FR_OK) {
+        printf("%s: expected host file '%s'\n", testname, host);
+    }
+    REQUIRE(fm->fstat(host, info) == FR_OK);
+    expect_iec_file(testname, dr, 2, "AB\xA0,S,R", "padded");
+    expect_iec_file(testname, dr, 2, "AB,S,R", "padded");
+
+    expect_iec_write_ok(testname, dr, 2, "A\xA0" "B,S,W", "inside");
+    snprintf(host, sizeof(host), "%s/A{A0}B.seq", path);
+    if (fm->fstat(host, info) != FR_OK) {
+        printf("%s: expected host file '%s'\n", testname, host);
+    }
+    REQUIRE(fm->fstat(host, info) == FR_OK);
+    expect_directory_contains(testname, dr, "$", "\"A\xA0" "B\"");
+
+    // A host name an earlier build produced with the padding escaped.
+    uint32_t tr;
+    REQUIRE(fm->save_file(true, path, "LEGACY{A0}.prg", (const uint8_t *)"old name", 8, &tr) == FR_OK);
+    expect_iec_file(testname, dr, 0, "LEGACY\xA0", "old name");
+}
+
+// SI-142: a host name escapes * and ?, so a pattern is matched against the CBM names
+// by the drive and never by the host file system: a scratch, an RD and an open by
+// pattern still find what they name, on a host directory and inside an image.
+static void s11_si142_escaped_wildcards(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI142-EscapedWildcards";
+    s11_partition(fm, dr, "si142");
+    expect_iec_write_ok(testname, dr, 2, "FILE1,S,W", "one");
+    expect_iec_write_ok(testname, dr, 2, "FILE2,S,W", "two");
+    expect_iec_write_ok(testname, dr, 2, "OTHER,S,W", "other");
+    expect_iec_file(testname, dr, 2, "FIL*,S,R", "one");
+    expect_command_response(testname, dr, "S:FIL*\r", "01, FILES SCRATCHED,02,00\r");
+    expect_iec_file(testname, dr, 2, "OTHER,S,R", "other");
+    expect_command_ok(testname, dr, "MD:ABCDIR\r");
+    expect_command_ok(testname, dr, "RD:ABC*\r");
+    expect_directory_contains(testname, dr, "$", "\"OTHER\"");
+    create_formatted_image(fm, "/Fat/s11_si142.d64", "PATTERNS", 683, e_image_d64);
+    expect_command_ok(testname, dr, "CD//\r");
+    dr->add_partition(46, "/Fat/s11_si142.d64", "PATTERNS");
+    expect_iec_write_ok(testname, dr, 2, "46:GAME1,P,W", "g1");
+    expect_iec_write_ok(testname, dr, 2, "46:GAME2,P,W", "g2");
+    expect_command_response(testname, dr, "S46:GAME?\r", "01, FILES SCRATCHED,02,00\r");
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -3162,6 +3221,8 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-SI083-SeekWrite",         s11_si083_seek_write },
     { "Suite11-SI083-SeekWriteImage",    s11_si083_seek_write_image },
     { "Suite11-SI071-Format",            s11_si071_format },
+    { "Suite11-SI147-ShiftedSpace",      s11_si147_shifted_space },
+    { "Suite11-SI142-EscapedWildcards",  s11_si142_escaped_wildcards },
 };
 
 // Runs every case, or only those whose name contains `only`.

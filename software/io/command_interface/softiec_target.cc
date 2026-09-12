@@ -545,7 +545,7 @@ void SoftIECTarget :: cmd_get_fatname(Message *command, Message **reply, Message
                 return;
             }
             char fatname[48];
-            petscii_to_fat(name.file.filename.c_str(), fatname, 48);
+            petscii_to_fat(name.file.filename.c_str(), fatname, sizeof(fatname) - 1);
             mstring work;
             FRESULT fres = resolve_directory_path(FileManager::getFileManager(), partition, name.file.path, work);
             if (fres == FR_OK) {

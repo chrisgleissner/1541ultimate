@@ -435,17 +435,24 @@ void petscii_to_fat(const char *pet, char *fat, int maxlen)
 
     while (*pet) {
         char p = *(pet++);
-        if (p == 160) {
+        // A trailing run of shifted spaces is the padding of a CBM directory entry and is
+        // dropped; one inside a name is escaped like any other byte (SI-147). The compare
+        // is on the byte's value, so a signed char build does the same as an unsigned one,
+        // and the end is tested on the byte that stopped the run, not on the one after it.
+        if ((uint8_t)p == 160) {
             const char *q = pet;
-            while (*(q++) == 160)
+            while ((uint8_t)*(q++) == 160)
                 ;
-            if (!*q)
+            if (!*(q - 1))
                 break;
         }
-        if ((p < 32) || (p >= 96) || (p == ':') || (p == '/') || (p == '\\') || (p == '\x22') ||
-            (p == '<') || (p == '>') || (first && p == '.')) { // '|' > 96 ;)
+        if ((p < 32) || (p >= 96) || (p == ':') || (p == '/') || (p == '\\') || (p == '*') || (p == '\x22') ||
+            (p == '<') || (p == '>') || (p == '?') || (first && p == '.')) { // '|' > 96 ;)
 
-            if ((i + 4) >= maxlen) {
+            // sd2iec's guards, which keep one byte more than this function used to
+            // (SI-142): the result, with a closing brace, can take maxlen bytes plus
+            // the terminator.
+            if ((i + 4) > maxlen) {
                 break;
             }
             if (!escape) {
@@ -455,7 +462,7 @@ void petscii_to_fat(const char *pet, char *fat, int maxlen)
             fat[i++] = hex[((uint8_t)p) >> 4];
             fat[i++] = hex[p & 15];
         } else {
-            if ((i + 2) >= maxlen) {
+            if ((i + 2) > maxlen) {
                 break;
             }
             if (escape) {
@@ -472,7 +479,7 @@ void petscii_to_fat(const char *pet, char *fat, int maxlen)
     }
     fat[i] = 0;
 
-    if (strlen(fat) > 3) {
+    if ((strlen(fat) > 3) && (i + 2 <= maxlen)) {
         char *ext = fat + strlen(fat) - 4;
         if (!strcasecmp(ext, ".prg") || !strcasecmp(ext, ".seq") || !strcasecmp(ext, ".usr") || !strcasecmp(ext, ".rel")) {
             strcat(fat, "{}");

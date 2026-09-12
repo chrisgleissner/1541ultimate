@@ -374,6 +374,46 @@ void test_md_rd_grammar(void)
     test_command( 0, (const uint8_t *)"RD12:NAME\r", 10);
 }
 
+// SI-147 and SI-142: the PETSCII to host name mapping shared with sd2iec's extension mode
+// 5. A trailing run of shifted spaces is padding and is dropped; a shifted space inside a
+// name is escaped; * and ? are escaped; and the length guard is sd2iec's. This suite is
+// also built with -funsigned-char (target/pc/linux/parse_unsigned), because the shifted
+// space rule depended on the signedness of char.
+static void check_fat_name(const char *what, const char *pet, int maxlen, const char *expected)
+{
+    char fat[64];
+    memset(fat, 'X', sizeof(fat));
+    fat[sizeof(fat) - 1] = 0;
+    petscii_to_fat(pet, fat, maxlen);
+    if (strcmp(fat, expected) == 0) {
+        printf("Name %s => OK!\n", what);
+        return;
+    }
+    printf("Name %s mapped to '%s', expected '%s' (char is %s)\n", what, fat, expected,
+           ((char)0xA0 < 0) ? "signed" : "unsigned");
+    failures++;
+}
+
+void test_name_mapping(void)
+{
+    // Each name is followed by a byte that is not zero, so a test that reads past the
+    // terminator sees something other than the end of the string.
+    const char trailing[] = { 'A', 'B', (char)0xA0, 0, 'Z' };
+    check_fat_name("AB+$A0", trailing, 51, "AB");
+    const char trailing_run[] = { 'A', (char)0xA0, (char)0xA0, 0, 'Z' };
+    check_fat_name("A+$A0$A0", trailing_run, 51, "A");
+    const char interior[] = { 'A', (char)0xA0, 'B', 0, 'Z' };
+    check_fat_name("A+$A0+B", interior, 51, "A{A0}B");
+    const char interior_run[] = { 'A', (char)0xA0, (char)0xA0, 'B', 0, 'Z' };
+    check_fat_name("A+$A0$A0+B", interior_run, 51, "A{A0A0}B");
+    check_fat_name("star", "FOO*", 51, "FOO{2A}");
+    check_fat_name("question mark", "WHAT?", 51, "WHAT{3F}");
+    // sd2iec stops when (i + 2) > maxlen for a plain byte and (i + 4) > maxlen for an
+    // escaped one; this firmware stopped one byte earlier.
+    check_fat_name("plain length guard", "ABCDEFGHIJKLMNOP", 12, "ABCDEFGHIJK");
+    check_fat_name("escaped length guard", "A\xC1\xC2\xC3\xC4\xC5\xC6", 12, "A{C1C2C3C4}");
+}
+
 void test_error_codes(void)
 {
     // SI-031: not a command letter. CHR$(0) and A are what the reporter measured on
@@ -699,6 +739,7 @@ int main(int argc, const char *argv[])
     test_added_commands();
     test_command_length_and_terminator();
     test_md_rd_grammar();
+    test_name_mapping();
     test_command(34, (const uint8_t *)"C99:EMPTY=", 10);
     test_command( 0, (const uint8_t *)"C1:FCOPY=3:FCOPY", 16);
     test_command( 0, (const uint8_t *)"C:FULLSTATS=STAT1,3:STAT3", 25);
