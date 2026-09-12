@@ -103,7 +103,8 @@ def check_command_channel(agent, api, password, folder, root):
     with check("CD into the created directory, back out, and remove it"):
         agent.command(f"CD//{here}/MADEDIR\r")
         agent.command("CD_\r")
-        agent.command(f"RD//{here}/:MADEDIR\r")
+        # RD takes no path; the working directory is the parent again after CD_.
+        agent.command("RD:MADEDIR\r")
         with ftp.session(api.host, password) as client:
             entries = ftp.names(client, f"{root.rstrip('/')}/{folder}")
         if "MADEDIR" in [name.upper() for name in entries]:

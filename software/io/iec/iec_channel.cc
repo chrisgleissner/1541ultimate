@@ -708,15 +708,14 @@ t_channel_retval IecChannel::write_record(void)
 
 static void iec_path_to_fs_path(mstring &path)
 {
-    // Path conversion needs to take place, because
-    // in this context, _ means "..", and when the path starts
-    // with a /, it should be stripped off, while // means root,
-    // which corresponds to starting with / in Ultimate VFS.
+    // Path conversion needs to take place, because when the path starts with a /, it
+    // should be stripped off, while // means root, which corresponds to starting with
+    // / in Ultimate VFS. A left arrow in a path component is a name like any other: it
+    // means the parent only in the name position, which do_change_dir() handles (SI-014).
     if (path[0] == '/' && path[1] != '/') {
         mstring stripped(path.c_str() + 1);
         path = stripped;
     }
-    path.replace("_", "..");
     path.replace("//", "/");
 }
 
@@ -815,8 +814,15 @@ FRESULT resolve_directory_path(FileManager *fm, IecPartition *partition,
 
     // Path requested(path.c_str()); // this doesnt work if the path starts with .. for example
     // printf("resolve_directory_path: path = %s. Requested = %s. Resolved before loop = %s.\n", path.c_str(), requested.get_path(), resolved.get_path());
-    const char *components[16];
-    int count = path.split('/', components, 16);
+    // As many components as the path has, not a fixed number: a deeper path is followed
+    // to its end rather than cut off (SI-150).
+    int capacity = 1;
+    for (const char *p = path.c_str(); *p; p++) {
+        capacity += (*p == '/');
+    }
+    const char **components = new const char *[capacity];
+    int count = path.split('/', components, capacity);
+    FRESULT result = FR_OK;
 
     for (int i = 0; i < count; i++) {
         const char *component = components[i]; //requested.getElement(i);
@@ -825,7 +831,8 @@ FRESULT resolve_directory_path(FileManager *fm, IecPartition *partition,
 
         if (!strcmp(component, ".") || !strcmp(component, "..")) {
             if (!resolved.cd(component)) { // not possible to move
-                return FR_NO_PATH;
+                result = FR_NO_PATH;
+                break;
             }
             continue;
         } 
@@ -834,8 +841,10 @@ FRESULT resolve_directory_path(FileManager *fm, IecPartition *partition,
         // printf("Fat component: %s\n", fat_component);
         direct_component = fat_component;
 
+        // A component with wildcards names the first directory that matches it (SI-012),
+        // so it is not tried as a literal name.
         Path direct_path(&resolved);
-        if (direct_path.cd(direct_component)) {
+        if (!iec_name_has_wildcards(component) && direct_path.cd(direct_component)) {
             mstring direct_full_path;
             partition_relative_to_full_path(partition, direct_path, direct_full_path);
 
@@ -855,13 +864,18 @@ FRESULT resolve_directory_path(FileManager *fm, IecPartition *partition,
         // printf("Current Full Path: %s\n", current_full_path.c_str());
         mstring actual_name;
         FRESULT fres = find_rendered_iec_child(fm, current_full_path.c_str(), component,
-                                               e_folder, true, false, false,
+                                               e_folder, true, false, true,
                                                actual_name, NULL);
         // printf("Fres = %s. Actual name = %s\n", FileSystem::get_error_string(fres), actual_name.c_str());
         if (fres != FR_OK) {
-            return fres;
+            result = fres;
+            break;
         }
         resolved.cd(actual_name.c_str());
+    }
+    delete[] components;
+    if (result != FR_OK) {
+        return result;
     }
 
     partition_relative_to_full_path(partition, resolved, full_path);
@@ -910,7 +924,7 @@ static FRESULT resolve_directory_target(FileManager *fm, IecPartition *partition
     petscii_to_fat(name.filename.c_str(), fatname, 52);
 
     Path direct_relative(relative_path.c_str());
-    if (direct_relative.cd(fatname)) {
+    if (!name.has_wildcard && direct_relative.cd(fatname)) {
         mstring direct_full_path;
         partition_relative_to_full_path(partition, direct_relative, direct_full_path);
 
@@ -926,7 +940,7 @@ static FRESULT resolve_directory_target(FileManager *fm, IecPartition *partition
 
     mstring actual_name;
     fres = find_rendered_iec_child(fm, full_path.c_str(), name.filename.c_str(),
-                                   e_folder, true, false, false,
+                                   e_folder, true, false, true,
                                    actual_name, NULL);
     if (fres != FR_OK) {
         return fres;
@@ -1833,15 +1847,21 @@ int IecCommandChannel::do_change_dir(filename_t& dest)
     GETPARTITION(dest.partition, prt, -1);
     DBGIECV("Partition %d ('%s') Change dir %s:%s\n", dest.partition, prt->GetFullPath(), dest.path.c_str(), dest.filename.c_str());
 
-    // The left arrow, PETSCII 0x5F, means the parent directory both after the command
-    // word, as in "CD_", and behind a colon, as in "CD:_" or "CD/SUB/:_". Only the
-    // first arrives as a path, so move the second there and both take one route.
+    // The left arrow, PETSCII 0x5F, means the parent directory in the name position:
+    // directly after the command word, as in "CD_", which the parser returns as a path
+    // of just the arrow, and behind a colon, as in "CD:_" or "CD/SUB/:_". Between
+    // slashes it is a directory name, so "CD/_" enters a directory called _ (SI-014,
+    // SI-015). Both name forms become the path component .., which is always the parent.
+    if ((dest.path == "_") && (dest.filename.length() == 0)) {
+        dest.path = "";
+        dest.filename = "_";
+    }
     if (dest.filename == "_") {
         dest.filename = "";
         if (dest.path.length() && (dest.path[-1] != '/')) {
             dest.path += "/";
         }
-        dest.path += "_";
+        dest.path += "..";
     }
 
     mstring full_path;

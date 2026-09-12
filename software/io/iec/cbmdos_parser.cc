@@ -363,6 +363,24 @@ int IecParser :: dir_command(const uint8_t *buffer, int len)
         return ERR_SYNTAX;
     }
     mstring cmd((const char *)buffer, 2, len-1);    
+    const char *colon = strchr(cmd.c_str(), ':');
+    if (buffer[0] == 'M') {
+        // MD requires a colon, and a name that starts with a shifted space is no name
+        // (SI-060, SD parse_mkdir()).
+        if (!colon || ((uint8_t)colon[1] == 0xA0)) {
+            return ERR_NO_NAME;
+        }
+    } else if (buffer[0] == 'R') {
+        // RD takes a partition number and a name behind a colon, and no path, so that a
+        // directory cannot be removed from inside it (SI-063, HD 9-19, SD parse_rmdir()).
+        const char *p = cmd.c_str();
+        while ((*p == ' ') || isdigit(*p)) {
+            p++;
+        }
+        if (strchr(cmd.c_str(), '/') || (*p != ':')) {
+            return ERR_NO_NAME;
+        }
+    }
     filename_t dest;
     int err = parse_full_path(cmd.c_str(), dest, NULL, true);
     if (err) {

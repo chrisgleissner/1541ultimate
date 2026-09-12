@@ -1323,7 +1323,10 @@ void execute_suite6(FileManager *fm, IecDrive *dr)
     expect_command_ok("Suite6-MDRenderedParentPath", dr, "MD6/PARENT:CHILD");
     expect_command_ok("Suite6-CDRenderedParentCreatedChild", dr, "CD6/PARENT/CHILD");
     expect_command_ok("Suite6-CDRootAfterMD", dr, "CD6//");
-    expect_command_ok("Suite6-RDRenderedParentPath", dr, "RD6/PARENT:CHILD");
+    // RD takes no path (SI-063), so the parent is entered first.
+    expect_command_ok("Suite6-CDRenderedParentForRD", dr, "CD6/PARENT");
+    expect_command_ok("Suite6-RDRenderedParentPath", dr, "RD6:CHILD");
+    expect_command_ok("Suite6-CDRootAfterRD", dr, "CD6//");
     expect_command_ok("Suite6-RDRenderedFinalDirectory", dr, "RD6:RDIR");
 
     expect_command_ok("Suite6-CopyRenderedSource", dr, "C6:COPYDST=6:COPYSRC");
@@ -1387,7 +1390,9 @@ static void run_suite8_control_plane(FileManager *fm, IecDrive *dr)
     expect_command_response("Suite8-CP1", dr, "CP1", "02,PARTITION SELECTED,01,00\r");
     expect_command_response("Suite8-CD-TEMP", dr, "CD/TEMP", "71,DIRECTORY ERROR,01,00\r");
     expect_command_ok("Suite8-CD-SOMEDIR", dr, "CD/SOMEDIR");
-    expect_command_ok("Suite8-CD-PARENT-OTHERDIR", dr, "CD/_/OTHERDIR");
+    // Up and down again in one command is spelled with .., because a left arrow in a
+    // path component is a directory name (SI-014).
+    expect_command_ok("Suite8-CD-PARENT-OTHERDIR", dr, "CD/../OTHERDIR");
     expect_command_ok("Suite8-CD-LEVEL2", dr, "CD:LEVEL2");
     expect_command_ok("Suite8-CD-ROOT", dr, "CD//");
     expect_command_ok("Suite8-CD-ABS-LEVEL2", dr, "CD/OTHERDIR/LEVEL2");
@@ -1472,7 +1477,7 @@ static void run_suite8_partition_listing(FileManager *fm, IecDrive *dr)
     expect_command_ok("Suite8-CD-SUBDIR", dr, "CD/Subdir");
     expect_command_response("Suite8-XPWD-SUBDIR", dr, "XPWD", "11:/SUBDIR/");
     expect_directory_read("Suite8-DIR-ROOT", dr, "$//");
-    expect_directory_read("Suite8-DIR-PARENT", dr, "$_");
+    expect_directory_read("Suite8-DIR-PARENT", dr, "$/../");
 }
 
 void execute_suite8(FileManager *fm, IecDrive *dr)
@@ -1776,8 +1781,11 @@ static void run_suite10_directory_navigation(FileManager *fm, IecDrive *dr)
     expect_path_exists("Suite10-MdNestedExists", fm, "/Fat/nav/MD1/MD2");
     expect_path_exists("Suite10-MdNestedFromRootExists", fm, "/Fat/nav/MD1/MD3");
     expect_command_response("Suite10-RdNotEmpty", dr, "RD:MD1\r", "63,FILE EXISTS,00,00\r");
-    expect_command_ok("Suite10-RdNested", dr, "RD//MD1/:MD2\r");
-    expect_command_ok("Suite10-RdNestedFromRoot", dr, "RD//MD1/:MD3\r");
+    // RD takes no path (SI-063): the parent is entered first.
+    expect_command_ok("Suite10-RdEnterParent", dr, "CD//MD1\r");
+    expect_command_ok("Suite10-RdNested", dr, "RD:MD2\r");
+    expect_command_ok("Suite10-RdNestedFromRoot", dr, "RD:MD3\r");
+    expect_command_ok("Suite10-RdLeaveParent", dr, "CD//\r");
     expect_command_ok("Suite10-RdNowEmpty", dr, "RD:MD1\r");
     expect_path_absent("Suite10-RdRemoved", fm, "/Fat/nav/MD1");
     expect_command_response("Suite10-RdMissing", dr, "RD:NOSUCH\r", "62,FILE NOT FOUND,00,00\r");
@@ -2657,6 +2665,105 @@ static void s11_si018_position_exempt(FileManager *fm, IecDrive *dr)
     close_file(dr, chan);
 }
 
+// SI-014 and SI-015: the left arrow (0x5F) is the parent directory in the name
+// position, directly after CD[n] or after a colon, and an ordinary character between
+// slashes. This is the reproduction from #877.
+static void s11_si014_left_arrow(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI014-LeftArrow";
+    const char *path = s11_partition(fm, dr, "si014");
+    char host[80];
+    expect_command_ok(testname, dr, "MD:_\r");
+    snprintf(host, sizeof(host), "%s/_", path);
+    expect_path_exists(testname, fm, host);
+    expect_directory_contains(testname, dr, "$", "\"_\"");
+    expect_command_ok(testname, dr, "CD/_\r");
+    expect_command_response(testname, dr, "XPWD\r", "40:/_/");
+    expect_command_ok(testname, dr, "CD:_\r");
+    expect_command_response(testname, dr, "XPWD\r", "40:/");
+    expect_command_ok(testname, dr, "CD/_\r");
+    expect_command_ok(testname, dr, "CD_\r");
+    expect_command_response(testname, dr, "XPWD\r", "40:/");
+    expect_command_ok(testname, dr, "CD/_\r");
+    expect_command_ok(testname, dr, "CD/:_\r"); // SI-015
+    expect_command_response(testname, dr, "XPWD\r", "40:/");
+    // A left arrow between slashes is a name; .. goes up and down again.
+    expect_command_ok(testname, dr, "MD/_/:OTHER\r");
+    expect_command_ok(testname, dr, "CD//_/OTHER\r");
+    expect_command_response(testname, dr, "XPWD\r", "40:/_/OTHER/");
+    expect_command_ok(testname, dr, "CD/../OTHER\r");
+    expect_command_response(testname, dr, "XPWD\r", "40:/_/OTHER/");
+    expect_command_ok(testname, dr, "CD//_\r");
+    expect_command_ok(testname, dr, "RD:OTHER\r");
+    expect_command_ok(testname, dr, "CD:_\r");
+    expect_command_ok(testname, dr, "RD:_\r");
+    expect_path_absent(testname, fm, host);
+}
+
+// SI-012: a path component may carry wildcards, and the first match is used.
+static void s11_si012_wildcard_path(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI012-WildcardPath";
+    s11_partition(fm, dr, "si012");
+    expect_command_ok(testname, dr, "MD:SUBDIRECTORY\r");
+    expect_command_ok(testname, dr, "MD/SUBDIRECTORY/:DEEP\r");
+    expect_command_ok(testname, dr, "CD//SUB*/DEEP\r");
+    expect_command_response(testname, dr, "XPWD\r", "40:/SUBDIRECTORY/DEEP/");
+    expect_command_ok(testname, dr, "CD//SUBDIRECTOR?/\r");
+    expect_command_response(testname, dr, "XPWD\r", "40:/SUBDIRECTORY/");
+    expect_command_ok(testname, dr, "CD//\r");
+    expect_iec_write_ok(testname, dr, 2, "/SUBDIRECTORY/DEEP/:INSIDE,S,W", "found");
+    expect_iec_file(testname, dr, 2, "//S*/D*/:INSIDE,S,R", "found");
+}
+
+// SI-060: MD needs a colon, and a name that is a shifted space is no name.
+static void s11_si060_md_colon(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI060-MdColon";
+    s11_partition(fm, dr, "si060");
+    expect_command_response(testname, dr, "MD NOCOLON\r", "34,SYNTAX ERROR,00,00\r");
+    const uint8_t shifted_space[5] = { 'M', 'D', ':', 0xA0, 0x0D };
+    expect_command_data_response(testname, dr, shifted_space, sizeof(shifted_space), "34,SYNTAX ERROR,00,00\r");
+    expect_command_ok(testname, dr, "MD:WITHCOLON\r");
+}
+
+// SI-063: RD takes no path, so it cannot remove the parent of where the user stands.
+static void s11_si063_rd_no_path(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI063-RdNoPath";
+    const char *path = s11_partition(fm, dr, "si063");
+    char host[80];
+    expect_command_ok(testname, dr, "MD:PROBEDIR\r");
+    expect_command_response(testname, dr, "RD/PROBEDIR\r", "34,SYNTAX ERROR,00,00\r");
+    expect_command_response(testname, dr, "RD//:PROBEDIR\r", "34,SYNTAX ERROR,00,00\r");
+    snprintf(host, sizeof(host), "%s/PROBEDIR", path);
+    expect_path_exists(testname, fm, host);
+    expect_command_ok(testname, dr, "RD:PROBEDIR\r");
+    expect_path_absent(testname, fm, host);
+}
+
+// SI-150: a path deeper than sixteen components is followed to its end, not cut off.
+static void s11_si150_deep_path(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI150-DeepPath";
+    s11_partition(fm, dr, "si150");
+    char path[128] = "";
+    char cmd[160];
+    for (int i = 0; i < 20; i++) {
+        snprintf(cmd, sizeof(cmd), "MD//%s:%c\r", path, 'A' + i);
+        expect_command_ok(testname, dr, cmd);
+        int len = strlen(path);
+        path[len] = 'A' + i;
+        path[len + 1] = '/';
+        path[len + 2] = 0;
+    }
+    snprintf(cmd, sizeof(cmd), "CD//%s\r", path);
+    expect_command_ok(testname, dr, cmd);
+    char pwd[160];
+    snprintf(pwd, sizeof(pwd), "40:/%s", path);
+    expect_command_response(testname, dr, "XPWD\r", pwd);
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -2683,6 +2790,11 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-SI022-TooLong",           s11_si022_too_long },
     { "Suite11-SI016-SecondTerminator",  s11_si016_second_terminator },
     { "Suite11-SI018-PositionExempt",    s11_si018_position_exempt },
+    { "Suite11-SI014-LeftArrow",         s11_si014_left_arrow },
+    { "Suite11-SI012-WildcardPath",      s11_si012_wildcard_path },
+    { "Suite11-SI060-MdColon",           s11_si060_md_colon },
+    { "Suite11-SI063-RdNoPath",          s11_si063_rd_no_path },
+    { "Suite11-SI150-DeepPath",          s11_si150_deep_path },
 };
 
 // Runs every case, or only those whose name contains `only`.

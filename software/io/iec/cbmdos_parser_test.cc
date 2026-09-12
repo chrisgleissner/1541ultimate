@@ -359,6 +359,20 @@ void test_command_length_and_terminator(void)
     test_dispatch_text("R-H:WORK\rX", 10, 0, "rename header", "-1||WORK");
 }
 
+// SI-060 and SI-063: MD requires a colon and refuses a name that is a shifted space;
+// RD takes a name behind a colon and no path.
+void test_md_rd_grammar(void)
+{
+    test_command(34, (const uint8_t *)"MD NOCOLON", 10);
+    test_command(34, (const uint8_t *)"MD:\xA0", 4);
+    test_command( 0, (const uint8_t *)"MD//SUB/:NAME", 13);
+    test_command(34, (const uint8_t *)"RD/PROBEDIR", 11);
+    test_command(34, (const uint8_t *)"RD//SUB/:NAME", 13);
+    test_command(34, (const uint8_t *)"RDNAME", 6);
+    test_command( 0, (const uint8_t *)"RD:NAME", 7);
+    test_command( 0, (const uint8_t *)"RD12:NAME\r", 10);
+}
+
 void test_error_codes(void)
 {
     // SI-031: not a command letter. CHR$(0) and A are what the reporter measured on
@@ -670,6 +684,7 @@ int main(int argc, const char *argv[])
     test_error_codes();
     test_added_commands();
     test_command_length_and_terminator();
+    test_md_rd_grammar();
     test_command(34, (const uint8_t *)"C99:EMPTY=", 10);
     test_command( 0, (const uint8_t *)"C1:FCOPY=3:FCOPY", 16);
     test_command( 0, (const uint8_t *)"C:FULLSTATS=STAT1,3:STAT3", 25);
@@ -691,7 +706,7 @@ int main(int argc, const char *argv[])
     test_command( 0, (const uint8_t *)"CD1//TEMP", 9);
     test_command( 0, (const uint8_t *)"CD1//TEMP/TEMP2", 15);
     test_command( 0, (const uint8_t *)"CD1_", 4);
-    test_command( 0, (const uint8_t *)"RD33_/BLAH", 10);
+    test_command(34, (const uint8_t *)"RD33_/BLAH", 10); // RD takes no path (SI-063)
     test_command( 0, (const uint8_t *)"CD/TEMP/TEMP2", 13);
     test_command( 0, (const uint8_t *)"T-RA", 4);
     test_command( 0, (const uint8_t *)"T-RI", 4);
@@ -716,8 +731,8 @@ int main(int argc, const char *argv[])
     test_command( 0, (const uint8_t *)"MD1//:TEMP", 10);
     test_command( 0, (const uint8_t *)"MD1//TEMP/:TEMP2", 16);
     test_command( 0, (const uint8_t *)"MD:", 3);
-    test_command( 0, (const uint8_t *)"MD", 2);
-    test_command( 0, (const uint8_t *)"MD/PATH\xC1\xC2", 9);
+    test_command(34, (const uint8_t *)"MD", 2);                // MD needs a colon (SI-060)
+    test_command(34, (const uint8_t *)"MD/PATH\xC1\xC2", 9);
     test_command( 0, (const uint8_t *)"MD:PATH\xC1\xC2", 9);
     test_command( 0, (const uint8_t *)"XPWD", 4);
 
