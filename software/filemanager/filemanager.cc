@@ -772,6 +772,27 @@ FRESULT FileManager::get_free(Path *path, uint32_t &free, uint32_t &cluster_size
     return fres;
 }
 
+FRESULT FileManager::get_total(Path *path, uint32_t &total, uint32_t &cluster_size)
+{
+    PathInfo pathInfo(rootfs);
+    pathInfo.init(path);
+    lock();
+    FRESULT fres = find_pathentry(pathInfo, true);
+    if (fres != FR_OK) {
+        unlock();
+        return fres;
+    }
+    FileInfo *inf = pathInfo.getLastInfo();
+    if (!inf || !(inf->fs)) {
+        unlock();
+        return FR_NO_FILESYSTEM;
+    }
+    fres = inf->fs->get_total(&total, &cluster_size);
+
+    unlock();
+    return fres;
+}
+
 FRESULT FileManager::fs_read_sector(Path *path, uint8_t *buffer, int track, int sector)
 {
     PathInfo pathInfo(rootfs);

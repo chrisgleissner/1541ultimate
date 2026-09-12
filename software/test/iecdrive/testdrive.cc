@@ -365,7 +365,7 @@ void create_file(const char *filename, int blocks)
 #include "blockdev_emul.h"
 void init_fat_file()
 {
-    create_file("format.fat", 16*1024); // 4 MB: room for the images Suite10 mounts
+    create_file("format.fat", 64*1024); // 16 MB: room for the images Suite10 and Suite11 create
     static BlockDevice_Emulated blk("format.fat", 512);
     static Partition prt(&blk, 0, 0, 0);
     static FileSystemFAT fs(&prt);
@@ -1434,9 +1434,11 @@ static void run_suite8_time_copy_rename_scratch(IecDrive *dr)
     expect_command_response("Suite8-CP2", dr, "CP2", "02,PARTITION SELECTED,02,00\r");
     expect_command_ok("Suite8-RENAME-P1", dr, "RENAME1:DOOM=1:DDDD");
     expect_iec_file("Suite8-RENAME-P1-CHECK", dr, 0, "1:DOOM", msg);
-    expect_command_ok("Suite8-RENAME-P1-TO-P2", dr, "RENAME2:DOOM=1:DOOM");
-    expect_iec_file("Suite8-RENAME-P2-CHECK", dr, 0, "2:DOOM", msg);
-    expect_iec_file_missing("Suite8-RENAME-P1-MISSING", dr, 0, "1:DOOM");
+    // A rename does not move a file to another directory, and partitions 1 and 2 are
+    // two directories (SI-074, C14).
+    expect_command_response("Suite8-RENAME-P1-TO-P2", dr, "RENAME2:DOOM=1:DOOM", "62,FILE NOT FOUND,00,00\r");
+    expect_iec_file("Suite8-RENAME-P1-STAYS", dr, 0, "1:DOOM", msg);
+    expect_iec_file_missing("Suite8-RENAME-P2-MISSING", dr, 0, "2:DOOM");
     expect_directory_read("Suite8-DIR-P1", dr, "$1");
     expect_command_response("Suite8-SCRATCH-C-WILDCARD", dr, "SCRATCH1:C*", "01, FILES SCRATCHED,03,00\r");
     expect_iec_file_missing("Suite8-SCRATCH-CCC-MISSING", dr, 0, "1:CCC");
@@ -2860,6 +2862,199 @@ static void s11_si065_header_name(FileManager *fm, IecDrive *dr)
     REQUIRE(memcmp(listing + 8, "SUITE11         ", 16) == 0);
 }
 
+// SI-032 and SI-148: opening a name for writing. A wildcard without @ is an illegal
+// name (33). With @, the first match is replaced under its own name when its type is
+// the one asked for, and anything else answers 64: another type, a relative file, or no
+// match at all (1541 ROM $D8F5). A name that starts with a shifted space is refused the
+// same way.
+static void s11_si032_wildcard_write(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI032-WildcardWrite";
+    const char *path = s11_partition(fm, dr, "si032");
+    char host[80];
+    expect_iec_write_ok(testname, dr, 1, "FOOBAR", "old");
+    expect_iec_write_ok(testname, dr, 2, "FOOSEQ,S,W", "seq");
+
+    // @ and a pattern matching a PRG, from a SAVE: the PRG is replaced, name and all.
+    expect_iec_write_ok(testname, dr, 1, "@:FOOB*", "new");
+    expect_iec_file(testname, dr, 0, "FOOBAR", "new");
+    snprintf(host, sizeof(host), "%s/FOOB*.prg", path);
+    expect_path_absent(testname, fm, host);
+    // @ and a pattern whose first match is not the type asked for.
+    expect_iec_open_status_prefix(testname, dr, 1, "@:FOOS*", "64,FILE TYPE MISMATCH");
+    close_file(dr, 1);
+    expect_iec_file(testname, dr, 2, "FOOSEQ,S,R", "seq");
+    // @ and a pattern that matches nothing.
+    expect_iec_open_status_prefix(testname, dr, 1, "@:NOMATCH*", "64,FILE TYPE MISMATCH");
+    close_file(dr, 1);
+    // @ and a pattern matching a relative file.
+    expect_rel_open(testname, dr, 3, "FOOREL", 16);
+    close_file(dr, 3);
+    expect_iec_open_status_prefix(testname, dr, 2, "@:FOOR*,S,W", "64,FILE TYPE MISMATCH");
+    close_file(dr, 2);
+    // No @: a wildcard in a name to write is an illegal name.
+    expect_iec_open_status_prefix(testname, dr, 1, "FOO*", "33,SYNTAX ERROR");
+    close_file(dr, 1);
+    expect_iec_open_status_prefix(testname, dr, 2, "FOO?AR,S,W", "33,SYNTAX ERROR");
+    close_file(dr, 2);
+    // SI-148: a name that starts with a shifted space is no name to create.
+    expect_iec_open_status_prefix(testname, dr, 2, "@:\xA0NAME,S,W", "64,FILE TYPE MISMATCH");
+    close_file(dr, 2);
+    expect_iec_open_status_prefix(testname, dr, 2, "\xA0NAME,S,W", "33,SYNTAX ERROR");
+    close_file(dr, 2);
+}
+
+// SI-041 and SI-042: G-P with 0 asks about the system partition, which this drive does
+// not have; bytes 27 to 29 are the partition's size in 512 byte blocks; byte 1 is 0.
+static void s11_si041_partition_size(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI041-PartitionSize";
+    s11_partition(fm, dr, "si041");
+    const uint8_t system[4] = { 'G', '-', 'P', 0 };
+    send_command_data(dr, system, sizeof(system));
+    get_status(dr);
+    printf("%s: G-P 0 answered %d bytes, type %d, partition %d\n", testname, last_status_size,
+           (uint8_t)last_status[0], (uint8_t)last_status[2]);
+    REQUIRE(last_status_size == 31);
+    REQUIRE((last_status[0] == 0) && (last_status[1] == 0) && (last_status[2] == 0));
+
+    // A D64 image is 174848 bytes, 342 blocks of 512 rounded up.
+    create_formatted_image(fm, "/Fat/s11_si041.d64", "SIZED", 683, e_image_d64);
+    dr->add_partition(44, "/Fat/s11_si041.d64", "SIZED");
+    const uint8_t gp44[4] = { 'G', '-', 'P', 44 };
+    send_command_data(dr, gp44, sizeof(gp44));
+    get_status(dr);
+    int blocks = ((uint8_t)last_status[27] << 16) | ((uint8_t)last_status[28] << 8) | (uint8_t)last_status[29];
+    printf("%s: G-P 44 type %d, byte 1 %d, size %d blocks\n", testname, (uint8_t)last_status[0],
+           (uint8_t)last_status[1], blocks);
+    REQUIRE(last_status_size == 31);
+    REQUIRE((last_status[0] == 2) && (last_status[1] == 0) && (last_status[2] == 44));
+    REQUIRE(blocks == 342);
+
+    // A directory partition reports its volume: the 16 MB FAT file this suite runs on,
+    // which is no more than 32768 blocks and no less than what is free on it.
+    const uint8_t gp40[4] = { 'G', '-', 'P', 40 };
+    send_command_data(dr, gp40, sizeof(gp40));
+    get_status(dr);
+    blocks = ((uint8_t)last_status[27] << 16) | ((uint8_t)last_status[28] << 8) | (uint8_t)last_status[29];
+    Path fat_path("/Fat/");
+    uint32_t free_clusters = 0, cluster_size = 0;
+    REQUIRE(fm->get_free(&fat_path, free_clusters, cluster_size) == FR_OK);
+    uint32_t free_blocks = (uint32_t)(((uint64_t)free_clusters * cluster_size) / 512);
+    printf("%s: G-P 40 size %d blocks, %u blocks free on the volume\n", testname, blocks, free_blocks);
+    REQUIRE((blocks <= 32768) && (blocks >= (int)free_blocks) && (blocks > 0));
+}
+
+// SI-072: a file named with a disk image or cartridge extension is stored under exactly
+// that name, without a type extension, so a PC sees GAME.D81 and not GAME.D81.prg.
+static void s11_si072_raw_names(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI072-RawNames";
+    const char *path = s11_partition(fm, dr, "si072");
+    static const char *names[] = { "X.D81", "Y.D64", "Z.DNP", "GAME.CRT", "GAME.TCRT" };
+    char host[80];
+    FileInfo info(16);
+    char open_name[40];
+    for (int i = 0; i < 5; i++) {
+        snprintf(open_name, sizeof(open_name), "%s,P,W", names[i]);
+        expect_iec_write_ok(testname, dr, 2, open_name, "raw");
+        snprintf(host, sizeof(host), "%s/%s", path, names[i]);
+        if (fm->fstat(host, info) != FR_OK) {
+            printf("%s: expected host file '%s'\n", testname, host);
+        }
+        REQUIRE(fm->fstat(host, info) == FR_OK);
+        snprintf(host, sizeof(host), "%s/%s.prg", path, names[i]);
+        if (fm->fstat(host, info) == FR_OK) {
+            printf("%s: host file '%s' should not exist\n", testname, host);
+        }
+        REQUIRE(fm->fstat(host, info) != FR_OK);
+    }
+    expect_iec_file(testname, dr, 0, "X.D81", "raw");
+    // Any other extension still gets the type.
+    expect_iec_write_ok(testname, dr, 2, "NOTES.TXT,S,W", "typed");
+    snprintf(host, sizeof(host), "%s/NOTES.TXT.seq", path);
+    REQUIRE(fm->fstat(host, info) == FR_OK);
+}
+
+// SI-074: a rename stays in one directory (62 otherwise), refuses a name that exists
+// with any type (63) and an empty name (34).
+static void s11_si074_rename_checks(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI074-RenameChecks";
+    s11_partition(fm, dr, "si074");
+    expect_command_ok(testname, dr, "MD:SUB\r");
+    expect_iec_write_ok(testname, dr, 1, "OLD", "old");
+    expect_iec_write_ok(testname, dr, 2, "NEW,S,W", "new");
+    expect_command_response(testname, dr, "R/SUB/:MOVED=OLD\r", "62,FILE NOT FOUND,00,00\r");
+    expect_iec_file(testname, dr, 0, "OLD", "old");
+    expect_command_response(testname, dr, "R:NEW=OLD\r", "63,FILE EXISTS,00,00\r");
+    expect_iec_file(testname, dr, 0, "OLD", "old");
+    expect_command_response(testname, dr, "R:=OLD\r", "34,SYNTAX ERROR,00,00\r");
+    expect_command_ok(testname, dr, "R:FRESH=OLD\r");
+    expect_iec_file(testname, dr, 0, "FRESH", "old");
+}
+
+// SI-083: P on a file opened for writing moves past the end, and the next write extends
+// the file. This is JiffyDOS's MD81, as the reporter's #877 excerpt shows it: open
+// FOO.D81,P,W, position to 819199, write one byte, close.
+static void s11_si083_seek_write(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI083-SeekWrite";
+    const char *path = s11_partition(fm, dr, "si083");
+    const uint8_t chan = 2;
+    open_file(dr, chan, "FOO.D81,P,W");
+    get_status(dr);
+    expect_status_ok(testname, "FOO.D81,P,W");
+    const uint8_t md81[6] = { 'P', (uint8_t)(96 + chan), 0xFF, 0x7F, 0x0C, 0x00 };
+    expect_command_data_response(testname, dr, md81, sizeof(md81), "00, OK,00,00\r");
+    const uint8_t last = 0x42;
+    send_channel_data(dr, chan, &last, 1);
+    close_file(dr, chan);
+    expect_status_ok(testname, "close FOO.D81");
+    char host[80];
+    snprintf(host, sizeof(host), "%s/FOO.D81", path);
+    FileInfo info(16);
+    REQUIRE(fm->fstat(host, info) == FR_OK);
+    printf("%s: FOO.D81 is %u bytes\n", testname, (unsigned)info.size);
+    REQUIRE(info.size == 819200);
+    expect_command_response(testname, dr, "S:FOO.D81\r", "01, FILES SCRATCHED,01,00\r");
+
+    // What was written before the position is kept, and the write lands where P put it.
+    open_file(dr, chan, "HOLES,S,W");
+    get_status(dr);
+    send_channel_data(dr, chan, (const uint8_t *)"HEAD", 4);
+    const uint8_t p1000[6] = { 'P', (uint8_t)(96 + chan), 0xE8, 0x03, 0x00, 0x00 };
+    expect_command_data_response(testname, dr, p1000, sizeof(p1000), "00, OK,00,00\r");
+    send_channel_data(dr, chan, (const uint8_t *)"TAIL", 4);
+    close_file(dr, chan);
+    uint8_t content[1100];
+    open_file(dr, 3, "HOLES,S,R");
+    get_status(dr);
+    int got = read_file(dr, 3, content, sizeof(content));
+    close_file(dr, 3);
+    printf("%s: HOLES is %d bytes\n", testname, got);
+    REQUIRE(got == 1004);
+    REQUIRE(memcmp(content, "HEAD", 4) == 0);
+    REQUIRE(memcmp(content + 1000, "TAIL", 4) == 0);
+}
+
+// SI-083 and SI-036: inside a disk image a file cannot be positioned past its end, and
+// the answer is 72, which CBM DOS names, not the Ultimate's 69.
+static void s11_si083_seek_write_image(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI083-SeekWriteImage";
+    s11_partition(fm, dr, "si083i");
+    create_formatted_image(fm, "/Fat/s11_si083.d81", "SEEK", 3200, e_image_d81);
+    dr->add_partition(45, "/Fat/s11_si083.d81", "SEEKIMAGE");
+    const uint8_t chan = 2;
+    open_file(dr, chan, "45:FOO,P,W");
+    get_status(dr);
+    expect_status_ok(testname, "45:FOO,P,W");
+    const uint8_t md81[6] = { 'P', (uint8_t)(96 + chan), 0xFF, 0x7F, 0x0C, 0x00 };
+    expect_command_data_response(testname, dr, md81, sizeof(md81), "72,DISK FULL,00,00\r");
+    close_file(dr, chan);
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -2895,6 +3090,12 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-SI133-SizeRemainder",     s11_si133_size_remainder },
     { "Suite11-SI134-HiddenFlag",        s11_si134_hidden_flag },
     { "Suite11-SI065-HeaderName",        s11_si065_header_name },
+    { "Suite11-SI032-WildcardWrite",     s11_si032_wildcard_write },
+    { "Suite11-SI041-PartitionSize",     s11_si041_partition_size },
+    { "Suite11-SI072-RawNames",          s11_si072_raw_names },
+    { "Suite11-SI074-RenameChecks",      s11_si074_rename_checks },
+    { "Suite11-SI083-SeekWrite",         s11_si083_seek_write },
+    { "Suite11-SI083-SeekWriteImage",    s11_si083_seek_write_image },
 };
 
 // Runs every case, or only those whose name contains `only`.

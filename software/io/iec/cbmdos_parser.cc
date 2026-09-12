@@ -255,6 +255,11 @@ int parse_open(const char *buf, open_t& fn)
         }
     }
 
+    // A name that starts with a shifted space is no name to create: 64 with @, as for a
+    // pattern (SI-148, SD file_open()).
+    if (fn.replace && ((uint8_t)fn.file.filename.c_str()[0] == 0xA0)) {
+        return ERR_REPLACE_TYPE;
+    }
     if (fn.file.filename.contains_any(",=:\xA0\r")) {
         return ERR_ILLEGAL_NAME;
     }
@@ -439,13 +444,13 @@ int IecParser :: get_command(const uint8_t *buffer, int len)
     switch(buffer[2]) {
     case 'P':
         if (len == 4) {
-            // 255 asks for the current partition, which is what no parameter asks
-            // for as well. Partition 0 is the system partition on a CMD drive; there
-            // is none here, so it also reads back as the current one.
+            // 255 asks for the current partition, which is what no parameter asks for
+            // as well, and is passed on as -1. Partition 0 is the system partition, a
+            // different question (SI-041).
             int wanted = (int)buffer[3];
-            return exec->do_get_partition_info((wanted == 255) ? 0 : wanted);
+            return exec->do_get_partition_info((wanted == 255) ? -1 : wanted);
         } else if (len == 3) {
-            return exec->do_get_partition_info(0);
+            return exec->do_get_partition_info(-1);
         }
         return ERR_SYNTAX;
     default:
@@ -543,6 +548,9 @@ int IecParser :: rename_command(const uint8_t *buffer, int len)
 
     if (dest.has_wildcard)
         return ERR_ILLEGAL_NAME;
+    if ((uint8_t)dest.filename.c_str()[0] == 0xA0) {
+        return ERR_NO_NAME; // a name that starts with a shifted space (SI-148, SD parse_rename())
+    }
 
     return exec->do_rename(src, dest);
 }

@@ -48,6 +48,18 @@ FRESULT FileSystemFAT :: get_free (uint32_t *e, uint32_t *cs)
 #endif
 }
 
+// The data clusters of the volume: FatFs numbers them from 2 to n_fatent - 1.
+FRESULT FileSystemFAT :: get_total (uint32_t *e, uint32_t *cs)
+{
+    *e = fatfs.n_fatent - 2;
+#if FF_MAX_SS != FF_MIN_SS
+    *cs = fatfs.ssize * fatfs.csize;
+#else
+    *cs = FF_MAX_SS * fatfs.csize;
+#endif
+    return FR_OK;
+}
+
 bool    FileSystemFAT :: is_writable()
 {
 #if FF_FS_READONLY

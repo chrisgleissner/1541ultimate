@@ -70,6 +70,7 @@ typedef struct {
 #define ERR_CMD_TOO_LONG  32 // the command filled the command buffer
 #define ERR_ILLEGAL_NAME  33 // a wildcard or a character a name cannot carry
 #define ERR_NO_NAME       34 // no name, or a colon with nothing after it
+#define ERR_REPLACE_TYPE  64 // FILE TYPE MISMATCH: @ names nothing that can be replaced
 
 // The command buffer holds 254 bytes, as on the CMD HD (HD 4-6) and on sd2iec's uIEC
 // (CONFIG_COMMAND_BUFFER_SIZE). A command that fills it is refused, because whether

@@ -719,6 +719,27 @@ static void iec_path_to_fs_path(mstring &path)
     path.replace("//", "/");
 }
 
+// A disk image or a cartridge is stored under exactly its own name, with no type
+// extension, so that a PC sees GAME.D81 and not GAME.D81.prg (SI-072, SD should_save_raw()).
+static bool iec_name_is_raw(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    if (!dot) {
+        return false;
+    }
+    char ext[5];
+    int n = 0;
+    for (const char *p = dot + 1; *p && (n < 5); p++) {
+        ext[n++] = toupper(*p);
+    }
+    if ((n == 3) && (ext[0] == 'D') &&
+        (!strncmp(ext, "D64", 3) || !strncmp(ext, "D41", 3) || !strncmp(ext, "D71", 3) ||
+         !strncmp(ext, "D81", 3) || !strncmp(ext, "DNP", 3))) {
+        return true;
+    }
+    return ((n == 3) && !strncmp(ext, "CRT", 3)) || ((n == 4) && !strncmp(ext, "TCRT", 4));
+}
+
 static bool iec_file_type_matches(filetype_t requested, filetype_t found)
 {
     return requested == e_any || found == e_any || requested == found;
@@ -1345,7 +1366,34 @@ int IecChannel :: setup_file_access()
     print_file(name_to_open.file);
 #endif
     mstring work;
-    const char *full_path = ConstructPath(work, name_to_open.file, name_to_open.filetype, name_to_open.access );
+    const char *full_path = NULL;
+
+    // A pattern in a name to write (SI-032). Without @ it is an illegal name. With @ the
+    // first match is replaced under its own name if its type is the one asked for; any
+    // other type, a relative file, or no match at all answers 64, which is the check the
+    // 1541 ROM makes at $D8F5.
+    if ((name_to_open.access == e_write) && name_to_open.file.has_wildcard) {
+        if (!name_to_open.replace) {
+            drive->set_error(ERR_SYNTAX_ERROR_NAME, 0, 0);
+            return 0;
+        }
+        GETPARTITION(name_to_open.file.partition, partition, 0);
+        FileInfo matched(48);
+        filetype_t found = e_any;
+        FRESULT fres = resolve_existing_iec_path(fm, partition, name_to_open.file, e_any,
+                                                 false, true, true, work, &matched);
+        if (fres == FR_OK) {
+            char cbm_name[24];
+            IecPartition::CreateIecName(&matched, cbm_name, found);
+        }
+        if ((fres != FR_OK) || (found != name_to_open.filetype) || (found == e_rel)) {
+            drive->set_error(ERR_FILE_TYPE_MISMATCH, 0, 0);
+            return 0;
+        }
+        full_path = work.c_str();
+    } else {
+        full_path = ConstructPath(work, name_to_open.file, name_to_open.filetype, name_to_open.access );
+    }
     if (!full_path) {
         drive->set_error(ERR_PARTITION_ERROR, drive->vfs->GetTargetPartitionNumber(name_to_open.file.partition), 0);
         return 0;
@@ -1763,7 +1811,8 @@ const char *IecChannel :: ConstructPath(mstring& work, filename_t& name, filetyp
     petscii_to_fat(name.filename.c_str(), fatname, 52);
     // printf("After petscii_to_fat: '%s'\n", fatname);
     const char *ext = types[(int)ftype];
-    if ((acc == e_read) || (ftype != e_any)) { // for reads, .??? is allowed, but for writes it is not
+    if (((acc == e_read) || (ftype != e_any)) && // for reads, .??? is allowed, but for writes it is not
+        !iec_name_is_raw(name.filename.c_str())) {
         add_extension(fatname, ext, 48);
     }
 
@@ -2095,6 +2144,25 @@ int IecCommandChannel::do_rename(filename_t &src, filename_t &dest)
     IecPartition::CreateIecName(&info, cbm_name, ftype);
     // ftype is now set to the type of the original file.
     
+    // A rename does not move a file to another directory (SI-074, SD parse_rename()), and
+    // the new name must not be taken by an entry of any type, unless it is the old name
+    // spelled in another case.
+    GETPARTITION(src.partition, src_partition, 0);
+    GETPARTITION(dest.partition, dest_partition, 0);
+    mstring src_dir, dest_dir;
+    if ((resolve_directory_path(fm, src_partition, src.path, src_dir) != FR_OK) ||
+        (resolve_directory_path(fm, dest_partition, dest.path, dest_dir) != FR_OK) ||
+        (strcmp(src_dir.c_str(), dest_dir.c_str()) != 0)) {
+        return ERR_FILE_NOT_FOUND;
+    }
+    if (strcasecmp(cbm_name, dest.filename.c_str()) != 0) {
+        mstring taken;
+        if (find_rendered_iec_child(fm, dest_dir.c_str(), dest.filename.c_str(), e_any,
+                                    true, true, false, taken, NULL) == FR_OK) {
+            return ERR_FILE_EXISTS;
+        }
+    }
+
     const char *dest_path = ConstructPath(workd, dest, ftype, e_write);
     if (!dest_path) {
         return ERR_PARTITION_ERROR;
@@ -2214,6 +2282,34 @@ int IecCommandChannel::do_set_position(int chan, uint32_t pos, int recnr, int re
     case e_buffer:
         return do_buffer_position(chan, pos);
     case e_file:
+        if ((channel->name_to_open.access == e_write) || (channel->name_to_open.access == e_append)) {
+            // A channel that writes (SI-083): what it holds goes out at the old position,
+            // then the file moves, past its end if the medium can grow a file that way, and
+            // the next byte lands there. Nothing is read back, because the file is not open
+            // for reading. A medium that cannot put the file there is full, 72, which CBM
+            // DOS names, rather than 69 (SI-036).
+            if (channel->pointer > 0) {
+                uint32_t written;
+                fres = channel->f->write(channel->buffer, channel->pointer, &written);
+                if (fres != FR_OK) {
+                    drive->set_error_fres(fres);
+                    return 0;
+                }
+                channel->pointer = 0;
+            }
+            fres = channel->f->seek(pos);
+            if ((fres != FR_OK) || (channel->f->get_size() < pos)) {
+                if (pos > channel->f->get_size()) {
+                    drive->set_error(ERR_DISK_FULL, 0, 0);
+                } else {
+                    drive->set_error_fres(fres);
+                }
+                return 0;
+            }
+            drive->set_error(ERR_ALL_OK, 0, 0);
+            state = e_idle;
+            return 0;
+        }
         fres = channel->f->seek(pos);
         if (fres != FR_OK) {
             drive->set_error_fres(fres);
@@ -2251,7 +2347,9 @@ int IecCommandChannel::do_set_position(int chan, uint32_t pos, int recnr, int re
 
 int IecCommandChannel::do_get_partition_info(int part)
 {
-    IecPartition *p = drive->vfs->GetPartition(part);
+    // -1 is the current partition. 0 is the system partition, which this drive does not
+    // have, so it reads back as a partition that is not there, numbered 0 (SI-041).
+    IecPartition *p = (part == 0) ? NULL : drive->vfs->GetPartition(part);
     memset(buffer, 0, 30);
     buffer[30] = 0x0d;
     drive->set_error(0, 0, 0);
@@ -2259,7 +2357,7 @@ int IecCommandChannel::do_get_partition_info(int part)
     // Byte 0 is the type, byte 1 is reserved and byte 2 is the partition number. A
     // partition that does not exist is not an error: type 0 is what CMD DOS calls
     // "not created", and the caller asked for exactly that answer.
-    buffer[2] = (uint8_t)drive->vfs->GetTargetPartitionNumber(part);
+    buffer[2] = (part == 0) ? 0 : (uint8_t)drive->vfs->GetTargetPartitionNumber(part);
 
     if (p) {
         buffer[0] = (uint8_t)iec_partition_type(fm, p);
@@ -2274,7 +2372,34 @@ int IecCommandChannel::do_get_partition_info(int part)
         IecPartition::CreateIecName(&info, cbm_name, ftype);
 
         strncpy((char *)(buffer+3), cbm_name, 16);
-        buffer[27] = 0xFF; // for now always reporting 0xFF0000 as partition size
+
+        // Bytes 27 to 29, the size in 512 byte blocks, as the HD counts them, clamped to
+        // 24 bits: the image file for a partition rooted in a disk image, the volume for
+        // one rooted in a directory (SI-041, SD parse_getpartition()).
+        uint32_t blocks = 0;
+        FileInfo root(8);
+        if (fm->is_path_valid(p->GetRootPath(), &root) && root.fs && root.fs->supports_direct_sector_access()) {
+            mstring image(p->GetRootPath());
+            const char *ip = image.c_str();
+            if (image.length() && (ip[image.length() - 1] == '/')) {
+                mstring trimmed(ip, 0, image.length() - 2);
+                image = trimmed;
+            }
+            FileInfo file(8);
+            if (fm->fstat(image.c_str(), file) == FR_OK) {
+                blocks = (file.size + 511) / 512;
+            }
+        } else {
+            Path root_path(p->GetRootPath());
+            uint32_t clusters = 0, cluster_size = 0;
+            if (fm->get_total(&root_path, clusters, cluster_size) == FR_OK) {
+                uint64_t total = ((uint64_t)clusters * cluster_size) / 512;
+                blocks = (total > 0xFFFFFF) ? 0xFFFFFF : (uint32_t)total;
+            }
+        }
+        buffer[27] = (uint8_t)(blocks >> 16);
+        buffer[28] = (uint8_t)(blocks >> 8);
+        buffer[29] = (uint8_t)blocks;
     }
 
     // Thirty bytes of information plus the carriage return that ends the reply.

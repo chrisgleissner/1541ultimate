@@ -52,6 +52,7 @@ public:
     virtual int     get_sectors_in_track(int track) { return 0; }
 
     virtual FRESULT get_free (uint32_t *e, uint32_t *cs) { *e = 0; *cs = 0; return FR_OK; } // Get number of free sectors on the file system
+    virtual FRESULT get_total(uint32_t *e, uint32_t *cs) { *e = 0; *cs = 0; return FR_NOT_ENABLED; } // Get the number of clusters the file system holds, in the units of get_free
     virtual FRESULT sync(void) { return FR_OK; } // by default we can't write, and syncing is thus always successful
     
     // functions for reading directories

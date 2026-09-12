@@ -237,12 +237,13 @@ void test_command_terminator(void)
     // for.
     test_dispatch("CP\r", 3, 0, "select partition", 0);
 
-    // G-P without a number, and with 255, both ask about the current partition. A
-    // CMD drive answers 0 with its system partition; there is none here, so that
-    // also reads back as the current one.
-    test_dispatch("G-P", 3, 0, "partition info", 0);
-    test_dispatch("G-P\r", 4, 0, "partition info", 0);
-    test_dispatch("G-P\xFF", 4, 0, "partition info", 0);
+    // G-P without a number, and with 255, both ask about the current partition, which
+    // the parser passes on as -1. 0 asks about the system partition, a different
+    // question (SI-041).
+    test_dispatch("G-P", 3, 0, "partition info", -1);
+    test_dispatch("G-P\r", 4, 0, "partition info", -1);
+    test_dispatch("G-P\xFF", 4, 0, "partition info", -1);
+    test_dispatch("G-P\x00", 4, 0, "partition info", 0);
     test_dispatch("G-P\x04", 4, 0, "partition info", 4);
     test_dispatch("G-P\x04\r", 5, 0, "partition info", 4);
     // Partition 13 needs the terminator the manual asks for, exactly as on a CMD
