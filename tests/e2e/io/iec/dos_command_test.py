@@ -227,13 +227,17 @@ def check_compatibility(agent, api, password, folder, root):
 
     def partition_directory():
         listing = listing_of(agent, "$=P")
-        detail(f"{len(listing)} bytes, header {listing[:6].hex()}")
-        if listing[:4] != bytes([1, 4, 1, 1]):
-            raise Failure(f"the listing starts {listing[:4].hex()}, expected 01040101")
-        if listing[4] != 1:
-            raise Failure(f"the header counts {listing[4]} partitions, expected 1")
+        detail(f"{len(listing)} bytes, header {listing[:6].hex()}, last line {listing[-32:]!r}")
+        # Every problem is reported, so #890's footer shows even when the header is wrong too.
+        problems = []
         if b"BLOCKS FREE" in listing or listing[-2:] != bytes(2):
-            raise Failure("the partition directory ends with a blocks free line")
+            problems.append("the partition directory ends with a blocks free line (#890)")
+        if listing[4] != 1:
+            problems.append(f"the header counts {listing[4]} partitions, expected 1")
+        if listing[:4] != bytes([1, 4, 1, 1]):
+            problems.append(f"the listing starts {listing[:4].hex()}, expected 01040101")
+        if problems:
+            raise Failure("; ".join(problems))
 
     def device_number():
         def close_quietly(device):
@@ -246,6 +250,13 @@ def check_compatibility(agent, api, password, folder, root):
                 pass
 
         agent.call(2, 15, b"U0>" + bytes([12]) + b"\r")
+        # The drive list says where the drive is without addressing a device that may not
+        # be there: a KERNAL open of an absent device leaves the agent busy past its budget.
+        moved = iec_drive(api)["bus_id"]
+        detail(f"after U0>+CHR$(12) the drive list reports device {moved}")
+        if moved != 12:
+            agent.status((0,))
+            raise Failure(f"the drive stayed at device {moved}")
         close_quietly(11)
         agent.softiec_device = 12
         try:
@@ -256,7 +267,7 @@ def check_compatibility(agent, api, password, folder, root):
                 raise Failure(f"device 12 answered {reply!r}")
         finally:
             # Back to device 11 whatever happened, so the checks after this one still
-            # have their drive: S-D to 12 is harmless when the drive never moved.
+            # have their drive.
             try:
                 agent.call(2, 15, b"S-D\r", device=12)
             except Failure:
@@ -456,6 +467,14 @@ def check_compatibility(agent, api, password, folder, root):
         raise Failure(f"{len(failed)} compatibility checks failed")
 
 
+def iec_drive(api):
+    """The Software IEC drive's entry in the drive list."""
+    for entry in api.rest.json("/v1/drives")["drives"]:
+        if "IEC Drive" in entry:
+            return entry["IEC Drive"]
+    raise Failure("The drive list has no IEC Drive")
+
+
 def listing_of(agent, name):
     """The whole of one directory stream, read in mailbox sized pieces."""
     agent.call(1, channel=3, data=name.encode("ascii"), secondary=0)
@@ -541,7 +560,9 @@ def run(args):
         agent.start()
         started = True
         agent.call(1, channel=15)
-        agent.status((0, 73))
+        # The error channel still holds whatever the last program left there, which after
+        # an aborted run on a firmware without these fixes can be any error.
+        agent.status(tuple(range(100)))
         agent.command("CD//")
         root = partition_path(api)
         if not original_path.casefold().startswith(root.casefold()):
