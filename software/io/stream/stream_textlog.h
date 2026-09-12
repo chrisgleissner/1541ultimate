@@ -45,11 +45,17 @@ public:
         }
     }
 
+    // Every task writes here without a lock, and an interrupt handler or the code that runs
+    // before the scheduler may print too, where no lock can be taken. So the position is
+    // read once and checked before it is used: two writers may lose a character to each
+    // other, but neither writes outside the buffer (CR-7).
     void charout(int c) {
-        if (offset >= size) {
-            offset = 0; // clear!
+        int o = offset;
+        if ((o < 0) || (o >= size)) {
+            o = 0; // clear!
         }
         if (!enabled) {
+            offset = o;
             return;
         }
         if (c == 27) {
@@ -57,21 +63,30 @@ public:
     	} else if (c == 9) {
     		c = ' ';
     	} else if ((c < 32) && (c != 10) && (c != 13)) {
+            offset = o;
     		return;
     	}
-        buffer[offset++] = (char)c;
+        buffer[o] = (char)c;
+        offset = o + 1;
     }
 
+    // A string longer than the log keeps its end.
     void raw(const char *data) {
         int len = strlen(data);
-        if (offset + len >= size) {
-            offset = 0; // clear!
+        if (len > size) {
+            data += len - size;
+            len = size;
+        }
+        int o = offset;
+        if ((o < 0) || (o + len > size)) {
+            o = 0; // clear!
         }
         if (!enabled) {
+            offset = o;
             return;
         }
-        memcpy(buffer + offset, data, len);
-        offset += len;
+        memcpy(buffer + o, data, len);
+        offset = o + len;
     }
 
     char *getText(void) {

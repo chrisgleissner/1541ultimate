@@ -183,6 +183,14 @@ void IecInterface :: task()
 
         gotSomething = xQueueReceive(queueToIec, &closure, 2); // here is the vTaskDelay(2) that used to be here
 
+        // The slaves are locked for one pass over the bus, so the drive's own entry points,
+        // which lock again for every byte, only count up and down (CR-6).
+        for (int i = 0; i < MAX_SLOTS; i++) {
+            if (slaves[i]) {
+                slaves[i]->lock();
+            }
+        }
+
         if (gotSomething == pdTRUE) {
             if (closure.func) {
                 closure.func(closure.obj, closure.data);
@@ -341,6 +349,12 @@ void IecInterface :: task()
                 addressed_slave->pop_more(jiffy_transfer);
             } else {
                 jiffy_load = false;
+            }
+        }
+
+        for (int i = MAX_SLOTS - 1; i >= 0; i--) {
+            if (slaves[i]) {
+                slaves[i]->unlock();
             }
         }
     }

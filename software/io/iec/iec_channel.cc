@@ -1385,10 +1385,12 @@ int IecChannel :: setup_directory_read()
     DBGIEC("Setup dir read\n");
     char fatname[48];
 
-    // previously not closed??
+    // Released and cleared before anything below can fail, so no early return leaves the
+    // channel pointing at a freed directory for the next open to free again (CR-5).
     if (dir) {
         delete dir;
-    }    
+        dir = NULL;
+    }
 
     GETPARTITION(name_to_open.file.partition, partition, -1);
     petscii_to_fat(name_to_open.file.filename.c_str(), fatname, sizeof(fatname) - 1);
@@ -2018,11 +2020,17 @@ int IecChannel::open_file(void)  // name should be in buffer
     return result;
 }
 
+// Closes the file, and releases the directory of a listing the host stopped reading
+// (CR-4), which otherwise stayed allocated until the channel listed again.
 int IecChannel::close_file(void) // file should be open
 {
     if (f)
         fm->fclose(f);
     f = NULL;
+    if (dir) {
+        delete dir;
+        dir = NULL;
+    }
     state = e_idle;
     return 0;
 }
@@ -2768,6 +2776,10 @@ static int scratch_matching(FileManager *fm, const char *dir_path, const char *p
     return scratched;
 }
 
+// Every name, with or without a pattern, is scratched through the directory scan, which
+// removes each unlocked entry of that name once and then stops. Deleting the name until
+// the file system refused, as this did before, depended on the refusal for termination
+// and deleted a locked entry that followed an unlocked one (CR-8, SI-076).
 int IecCommandChannel::do_scratch(filename_t filenames[], int n)
 {
     if (int err = drive->refuse_write()) {
@@ -2777,46 +2789,9 @@ int IecCommandChannel::do_scratch(filename_t filenames[], int n)
     mstring work;
     int scratched = 0;
     for(int i=0;i<n;i++) {
-        int scratched_this_file = 0;
-        if (filenames[i].has_wildcard) {
-            GETPARTITION(filenames[i].partition, partition, 0);
-            if (resolve_directory_path(fm, partition, filenames[i].path, work) == FR_OK) {
-                scratched += scratch_matching(fm, work.c_str(), filenames[i].filename.c_str());
-            }
-            continue;
-        }
-        const char *fp = ConstructPath(work, filenames[i], e_any, e_read); // If read is not set, the extension will not be set to .???
-        if (fp) {
-            DBGIECV("  %d. %s\n", i, fp);
-        } else {
-            DBGIECV("  %d. unresolved by canonical path\n", i);
-        }
-        FRESULT fres = FR_NO_PATH;
-        FileInfo locked(8);
-        if (fp && (fm->fstat(fp, locked) == FR_OK) && (locked.attrib & AM_RDO)) {
-            continue; // a locked file is not scratched (SI-076)
-        }
-        if (fp) {
-            do {
-                fres = fm->delete_file(fp);
-                if (fres == FR_OK) {
-                    scratched ++;
-                    scratched_this_file ++;
-                }
-            } while(fres == FR_OK);
-        }
-        if (!scratched_this_file && !filenames[i].has_wildcard &&
-                (fres == FR_NO_FILE || fres == FR_NO_PATH)) {
-            GETPARTITION(filenames[i].partition, partition, 0);
-            fres = resolve_existing_iec_path(fm, partition, filenames[i], e_any,
-                                             false, true, false, work);
-            if (fres == FR_OK) {
-                DBGIECV("  %d. directory-assisted scratch %s\n", i, work.c_str());
-                fres = fm->delete_file(work.c_str());
-                if (fres == FR_OK) {
-                    scratched ++;
-                }
-            }
+        GETPARTITION(filenames[i].partition, partition, 0);
+        if (resolve_directory_path(fm, partition, filenames[i].path, work) == FR_OK) {
+            scratched += scratch_matching(fm, work.c_str(), filenames[i].filename.c_str());
         }
     }
     // Scratching nothing is not an error: the answer is 01 with a count of zero (SI-033).
@@ -3330,6 +3305,7 @@ bool IecPartition::IsValid()
 
 void IecFileSystem :: LoadPartitions(const char *path, const char *file)
 {
+    IecDriveLock guard(drive);
     File *fi;
     FRESULT fres = fm->fopen(path, file, FA_READ, &fi);
     if (fres == FR_OK) {
@@ -3340,6 +3316,7 @@ void IecFileSystem :: LoadPartitions(const char *path, const char *file)
 
 FRESULT IecFileSystem :: SavePartitions(const char *path, const char *filename)
 {
+    IecDriveLock guard(drive);
     File *fo;
     uint32_t tr;
 

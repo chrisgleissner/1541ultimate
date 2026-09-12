@@ -56,6 +56,7 @@ void SoftIECTarget :: parse_command(Message *command, Message **reply, Message *
         *status = &c_iec_module_not_loaded;
         return;
     }
+    IecDriveLock guard(iec_drive); // the IEC task and the GUI reach the same channels (CR-6)
 
     switch(command->message[1]) {
         case SOFTIEC_CMD_IDENTIFY:
@@ -270,6 +271,7 @@ void SoftIECTarget :: prepare_data(int count)
 void SoftIECTarget :: get_more_data(Message **reply, Message **status)
 {
     if (input_channel) {
+        IecDriveLock guard(iec_drive);
 #if SIEC_TARGET_DEBUG > 1
         printf("Popping %d bytes.\n", input_length);
 #endif
@@ -286,6 +288,7 @@ void SoftIECTarget :: get_more_data(Message **reply, Message **status)
 void SoftIECTarget :: abort(int a)
 {
     if (input_channel) {
+        IecDriveLock guard(iec_drive);
         int bytes = (a < input_length) ? a : input_length;
 #if SIEC_TARGET_DEBUG
         printf("Pop(%d:%d)\n", bytes, a);

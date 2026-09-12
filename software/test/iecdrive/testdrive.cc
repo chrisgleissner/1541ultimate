@@ -365,10 +365,38 @@ void create_file(const char *filename, int blocks)
 }
 
 #include "blockdev_emul.h"
+#include "stream_textlog.h"
+#include <malloc.h>
+
+// The FAT file, which also tells Suite11-CR6-Lock whether a watched drive held its lock
+// when one of its entry points reached storage.
+extern IecDrive *s11_lock_watch;
+extern int s11_lock_watch_locked;
+extern int s11_lock_watch_unlocked;
+extern int iec_drive_lock_depth(IecDrive *drive) __attribute__((weak));
+class LockWatchingBlockDevice : public BlockDevice_Emulated
+{
+    void note(void)
+    {
+        if (!s11_lock_watch) {
+            return;
+        }
+        if (iec_drive_lock_depth && iec_drive_lock_depth(s11_lock_watch)) {
+            s11_lock_watch_locked++;
+        } else {
+            s11_lock_watch_unlocked++;
+        }
+    }
+public:
+    LockWatchingBlockDevice(const char *name, int sec_size) : BlockDevice_Emulated(name, sec_size) { }
+    DRESULT read(uint8_t *buf, uint32_t sector, int count) { note(); return BlockDevice_Emulated::read(buf, sector, count); }
+    DRESULT write(const uint8_t *buf, uint32_t sector, int count) { note(); return BlockDevice_Emulated::write(buf, sector, count); }
+};
+
 void init_fat_file()
 {
     create_file("format.fat", 64*1024); // 16 MB: room for the images Suite10 and Suite11 create
-    static BlockDevice_Emulated blk("format.fat", 512);
+    static LockWatchingBlockDevice blk("format.fat", 512);
     static Partition prt(&blk, 0, 0, 0);
     static FileSystemFAT fs(&prt);
     fs.format("GIDEON");
@@ -3767,6 +3795,168 @@ static void s11_si084_rel_layouts(FileManager *fm, IecDrive *dr)
     close_file(dr, 2);
 }
 
+// CR-4: a listing that is abandoned releases its directory when the channel closes, so
+// the heap is back where it was once the channel is closed. A full listing first puts
+// everything the file manager caches for the directory in place.
+static size_t s11_heap_in_use(void)
+{
+    struct mallinfo2 m = mallinfo2();
+    return m.uordblks;
+}
+
+static void s11_cr4_abandoned_listing(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-CR4-AbandonedListing";
+    s11_partition(fm, dr, "cr4");
+    expect_iec_write_ok(testname, dr, 1, "ONE", "1");
+    uint8_t listing[4096];
+    read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    size_t before = s11_heap_in_use();
+    for (int i = 0; i < 2; i++) {
+        uint8_t part[8];
+        open_file(dr, 0, "$");
+        get_status(dr);
+        expect_status_ok(testname, "$");
+        REQUIRE(read_file_limited(dr, 0, part, sizeof(part)) == sizeof(part));
+        close_file(dr, 0);
+    }
+    size_t after = s11_heap_in_use();
+    printf("%s: %d bytes in use before, %d after the channel closed\n", testname, (int)before, (int)after);
+    REQUIRE(after <= before);
+}
+
+// CR-5: a directory open that fails after an abandoned listing must not leave the channel
+// pointing at the directory it freed, which the next open would free again.
+static void s11_cr5_failed_directory_open(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-CR5-FailedDirectoryOpen";
+    s11_partition(fm, dr, "cr5");
+    expect_iec_write_ok(testname, dr, 1, "ONE", "1");
+    for (int i = 0; i < 3; i++) {
+        uint8_t part[8];
+        open_file(dr, 0, "$");
+        get_status(dr);
+        expect_status_ok(testname, "$");
+        REQUIRE(read_file_limited(dr, 0, part, sizeof(part)) == sizeof(part));
+        open_file(dr, 0, "$/NOSUCHDIR/");
+        get_status(dr);
+        printf("%s: $/NOSUCHDIR/ answered %s", testname, last_status);
+        REQUIRE(strncmp(last_status, "00,", 3) != 0);
+        close_file(dr, 0);
+    }
+    // The UCI target opens without closing first, so there the directory open itself must
+    // leave nothing dangling.
+    IecChannel *channel = dr->get_data_channel(0);
+    for (int i = 0; i < 3; i++) {
+        REQUIRE(channel->ext_open_file("$") == 1);
+        REQUIRE(channel->ext_open_file("$/NOSUCHDIR/") == 0);
+    }
+    REQUIRE(channel->ext_open_file("$") == 1);
+    channel->ext_close_file();
+    expect_directory_contains(testname, dr, "$", "\"ONE\"");
+    expect_command_response(testname, dr, "XPWD\r", "40:/");
+}
+
+// CR-6: the IEC task and the GUI task reach the same channels and partitions, so the
+// drive holds its lock whenever one of its entry points reaches storage. The FAT file
+// counts the block accesses made while a watched drive is inside an entry point without
+// its lock.
+int s11_lock_watch_unlocked = 0;
+int s11_lock_watch_locked = 0;
+IecDrive *s11_lock_watch = NULL;
+extern int iec_drive_lock_depth(IecDrive *drive) __attribute__((weak));
+
+static void s11_cr6_lock(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-CR6-Lock";
+    s11_partition(fm, dr, "cr6");
+    if (!iec_drive_lock_depth) {
+        printf("%s: the drive has no lock\n", testname);
+    }
+    REQUIRE(iec_drive_lock_depth);
+    s11_lock_watch_unlocked = 0;
+    s11_lock_watch_locked = 0;
+    s11_lock_watch = dr;
+    expect_iec_write_ok(testname, dr, 1, "LOCKED", "some data");
+    expect_iec_file(testname, dr, 0, "LOCKED", "some data");
+    expect_directory_contains(testname, dr, "$", "\"LOCKED\"");
+    expect_command_ok(testname, dr, "MD:SUB\r");
+    open_file(dr, 1, "PENDING");
+    get_status(dr);
+    uint8_t block[600];
+    memset(block, 'p', sizeof(block));
+    send_channel_data(dr, 1, block, sizeof(block));
+    dr->reset(); // the GUI's Reset closes the file
+    s11_lock_watch = NULL;
+    printf("%s: %d block accesses inside the lock, %d outside it\n", testname,
+           s11_lock_watch_locked, s11_lock_watch_unlocked);
+    REQUIRE((s11_lock_watch_unlocked == 0) && (s11_lock_watch_locked > 0));
+    REQUIRE(iec_drive_lock_depth(dr) == 0);
+    expect_command_response(testname, dr, "CP40\r", "02,PARTITION SELECTED,40,00\r");
+    expect_directory_contains(testname, dr, "$", "\"PENDING\"");
+}
+
+// CR-7: StreamTextLog::raw() with a string longer than the log keeps within the buffer.
+static void s11_cr7_text_log(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-CR7-TextLog";
+    char memory[128];
+    memset(memory, 0x55, sizeof(memory));
+    StreamTextLog log(64, memory);
+    char text[101];
+    memset(text, 'x', 100);
+    text[100] = 0;
+    log.raw("start");
+    log.raw(text);
+    int overrun = 0;
+    for (int i = 64; i < (int)sizeof(memory); i++) {
+        overrun += (memory[i] != 0x55);
+    }
+    printf("%s: %d guard bytes overwritten, %d bytes logged\n", testname, overrun, log.getLength());
+    REQUIRE(overrun == 0);
+    REQUIRE(log.getLength() <= 60);
+    log.raw("end");
+    REQUIRE(log.getLength() <= 60);
+    for (int i = 64; i < (int)sizeof(memory); i++) {
+        REQUIRE(memory[i] == 0x55);
+    }
+}
+
+// CR-8: a scratch by name is driven by the directory, so it removes every unlocked entry of
+// that name and stops, and never deletes a locked one.
+static void s11_cr8_scratch_scan(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-CR8-ScratchScan";
+    const char *image = "/Fat/s11_cr8.d64";
+    create_formatted_image(fm, image, "TWINS", 683, e_image_d64);
+    dr->add_partition(54, image, "TWINS");
+    expect_command_status_prefix(testname, dr, "CP54\r", "02,PARTITION SELECTED");
+    expect_iec_write_ok(testname, dr, 1, "TWIN", "prg");
+    expect_iec_write_ok(testname, dr, 2, "TWIN,S,W", "seq");
+    expect_iec_write_ok(testname, dr, 2, "OTHER,S,W", "other");
+    expect_command_ok(testname, dr, "L:TWIN\r"); // the first entry, the PRG
+    char type[8];
+    bool present;
+    s11_listing_type(dr, testname, "$", "TWIN", type, &present);
+    REQUIRE(present && !strcmp(type, "PRG<"));
+    const char *response = send_command(dr, "S:TWIN\r");
+    printf("%s: S:TWIN answered %s", testname, response);
+    REQUIRE(strcmp(response, "01, FILES SCRATCHED,01,00\r") == 0);
+    uint8_t listing[4096];
+    int got = read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    int twins = 0;
+    for (int offset = 32; offset + 32 <= got; offset += 32) {
+        twins += (memmem(listing + offset, 32, "\"TWIN\"", 6) != NULL);
+    }
+    s11_listing_type(dr, testname, "$", "TWIN", type, &present);
+    printf("%s: %d TWIN entries left, the first typed '%s'\n", testname, twins, type);
+    REQUIRE((twins == 1) && present && !strcmp(type, "PRG<"));
+    s11_listing_type(dr, testname, "$", "OTHER", type, &present);
+    REQUIRE(present);
+    expect_command_ok(testname, dr, "L:TWIN\r");
+    expect_command_response(testname, dr, "S:TWIN\r", "01, FILES SCRATCHED,01,00\r");
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -3823,6 +4013,11 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-SI144-ReadX00",           s11_si144_read_x00 },
     { "Suite11-SI145-WriteX00",          s11_si145_write_x00 },
     { "Suite11-SI084-RelLayouts",        s11_si084_rel_layouts },
+    { "Suite11-CR4-AbandonedListing",    s11_cr4_abandoned_listing },
+    { "Suite11-CR5-FailedDirectoryOpen", s11_cr5_failed_directory_open },
+    { "Suite11-CR6-Lock",                s11_cr6_lock },
+    { "Suite11-CR7-TextLog",             s11_cr7_text_log },
+    { "Suite11-CR8-ScratchScan",         s11_cr8_scratch_scan },
 };
 
 // Runs every case, or only those whose name contains `only`.

@@ -192,11 +192,15 @@ public:
         }
     }
 
+    // The drive's lock (CR-6), which the menu's partition list also takes.
+    IecDrive *get_drive(void) { return drive; }
+
     void add_partition(int p, const char *path, const char *name)
     {
         if (!is_valid_partition_number(p)) {
             return;
         }
+        IecDriveLock guard(drive);
         if (partitions[p]) {
             partitions[p]->SetName(name);
             partitions[p]->SetRoot(path);
@@ -210,6 +214,7 @@ public:
         if (!is_valid_partition_number(p)) {
             return;
         }
+        IecDriveLock guard(drive);
         if (partitions[p]) {
             delete partitions[p];
             partitions[p] = NULL;
