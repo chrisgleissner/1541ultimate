@@ -3906,6 +3906,104 @@ static void s11_crash_long_host_name(FileManager *fm, IecDrive *dr)
     expect_command_response(testname, dr, "UI\r", "73,U64HD ULTIMATE DOS V2.0,00,00\r");
 }
 
+// P on a file inside a disk image to a position past its end. The last sector's count of
+// bytes left went negative and was copied as a length (found by the crash review).
+static void s11_crash_seek_past_end_image(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-Crash-SeekPastEndImage";
+    create_formatted_image(fm, "/Fat/s11_seek.d64", "SEEK", 683, e_image_d64);
+    dr->add_partition(57, "/Fat/s11_seek.d64", "SEEK");
+    expect_command_status_prefix(testname, dr, "CP57\r", "02,PARTITION SELECTED");
+    char payload[101];
+    memset(payload, 'A', 100);
+    payload[100] = 0;
+    expect_iec_write_ok(testname, dr, 2, "SMALL,S,W", payload);
+    open_file(dr, 2, "SMALL,S,R");
+    get_status(dr);
+    const uint8_t p200[6] = { 'P', 2, 200, 0, 0, 0 };
+    send_command_data(dr, p200, sizeof(p200));
+    get_status(dr);
+    printf("%s: P to byte 200 of a 100 byte file answered %s", testname, last_status);
+    uint8_t back[512];
+    int got = read_file(dr, 2, back, sizeof(back));
+    printf("%s: reading on gave %d bytes\n", testname, got);
+    REQUIRE(got <= 1);
+    close_file(dr, 2);
+    expect_command_response(testname, dr, "UI\r", "73,U64HD ULTIMATE DOS V2.0,00,00\r");
+}
+
+// A listing of a disk image partition, part read, while other channels list more images
+// than the file manager keeps mounted. The first image was released under its open
+// directory (found by the crash review).
+static void s11_crash_evict_open_listing(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-Crash-EvictOpenListing";
+    char path[64], name[16], cmd[24];
+    for (int i = 0; i < 10; i++) {
+        snprintf(path, sizeof(path), "/Fat/s11_evict%d.d64", i);
+        snprintf(name, sizeof(name), "EV%d", i);
+        create_formatted_image(fm, path, name, 683, e_image_d64);
+        dr->add_partition(70 + i, path, name);
+        snprintf(cmd, sizeof(cmd), "%d:FILE%d,S,W", 70 + i, i);
+        expect_iec_write_ok(testname, dr, 2, cmd, "X");
+    }
+    open_file(dr, 0, "$70");
+    get_status(dr);
+    uint8_t part[40];
+    REQUIRE(read_file_limited(dr, 0, part, sizeof(part)) == sizeof(part));
+    uint8_t listing[4096];
+    for (int i = 1; i < 10; i++) {
+        snprintf(cmd, sizeof(cmd), "$%d", 70 + i);
+        open_file(dr, 2, cmd);
+        get_status(dr);
+        read_file(dr, 2, listing, sizeof(listing));
+        close_file(dr, 2);
+    }
+    memset(listing, 0, sizeof(listing));
+    int got = read_file(dr, 0, listing, sizeof(listing));
+    printf("%s: the first listing went on for %d more bytes\n", testname, got);
+    close_file(dr, 0);
+    REQUIRE(memmem(listing, got, "BLOCKS FREE.", 12) != NULL);
+}
+
+// A copy that names a source in a partition that does not exist left the target open and
+// its 32 KB copy buffer allocated, every time.
+static void s11_crash_copy_missing_partition(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-Crash-CopyMissingPartition";
+    s11_partition(fm, dr, "copyleak");
+    expect_iec_write_ok(testname, dr, 2, "SRC,S,W", "source");
+    expect_command_status_prefix(testname, dr, "C:WARM=SRC,200:X\r", "77,");
+    size_t before = s11_heap_in_use();
+    char cmd[32];
+    for (int i = 0; i < 20; i++) {
+        snprintf(cmd, sizeof(cmd), "C:N%d=SRC,200:X\r", i);
+        expect_command_status_prefix(testname, dr, cmd, "77,");
+    }
+    size_t after = s11_heap_in_use();
+    printf("%s: %d bytes in use before 20 copies, %d after\n", testname, (int)before, (int)after);
+    REQUIRE(after < before + 32768);
+}
+
+// An open through the UCI target on a channel that is already open, without a close in
+// between, as a client that sends LOAD_SU twice does. The first file stayed open.
+static void s11_crash_uci_reopen(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-Crash-UciReopen";
+    s11_partition(fm, dr, "ucireopen");
+    expect_iec_write_ok(testname, dr, 1, "PROG", "program");
+    IecChannel *channel = dr->get_data_channel(0);
+    channel->ext_open_file("PROG"); // one file open, as there is after every open
+    size_t before = s11_heap_in_use();
+    for (int i = 0; i < 20; i++) {
+        channel->ext_open_file("PROG");
+    }
+    size_t after = s11_heap_in_use();
+    channel->ext_close_file();
+    printf("%s: %d bytes in use with one open, %d after 20 more\n", testname, (int)before, (int)after);
+    REQUIRE(after < before + 1024);
+}
+
 // A record positioned past its last byte: the channel offered a negative number of
 // bytes, which the UCI target passes on as a length to copy (found by Suite11-Soak).
 static void s11_crash_record_past_end(FileManager *fm, IecDrive *dr)
@@ -4420,6 +4518,10 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-Crash-DamagedChain",      s11_crash_damaged_chain },
     { "Suite11-Crash-LongHostName",      s11_crash_long_host_name },
     { "Suite11-Crash-RecordPastEnd",     s11_crash_record_past_end },
+    { "Suite11-Crash-SeekPastEndImage",  s11_crash_seek_past_end_image },
+    { "Suite11-Crash-EvictOpenListing",  s11_crash_evict_open_listing },
+    { "Suite11-Crash-CopyMissingPartition", s11_crash_copy_missing_partition },
+    { "Suite11-Crash-UciReopen",         s11_crash_uci_reopen },
     { "Suite11-ShortCommands",           s11_short_commands },
     { "Suite11-Soak",                    s11_soak },
 };

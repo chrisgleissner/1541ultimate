@@ -2229,6 +2229,9 @@ FRESULT FileInCBM::read_linear(uint8_t *dst, int len, uint32_t& tr)
             return FR_DISK_ERR;
         }
         bytes_left = (1 + (int)fs->sect_buffer[1]) - offset_in_sector;
+        if (bytes_left < 0) { // positioned past the end of the file
+            bytes_left = 0;
+        }
     }
 
     // determine number of bytes to transfer now

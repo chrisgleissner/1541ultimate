@@ -75,56 +75,56 @@ static char get_escaped_char(const char *&p, bool &escape)
     return ret;
 }
 
+// * matches any run of characters, including none, and ? any one character. The last *
+// takes one more character each time the rest of the pattern fails, which takes time
+// proportional to the product of the two lengths; the recursion this replaces took time
+// exponential in the number of stars, which one command from the IEC bus can send. The
+// recursion also matched a fixed string that ended where the pattern had a *, whatever
+// followed it, so S:FOO*X scratched FOO.
 bool pattern_match(const char *pattern, const char *fixed, bool case_sensitive)
 {
-    const char *p;
-    const char *f;
+    const char *p = pattern;
+    const char *f = fixed;
+    const char *star_p = NULL; // the pattern after the last *
+    const char *star_f = NULL; // where in the fixed string that was last tried
     char cp, cf;
 
-    p = pattern;
-    f = fixed;
-    do {
-        if(!(*p)) { // end of pattern
-            return (*f == '\0'); // if the fixed is also at the end, we have a match,
-                                 // if not, then our pattern is too short and we don't match
-        }
-        if(!(*f)) { // end of fixed string
-            if(*p == '*') // check special case foo* == foo.
+    while(true) {
+        if(!(*f)) { // end of fixed string: what is left of the pattern may only be stars
+            while(*p == '*')
+                p++;
+            if(!(*p))
                 return true;
-            else
-                return false; // our pattern string was longer
-        }
-        if(*p == '*') {
+        } else if(*p == '*') {
             p++; // skip the * and set pointer to next character
             if(!(*p)) // end of our pattern, so we have a match
                 return true;
-
-            // now, recurse and try to find the pattern AFTER the * in the fixed string
-            while(*f) {
-                bool match = pattern_match(p, f, case_sensitive);
-                if(match)
-                    return true;
-                f++;
-            }
-            return false;
-        } else if(*p == '?') {
-            // assume equality; continue
+            star_p = p;
+            star_f = f;
+            continue;
         } else {
-    		if(!case_sensitive) {
-    			cp = toupper(*p);
-    			cf = toupper(*f);
+            if(*p == '?') {
+                cp = cf = 0; // assume equality
+            } else if(!case_sensitive) {
+                cp = toupper(*p);
+                cf = toupper(*f);
             } else {
                 cp = *p;
                 cf = *f;
             }
-            if(cf != cp)
-                return false; // two character inequal
-        } 
-        f++;
-        p++;
-    } while(true);
-        
-	return false; // never gets here.
+            if(cf == cp) {
+                f++;
+                p++;
+                continue;
+            }
+        }
+        // No match from here: let the last * take one more character of the fixed string.
+        if(!star_p || !(*star_f))
+            return false;
+        star_f++;
+        p = star_p;
+        f = star_f;
+    }
 }
 
 bool pattern_match_escaped(const char *pattern, const char *fixed, bool case_sensitive, bool p_esc, bool f_esc)

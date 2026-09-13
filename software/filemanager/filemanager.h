@@ -93,6 +93,7 @@ class FileManager
 #endif
 	IndexedList<MountPoint *>mount_points;
     IndexedList<File *>open_file_list;
+    IndexedList<FileSystem *>open_directory_fs; // one entry per directory open_directory() handed out
 	IndexedList<ManagedTempEntry *>managed_temp_entries;
 	uint32_t next_temp_seq;
 	bool temp_auto_cleanup_enabled;
@@ -102,7 +103,7 @@ class FileManager
 	CachedTreeNode *root;
 	FileSystem *rootfs;
 
-    FileManager() : mount_points(8, NULL), open_file_list(16, NULL), managed_temp_entries(16, NULL), next_temp_seq(0), mount_use_seq(0), temp_auto_cleanup_enabled(true), temp_use_cache_subfolder_enabled(true), /*used_paths(8, NULL), */observers(4, NULL) {
+    FileManager() : mount_points(8, NULL), open_file_list(16, NULL), open_directory_fs(4, NULL), managed_temp_entries(16, NULL), next_temp_seq(0), mount_use_seq(0), temp_auto_cleanup_enabled(true), temp_use_cache_subfolder_enabled(true), /*used_paths(8, NULL), */observers(4, NULL) {
         root = new CachedTreeNode(NULL, "RootNode");
         root->get_file_info()->attrib = AM_DIR;
         rootfs = new FileSystem_Root(root);
@@ -150,6 +151,7 @@ class FileManager
 	void enforce_temp_limits(void);
 
 //	friend class FileDirEntry;
+    friend class ManagedDirectory;
 
     void lock() {
 #ifdef OS

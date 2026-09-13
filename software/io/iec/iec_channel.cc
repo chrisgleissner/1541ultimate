@@ -1642,6 +1642,7 @@ int IecChannel::close_file(void) // file should be open
 
 int IecChannel::ext_open_file(const char *name)
 {
+    close_file(); // as an OPEN from the bus closes what the channel had open
     strncpy((char *) buffer, name, 255);
     buffer[255] = 0;
     pointer = strlen((char *) buffer);
@@ -2068,7 +2069,13 @@ int IecCommandChannel::do_copy(filename_t& dest, filename_t sources[], int n)
             fres = fm->fopen(frompath, FA_READ, &fi);
         }
         if (fres != FR_OK) {
-            GETPARTITION(sources[i].partition, partition, 0);
+            // Not GETPARTITION(), whose return would leave the target open and the copy
+            // buffer allocated.
+            IecPartition *partition = drive->vfs->GetPartition(sources[i].partition);
+            if (!partition) {
+                set_error(ERR_PARTITION_ERROR, drive->vfs->GetTargetPartitionNumber(sources[i].partition));
+                break;
+            }
             fres = open_by_rendered_iec_name(fm, partition, sources[i], e_any,
                                              FA_READ, &fi, work);
             frompath = work.c_str();

@@ -534,9 +534,107 @@ void test_log_formatters(void)
     test_log_truncation();
 }
 
+// The recursive pattern_match() the iterative one replaced, as the reference its results
+// are compared with, with the one defect corrected: at the end of the fixed string only
+// stars may be left of the pattern, where the recursion accepted anything after a star.
+static bool reference_pattern_match(const char *p, const char *f, bool case_sensitive)
+{
+    do {
+        if (!(*f)) {
+            while (*p == '*') {
+                p++;
+            }
+            return (*p == '\0');
+        }
+        if (!(*p)) {
+            return false;
+        }
+        if (*p == '*') {
+            p++;
+            if (!(*p)) {
+                return true;
+            }
+            while (*f) {
+                if (reference_pattern_match(p, f, case_sensitive)) {
+                    return true;
+                }
+                f++;
+            }
+            return false;
+        } else if (*p != '?') {
+            char cp = case_sensitive ? *p : toupper(*p);
+            char cf = case_sensitive ? *f : toupper(*f);
+            if (cf != cp) {
+                return false;
+            }
+        }
+        f++;
+        p++;
+    } while (true);
+}
+
+static int build_string(char *out, const char *alphabet, int base, int length, int index)
+{
+    for (int i = 0; i < length; i++) {
+        out[i] = alphabet[index % base];
+        index /= base;
+    }
+    out[length] = 0;
+    return length;
+}
+
+// Every pattern of up to five characters from A, b, * and ? against every name of up to
+// five characters from a and B, both case modes, gives the reference's answer; and a
+// pattern of forty stars that does not match returns at once, where the recursion took
+// time exponential in the number of stars.
+void test_pattern_match(void)
+{
+    char pattern[8], fixed[8];
+    int compared = 0;
+    for (int plen = 0; plen <= 5; plen++) {
+        int pcount = 1;
+        for (int i = 0; i < plen; i++) pcount *= 4;
+        for (int pi = 0; pi < pcount; pi++) {
+            build_string(pattern, "Ab*?", 4, plen, pi);
+            for (int flen = 0; flen <= 5; flen++) {
+                for (int fi = 0; fi < (1 << flen); fi++) {
+                    build_string(fixed, "aB", 2, flen, fi);
+                    for (int cs = 0; cs < 2; cs++) {
+                        bool want = reference_pattern_match(pattern, fixed, cs);
+                        if (pattern_match(pattern, fixed, cs) != want) {
+                            printf("pattern_match('%s', '%s', %d) differs from the reference, which says %d\n",
+                                   pattern, fixed, cs, want);
+                            failures++;
+                            return;
+                        }
+                        compared++;
+                    }
+                }
+            }
+        }
+    }
+    // The defect the recursion had: a name that ends where the pattern has a star.
+    if (pattern_match("FOO*X", "FOO", false) || !pattern_match("FOO*", "FOO", false) ||
+        pattern_match("*.D64", "", false) || !pattern_match("*", "", false)) {
+        printf("FOO*X matched FOO, FOO* did not match FOO, *.D64 matched nothing or * did not\n");
+        failures++;
+        return;
+    }
+    char stars[64];
+    memset(stars, '*', 40);
+    strcpy(stars + 40, "Q");
+    if (pattern_match(stars, "ABCDEFGHIJKLMNOP", false) || !pattern_match(stars, "ABCDEFGHIJKLMNOQ", false)) {
+        printf("forty stars and Q matched wrongly\n");
+        failures++;
+        return;
+    }
+    printf("Pattern match: %d comparisons with the reference, forty stars => OK!\n", compared);
+}
+
 int main(int argc, const char *argv[])
 {
     test_log_formatters();
+    test_pattern_match();
 
     open_t o;
     d_parse_open("JUSTFILE", o,     0,
