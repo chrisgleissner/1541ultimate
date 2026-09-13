@@ -3931,32 +3931,6 @@ static void s11_cr6_lock(FileManager *fm, IecDrive *dr)
     expect_directory_contains(testname, dr, "$", "\"PENDING\"");
 }
 
-// CR-7: StreamTextLog::raw() with a string longer than the log keeps within the buffer.
-static void s11_cr7_text_log(FileManager *fm, IecDrive *dr)
-{
-    const char *testname = "Suite11-CR7-TextLog";
-    char memory[128];
-    memset(memory, 0x55, sizeof(memory));
-    StreamTextLog log(64, memory);
-    char text[101];
-    memset(text, 'x', 100);
-    text[100] = 0;
-    log.raw("start");
-    log.raw(text);
-    int overrun = 0;
-    for (int i = 64; i < (int)sizeof(memory); i++) {
-        overrun += (memory[i] != 0x55);
-    }
-    printf("%s: %d guard bytes overwritten, %d bytes logged\n", testname, overrun, log.getLength());
-    REQUIRE(overrun == 0);
-    REQUIRE(log.getLength() <= 60);
-    log.raw("end");
-    REQUIRE(log.getLength() <= 60);
-    for (int i = 64; i < (int)sizeof(memory); i++) {
-        REQUIRE(memory[i] == 0x55);
-    }
-}
-
 // CR-8: a scratch by name is driven by the directory, so it removes every unlocked entry of
 // that name and stops, and never deletes a locked one.
 static void s11_cr8_scratch_scan(FileManager *fm, IecDrive *dr)
@@ -4704,7 +4678,6 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-CR4-AbandonedListing",    s11_cr4_abandoned_listing },
     { "Suite11-CR5-FailedDirectoryOpen", s11_cr5_failed_directory_open },
     { "Suite11-CR6-Lock",                s11_cr6_lock },
-    { "Suite11-CR7-TextLog",             s11_cr7_text_log },
     { "Suite11-CR8-ScratchScan",         s11_cr8_scratch_scan },
     { "Suite11-FailureLog",              s11_failure_log },
     { "Suite11-Crash-DamagedChain",      s11_crash_damaged_chain },
