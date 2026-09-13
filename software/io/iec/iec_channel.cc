@@ -25,7 +25,6 @@ bool IecChannel::drive_failed(void)
 // so two lines cannot be built at once.
 void IecChannel::log_failure(const char *what, const uint8_t *payload, int len)
 {
-    static char hex[SOFTIEC_LOG_HEX_SIZE];
     static char txt[SOFTIEC_LOG_TEXT_SIZE];
     static char err[80];
 
@@ -41,14 +40,13 @@ void IecChannel::log_failure(const char *what, const uint8_t *payload, int len)
     err[n] = 0;
 
     if (payload) {
-        softiec_log_hex(payload, len, hex, sizeof(hex));
         softiec_log_text(payload, len, txt, sizeof(txt));
         if (channel == 15) {
-            printf(SOFTIEC_LOG_PREFIX "%s dev=%d len=%d hex=[%s] txt=\"%s\" -> %s\n",
-                   what, (int)drive->get_address(), len, hex, txt, err);
+            printf(SOFTIEC_LOG_PREFIX "%s dev=%d len=%d txt=\"%s\" -> %s\n",
+                   what, (int)drive->get_address(), len, txt, err);
         } else {
-            printf(SOFTIEC_LOG_PREFIX "%s dev=%d chan=%d len=%d hex=[%s] txt=\"%s\" -> %s\n",
-                   what, (int)drive->get_address(), channel, len, hex, txt, err);
+            printf(SOFTIEC_LOG_PREFIX "%s dev=%d chan=%d len=%d txt=\"%s\" -> %s\n",
+                   what, (int)drive->get_address(), channel, len, txt, err);
         }
     } else {
         printf(SOFTIEC_LOG_PREFIX "%s dev=%d chan=%d -> %s\n", what, (int)drive->get_address(), channel, err);
@@ -794,7 +792,7 @@ FRESULT resolve_directory_path(FileManager *fm, IecPartition *partition,
             continue;
         } 
 
-        petscii_to_fat(component, fat_component, sizeof(fat_component) - 1);
+        petscii_to_fat(component, fat_component, 52);
         // printf("Fat component: %s\n", fat_component);
         direct_component = fat_component;
 
@@ -878,7 +876,7 @@ static FRESULT resolve_directory_target(FileManager *fm, IecPartition *partition
     }
 
     char fatname[52];
-    petscii_to_fat(name.filename.c_str(), fatname, sizeof(fatname) - 1);
+    petscii_to_fat(name.filename.c_str(), fatname, 52);
 
     Path direct_relative(relative_path.c_str());
     if (!name.has_wildcard && direct_relative.cd(fatname)) {
@@ -1191,7 +1189,7 @@ int IecChannel :: setup_directory_read()
     }
 
     GETPARTITION(name_to_open.file.partition, partition, -1);
-    petscii_to_fat(name_to_open.file.filename.c_str(), fatname, sizeof(fatname) - 1);
+    petscii_to_fat(name_to_open.file.filename.c_str(), fatname, 48);
 
     mstring work;
     mstring relative;
@@ -1771,7 +1769,7 @@ const char *IecChannel :: ConstructPath(mstring& work, filename_t& name, filetyp
 
     GETPARTITION(name.partition, partition, NULL);
     char fatname[52];
-    petscii_to_fat(name.filename.c_str(), fatname, sizeof(fatname) - 1);
+    petscii_to_fat(name.filename.c_str(), fatname, 52);
     // printf("After petscii_to_fat: '%s'\n", fatname);
     const char *ext = types[(int)ftype];
     if (((acc == e_read) || (ftype != e_any)) && // for reads, .??? is allowed, but for writes it is not
@@ -2119,7 +2117,7 @@ int IecCommandChannel::do_format(filename_t& dest, const char *id)
     }
 
     char host[52];
-    petscii_to_fat(name, host, sizeof(host) - 1);
+    petscii_to_fat(name, host, sizeof(host));
     mstring full(dir.c_str());
     append_path_component(full, host);
 

@@ -3660,7 +3660,7 @@ static void s11_failure_log(FileManager *fm, IecDrive *dr)
     send_command(dr, "ZZ\r");
     log_capture_end(saved_fd, sink);
     expect_log_line(testname, "failed command",
-                    "SoftIEC: command failed dev=11 len=3 hex=[5A 5A 0D] txt=\"ZZ\\r\" -> 31,SYNTAX ERROR,00,00");
+                    "SoftIEC: command failed dev=11 len=3 txt=\"ZZ\\r\" -> 31,SYNTAX ERROR,00,00");
     REQUIRE(count_log_lines() == 1);
 
     // An open that fails is logged with the name as the bus delivered it.
@@ -3670,21 +3670,20 @@ static void s11_failure_log(FileManager *fm, IecDrive *dr)
     close_file(dr, 3);
     log_capture_end(saved_fd, sink);
     expect_log_line(testname, "failed open",
-                    "SoftIEC: open failed dev=11 chan=3 len=12 hex=[39 3A 4E 4F 53 55 43 48 2C 53 2C 52] "
-                    "txt=\"9:NOSUCH,S,R\" -> 62,FILE NOT FOUND,00,00");
+                    "SoftIEC: open failed dev=11 chan=3 len=12 txt=\"9:NOSUCH,S,R\" -> 62,FILE NOT FOUND,00,00");
     REQUIRE(count_log_lines() == 1);
 
     // SI-152: a command longer than the rendering reports its real length, and the
     // rendering says where it was cut.
     char long_cmd[201];
-    memset(long_cmd, ' ', 200);
+    memset(long_cmd, 0x01, 200); // four characters each in the rendering
     memcpy(long_cmd, "ZZ", 2);
     long_cmd[200] = 0;
     log_capture_begin(saved_fd, sink);
     send_command(dr, long_cmd);
     log_capture_end(saved_fd, sink);
     expect_log_line(testname, "long command length", "SoftIEC: command failed dev=11 len=200 ");
-    expect_log_line(testname, "long command cut", "20 20 20..] txt=");
+    expect_log_line(testname, "long command cut", "\\x01..\" -> 31");
 
 }
 

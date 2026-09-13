@@ -449,10 +449,7 @@ void petscii_to_fat(const char *pet, char *fat, int maxlen)
         if ((p < 32) || (p >= 96) || (p == ':') || (p == '/') || (p == '\\') || (p == '*') || (p == '\x22') ||
             (p == '<') || (p == '>') || (p == '?') || (first && p == '.')) { // '|' > 96 ;)
 
-            // sd2iec's guards, which keep one byte more than this function used to
-            // (SI-142): the result, with a closing brace, can take maxlen bytes plus
-            // the terminator.
-            if ((i + 4) > maxlen) {
+            if ((i + 4) >= maxlen) {
                 break;
             }
             if (!escape) {
@@ -462,7 +459,7 @@ void petscii_to_fat(const char *pet, char *fat, int maxlen)
             fat[i++] = hex[((uint8_t)p) >> 4];
             fat[i++] = hex[p & 15];
         } else {
-            if ((i + 2) > maxlen) {
+            if ((i + 2) >= maxlen) {
                 break;
             }
             if (escape) {
@@ -479,7 +476,7 @@ void petscii_to_fat(const char *pet, char *fat, int maxlen)
     }
     fat[i] = 0;
 
-    if ((strlen(fat) > 3) && (i + 2 <= maxlen)) {
+    if ((strlen(fat) > 3) && (i + 3 <= maxlen)) { // the braces and the terminator fit
         char *ext = fat + strlen(fat) - 4;
         if (!strcasecmp(ext, ".prg") || !strcasecmp(ext, ".seq") || !strcasecmp(ext, ".usr") || !strcasecmp(ext, ".rel")) {
             strcat(fat, "{}");

@@ -8,9 +8,9 @@
  * a special build. Logging only failures keeps it off the path of every successful
  * command, open and byte.
  *
- * The two formatters below take an explicit length and never treat IEC data as a C
- * string, so an embedded zero, a carriage return and a shifted PETSCII character all
- * survive into the log and stay distinguishable from each other.
+ * The formatter below takes an explicit length and never treats IEC data as a C string,
+ * so an embedded zero, a carriage return and a shifted PETSCII character all survive
+ * into the log and stay distinguishable from each other.
  */
 #ifndef IEC_LOG_H
 #define IEC_LOG_H
@@ -25,49 +25,17 @@
 // marked with "..", and the line still reports the real length (SI-152).
 #define SOFTIEC_LOG_MAX_BYTES 64
 
-// Room a caller has to provide for the two renderings of SOFTIEC_LOG_MAX_BYTES.
-#define SOFTIEC_LOG_HEX_SIZE  (3 * SOFTIEC_LOG_MAX_BYTES + 4)
+// Room a caller has to provide for the rendering of SOFTIEC_LOG_MAX_BYTES.
 #define SOFTIEC_LOG_TEXT_SIZE (4 * SOFTIEC_LOG_MAX_BYTES + 4)
 
 static const char softiec_log_digits[] = "0123456789ABCDEF";
 
-// Renders len bytes as two upper case hex digits each, separated by single spaces.
-// Writes at most out_size - 1 characters and always terminates. A rendering that did
-// not fit ends in ".." so a reader can tell a short line from a short payload.
-// Returns the number of characters written, not counting the terminator.
-static inline int softiec_log_hex(const uint8_t *data, int len, char *out, int out_size)
-{
-    int w = 0;
-    if (!out || (out_size < 1)) {
-        return 0;
-    }
-    out[0] = 0;
-    if (!data || (len < 0)) {
-        return 0;
-    }
-    for (int i = 0; i < len; i++) {
-        int need = (w ? 3 : 2);
-        if ((w + need) >= (out_size - 2)) { // keep room for ".." and the terminator
-            if ((w + 2) < out_size) {
-                out[w++] = '.';
-                out[w++] = '.';
-            }
-            break;
-        }
-        if (w) {
-            out[w++] = ' ';
-        }
-        out[w++] = softiec_log_digits[(data[i] >> 4) & 15];
-        out[w++] = softiec_log_digits[data[i] & 15];
-    }
-    out[w] = 0;
-    return w;
-}
-
 // Renders len bytes as readable text. A printable ASCII byte stands for itself; a
 // carriage return, a line feed and a zero get the usual short escapes, and every
 // other byte, which includes shifted PETSCII and binary parameters, is written as
-// \xNN. Same truncation rule and return value as softiec_log_hex().
+// \xNN. Writes at most out_size - 1 characters and always terminates. A rendering that
+// did not fit ends in ".." so a reader can tell a short line from a short payload.
+// Returns the number of characters written, not counting the terminator.
 static inline int softiec_log_text(const uint8_t *data, int len, char *out, int out_size)
 {
     int w = 0;

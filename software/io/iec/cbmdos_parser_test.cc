@@ -361,7 +361,8 @@ void test_md_rd_grammar(void)
 
 // SI-147 and SI-142: the PETSCII to host name mapping shared with sd2iec's extension mode
 // 5. A trailing run of shifted spaces is padding and is dropped; a shifted space inside a
-// name is escaped; * and ? are escaped; and the length guard is sd2iec's. This suite is
+// name is escaped; * and ? are escaped; and the braces a type extension gets stay inside the
+// buffer. This suite is
 // also built with -funsigned-char (target/pc/linux/parse_unsigned), because the shifted
 // space rule depended on the signedness of char.
 static void check_fat_name(const char *what, const char *pet, int maxlen, const char *expected)
@@ -393,10 +394,11 @@ void test_name_mapping(void)
     check_fat_name("A+$A0$A0+B", interior_run, 51, "A{A0A0}B");
     check_fat_name("star", "FOO*", 51, "FOO{2A}");
     check_fat_name("question mark", "WHAT?", 51, "WHAT{3F}");
-    // sd2iec stops when (i + 2) > maxlen for a plain byte and (i + 4) > maxlen for an
-    // escaped one; this firmware stopped one byte earlier.
-    check_fat_name("plain length guard", "ABCDEFGHIJKLMNOP", 12, "ABCDEFGHIJK");
-    check_fat_name("escaped length guard", "A\xC1\xC2\xC3\xC4\xC5\xC6", 12, "A{C1C2C3C4}");
+    // A name that fills the buffer and ends in .PRG gets no braces, which would not fit:
+    // with a 48 byte buffer, 46 characters and the terminator are all there is room for.
+    check_fat_name("braces bound", "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOP.PRG", 48,
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOP.PRG");
+    check_fat_name("braces", "GAME.PRG", 48, "GAME.PRG{}");
 }
 
 // SI-076: L toggles the lock of one entry.
@@ -467,25 +469,19 @@ void test_error_codes(void)
     d_parse_open("@345:", o, 34);
 }
 
-// The byte formatters of the Software IEC failure log. They take a length and
+// The byte formatter of the Software IEC failure log. It takes a length and
 // must never read the payload as a string, because an IEC payload can carry an
 // embedded zero, a carriage return that is a parameter rather than a terminator, and
 // shifted PETSCII bytes above 0x7F.
-void test_log_render(const char *what, const uint8_t *data, int len,
-                       const char *exp_hex, const char *exp_text)
+void test_log_render(const char *what, const uint8_t *data, int len, const char *exp_text)
 {
-    char hex[SOFTIEC_LOG_HEX_SIZE];
     char txt[SOFTIEC_LOG_TEXT_SIZE];
-    int hex_len = softiec_log_hex(data, len, hex, sizeof(hex));
     int txt_len = softiec_log_text(data, len, txt, sizeof(txt));
-    bool ok = (strcmp(hex, exp_hex) == 0) && (strcmp(txt, exp_text) == 0) &&
-              (hex_len == (int)strlen(exp_hex)) && (txt_len == (int)strlen(exp_text));
-    if (ok) {
+    if ((strcmp(txt, exp_text) == 0) && (txt_len == (int)strlen(exp_text))) {
         printf("Log %s => OK!\n", what);
         return;
     }
-    printf("Log %s rendered [%s] \"%s\", expected [%s] \"%s\"\n",
-           what, hex, txt, exp_hex, exp_text);
+    printf("Log %s rendered \"%s\", expected \"%s\"\n", what, txt, exp_text);
     failures++;
 }
 
@@ -493,40 +489,36 @@ void test_log_render(const char *what, const uint8_t *data, int len,
 void test_log_truncation(void)
 {
     const uint8_t data[] = { 0x41, 0x42, 0x43, 0x44 };
-    char hex[8];
     char txt[6];
-    softiec_log_hex(data, 4, hex, sizeof(hex));
     softiec_log_text(data, 4, txt, sizeof(txt));
-    if ((strcmp(hex, "41 42..") == 0) && (strcmp(txt, "ABC..") == 0)) {
+    if (strcmp(txt, "ABC..") == 0) {
         printf("Log truncation => OK!\n");
         return;
     }
-    printf("Log truncation rendered [%s] \"%s\", expected [41 42..] \"ABC..\"\n", hex, txt);
+    printf("Log truncation rendered \"%s\", expected \"ABC..\"\n", txt);
     failures++;
 }
 
 void test_log_formatters(void)
 {
     const uint8_t empty[1] = { 0 };
-    test_log_render("empty payload", empty, 0, "", "");
+    test_log_render("empty payload", empty, 0, "");
 
     // The command that started #881: C, shifted P, and partition 13 as a byte.
     const uint8_t change_partition[] = { 'C', 0xD0, 0x0D };
-    test_log_render("binary change partition", change_partition, 3,
-                      "43 D0 0D", "C\\xD0\\r");
+    test_log_render("binary change partition", change_partition, 3, "C\\xD0\\r");
 
     // A text command with the carriage return PRINT# appends behind it.
     const uint8_t text_command[] = { 'G', '-', 'P', 0x0D };
-    test_log_render("text command with terminator", text_command, 4,
-                      "47 2D 50 0D", "G-P\\r");
+    test_log_render("text command with terminator", text_command, 4, "G-P\\r");
 
     // An embedded zero is a payload byte here, not the end of the payload.
     const uint8_t with_zero[] = { 'A', 0x00, 'B' };
-    test_log_render("embedded zero", with_zero, 3, "41 00 42", "A\\0B");
+    test_log_render("embedded zero", with_zero, 3, "A\\0B");
 
     // Quotes and backslashes have to survive the quoted rendering.
     const uint8_t quoting[] = { '"', '\\', 0x0A };
-    test_log_render("quoting", quoting, 3, "22 5C 0A", "\\\"\\\\\\n");
+    test_log_render("quoting", quoting, 3, "\\\"\\\\\\n");
 
     test_log_truncation();
 }
