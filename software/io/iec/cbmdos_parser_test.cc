@@ -211,6 +211,13 @@ void test_block_command_forms(void)
     // which of the two it uses from the state of the channel.
     test_dispatch("P\x02\x01\x00\x01", 5, 0, "set position", 2, 0x10001, 1, 1);
     test_dispatch("P\x62\x01\x00\x01", 5, 0, "set position", 0x62, 0x10001, 1, 1);
+    // A record number without an offset, sent without a terminator, as a machine language
+    // caller sends it: the 1541 ROM takes the record from both bytes.
+    test_dispatch("P\x62\x05\x01", 4, 0, "set position", 0x62, 0x105, 0x105, 0);
+    // The documented BASIC form with one position byte: the carriage return behind it is
+    // not the next byte of the position (GSD "Positioning (seeking) Within a File"). A
+    // relative file would read it as the record's high byte, as the ROM does.
+    test_dispatch("P\x02\x64\r", 4, 0, "set position", 2, 100, 0xD64, 0);
 }
 
 // What happens to the carriage return BASIC's PRINT# appends, and to the commands
@@ -223,8 +230,8 @@ void test_block_command_forms(void)
 // last parameter is mandatory, so it keeps a parameter of 13.
 void test_command_terminator(void)
 {
-    // An empty command line is not a command.
-    test_dispatch("\r", 1, 0, NULL);
+    // A lone carriage return is not a command the drive knows: 31, as the ROM answers.
+    test_dispatch("\r", 1, 31, NULL);
 
     // C<shift-P> selects a partition by a byte, so 13 is a partition number whether
     // or not a terminator followed it. This is the regression reported against the
@@ -258,8 +265,8 @@ void test_command_terminator(void)
     // parameter byte is data (SI-018, SD parse_position() restores the length from
     // before the strip): an offset of 13 arrives with or without a terminator, and a
     // terminator behind the parameters is ignored.
-    test_dispatch("P\x02\x0A\x00\x0D\x0D", 6, 0, "set position", 2, 0xD0D000A, 10, 13);
-    test_dispatch("P\x02\x0A\x00\x0D", 5, 0, "set position", 2, 0xD000A, 10, 13);
+    test_dispatch("P\x02\x0A\x00\x0D\x0D", 6, 0, "set position", 2, 0xD000A, 10, 13);
+    test_dispatch("P\x02\x0A\x00\x0D", 5, 0, "set position", 2, 0xA, 10, 13);
 
     // A command whose parameters are text loses the terminator rather than reading
     // it as a value.
@@ -342,7 +349,11 @@ void test_command_length_and_terminator(void)
     test_dispatch(cmd, 254, 32, NULL);
     test_dispatch(cmd, 255, 32, NULL);
 
-    test_dispatch("B-P:2,144\rX", 11, 0, "buffer position", 2, 144);
+    test_dispatch("B-P:2,144\r\n", 11, 0, "buffer position", 2, 144);
+    // Only a carriage return and a line feed end a command early: a 13 second to last is a
+    // binary parameter, here the high byte of an M-R address, and the count behind it
+    // stays.
+    test_dispatch("M-R\x00\x0D\x05", 6, 0, "command response", 5);
 }
 
 // SI-060 and SI-063: MD requires a colon and refuses a name that is a shifted space;

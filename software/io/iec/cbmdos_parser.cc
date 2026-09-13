@@ -492,30 +492,26 @@ int IecParser :: format_command(const uint8_t *buffer, int len)
     return exec->do_format(dest, id);
 }
 
-int IecParser :: position_command(const uint8_t *buffer, int len)
+// P+CHR$(ch)+CHR$(lo)[+CHR$(hi)[+CHR$(offset)]] for a relative file, and up to four
+// position bytes for any other file (SD README). The record number and offset are read
+// from the command as sent, len, because a 13 in the offset's place is the offset
+// (SI-018, 1541 ROM $E23E). The position is read from the command without its terminator,
+// stripped_len, so a position of fewer than four bytes from BASIC does not take the
+// carriage return PRINT# appends as its next byte.
+int IecParser :: position_command(const uint8_t *buffer, int len, int stripped_len)
 {
     uint32_t pos = 0;
     int chan = (int)buffer[1];
-    len -= 2; buffer += 2;
+    len -= 2; stripped_len -= 2; buffer += 2;
 
     if (len < 1) {
         return ERR_SYNTAX;
     }
-    // The length is the one from before the terminator was stripped (SI-018), so what
-    // follows four parameter bytes, which from BASIC is the terminator, is ignored, as
-    // SD parse_position() ignores it.
-    if (len > 4) {
-        len = 4;
-    }
-    for(int i=0; i<len; i++) {
+    for(int i=0; (i < stripped_len) && (i < 4); i++) {
         pos |= ((uint32_t)buffer[i]) << (8*i);
     }
-    int recnr = 0;
-    int recoffset = 0;
-    if (len >= 3) {
-        recnr = (int)(pos & 0xFFFF);
-        recoffset = (int)buffer[2];
-    }
+    int recnr = buffer[0] | ((len >= 2) ? (buffer[1] << 8) : 0);
+    int recoffset = (len >= 3) ? buffer[2] : 0;
     return exec->do_set_position(chan, pos, recnr, recoffset);
 }
 
@@ -750,8 +746,10 @@ int IecParser :: extended_command(const uint8_t *buffer, int len)
 // ambiguity wherever the last parameter is optional, and its manual answers it by
 // telling programmers to send the terminator themselves when they want partition 13.
 //
-// The ROM also ends a command at a carriage return second to last, dropping it and the
-// byte behind it (SI-016).
+// BASIC's PRINT# to a logical file number of 128 or more ends a line with a carriage
+// return and a line feed (C64 ROM $AAD7), and both are dropped. The ROM also ends a
+// command at any carriage return second to last (SI-016), but that would cut a binary
+// parameter of 13 short, which the reporter of #877 asked not to reproduce.
 static int strip_terminator(const uint8_t *buffer, int len)
 {
     if ((len > 1) && (buffer[0] == 'C') && (buffer[1] == 0xD0)) {
@@ -760,7 +758,7 @@ static int strip_terminator(const uint8_t *buffer, int len)
     if (len && (buffer[len - 1] == 0x0D)) {
         return len - 1;
     }
-    if ((len > 2) && (buffer[len - 2] == 0x0D)) {
+    if ((len > 2) && (buffer[len - 2] == 0x0D) && (buffer[len - 1] == 0x0A)) {
         return len - 2;
     }
     return len;
@@ -773,8 +771,8 @@ int IecParser :: execute_command(const uint8_t *buffer, int len)
     }
     const int original_len = len;
     len = strip_terminator(buffer, len);
-    if (len <= 0) { // an empty command line is not a command
-        return 0;
+    if (len <= 0) { // a lone carriage return: the ROM at $C175 and sd2iec answer 31
+        return ERR_UNKNOWN_CMD;
     }
     switch(buffer[0]) {
     case 'B': return block_command(buffer, len);
@@ -795,7 +793,7 @@ int IecParser :: execute_command(const uint8_t *buffer, int len)
         }
         return dir_command(buffer, len);
     case 'N': return format_command(buffer, len);
-    case 'P': return position_command(buffer, original_len); // its last byte is data (SI-018)
+    case 'P': return position_command(buffer, original_len, len); // its last byte is data (SI-018)
     case 'R':
         if (buffer[1] == 'D') {
             return dir_command(buffer, len);

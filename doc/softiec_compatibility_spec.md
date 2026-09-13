@@ -255,6 +255,14 @@ removes one trailing carriage return only. The second branch is missing.
 **Change required**, and it is not cosmetic: it is the reason CMD's manual tells
 programmers to append the terminator themselves when a parameter can be 13.
 
+Implemented in PR #881 for a carriage return followed by a line feed only, which is what
+BASIC's `PRINT#` to a logical file number of 128 or more sends (C64 ROM `$AAD7`). The
+ROM's branch also cuts a binary parameter of 13 short, for example the high byte of an
+`M-R` address, and the reporter of #877 wrote that "needing an additional CR for some
+commands do not need to be reproduced". A lone carriage return answers `31`, as the ROM
+does at `$C175`. `P` reads its record number and offset from the command as sent and a
+plain file's position from the command without its terminator (SI-018).
+
 **SI-017.** The binary Change Partition command is exempt from SI-016, because its
 parameter byte is mandatory and cannot be a terminator. Current behaviour:
 `U strip_terminator()` already exempts `C` followed by `$D0`. Unchanged.

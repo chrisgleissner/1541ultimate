@@ -2559,13 +2559,14 @@ static void s11_si022_too_long(FileManager *fm, IecDrive *dr)
     expect_command_response(testname, dr, cmd, "01, FILES SCRATCHED,01,00\r");
 }
 
-// SI-016: a command whose second to last byte is a carriage return ends there.
+// SI-016: a command ending in a carriage return and a line feed, as PRINT# to a logical
+// file number of 128 or more sends it, ends before them.
 static void s11_si016_second_terminator(FileManager *fm, IecDrive *dr)
 {
     const char *testname = "Suite11-SI016-SecondTerminator";
     s11_partition(fm, dr, "si016");
     expect_command_ok(testname, dr, "MD:SUB\r");
-    expect_command_ok(testname, dr, "CD:SUB\rX");
+    expect_command_ok(testname, dr, "CD:SUB\r\n");
     expect_command_response(testname, dr, "XPWD\r", "40:/SUB/");
 }
 

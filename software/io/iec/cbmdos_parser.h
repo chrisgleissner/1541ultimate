@@ -116,7 +116,7 @@ class IecParser
     int copy_command(const uint8_t *buffer, int len);
     int initialize_command(const uint8_t *buffer, int len);
     int format_command(const uint8_t *buffer, int len);
-    int position_command(const uint8_t *buffer, int len);
+    int position_command(const uint8_t *buffer, int len, int stripped_len);
     int rename_command(const uint8_t *buffer, int len);
     int scratch_command(const uint8_t *buffer, int len);
     int time_command(const uint8_t *buffer, int len);
