@@ -222,6 +222,7 @@ IecChannel *IecDrive :: get_data_channel(int chan)
 
 void IecDrive :: effectuate_settings(void)
 {
+    IecDriveLock guard(this); // configure() holds the IEC processor in reset (CR-6)
     my_bus_id = cfg->get_value(CFG_IEC_BUS_ID);
     cmd_if.set_kernal_device_id(my_bus_id);
     
