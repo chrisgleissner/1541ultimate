@@ -1718,8 +1718,9 @@ Every Operation** in the SoftIEC Drive Settings, which is off by default, it als
 one for every other command, open and close. Such a line adds the reply of a command
 that answers with data, such as `M-R`, the host file an open reached or the first 32
 bytes of a listing, and a listing writes its last line as well. Every line carries the
-bytes the host sent, the partition, the current directory and the error channel's
-answer. With the setting off, a successful command costs one read of the setting and
+bytes the host sent, the error channel's answer, and the current partition and its
+directory as they are once the operation has run, so the line of a `CD` shows the
+directory it entered. With the setting off, a successful command costs one read of the setting and
 writes nothing. The setting exists so that a trace like TRACE, of what a program sends
 and what the drive answers, can be recorded with a release build.
 
