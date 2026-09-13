@@ -674,6 +674,9 @@ int IecParser :: attribute_command(const uint8_t *buffer, int len)
 // toggles the hidden flag of one entry (SI-077, SD parse_ecommand()).
 int IecParser :: e_command(const uint8_t *buffer, int len)
 {
+    if (len < 2) {
+        return ERR_SYNTAX; // "E" alone: there is no sub-command to take the rest from
+    }
     mstring cmd((const char *)buffer, 2, len-1);
     switch (buffer[1]) {
     case 'L':

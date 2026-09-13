@@ -29,8 +29,9 @@ class DirectoryFAT : public Directory
 		inf->extension[0] = toupper(inf->extension[0]);
         inf->extension[1] = toupper(inf->extension[1]);
         inf->extension[2] = toupper(inf->extension[2]);
-		if(inf->lfname) {
+		if(inf->lfname && inf->lfsize) {
 			strncpy(inf->lfname, fi->fname, inf->lfsize);
+			inf->lfname[inf->lfsize - 1] = 0; // a longer name is cut, not left unterminated
 		}
 	}
 

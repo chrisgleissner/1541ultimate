@@ -2471,7 +2471,7 @@ uint32_t FileInCBM::get_size()
     fs->get_track_sector(abs, ct, cs);
     do {
         abs = fs->get_abs_sector(ct, cs);
-        if (visited[abs]) {
+        if ((abs < 0) || visited[abs]) { // a link outside the disk, or a loop
             break;
         }
         visited[abs] = 1;

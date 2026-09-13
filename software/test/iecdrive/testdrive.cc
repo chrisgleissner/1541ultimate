@@ -16,7 +16,8 @@ FileDevice *ramdisk_node;
 BlockDevice *flashdisk_blk;
 FileDevice *flashdisk_node;
 
-char last_status[128];
+char last_status[300]; // a status, or a binary reply of up to 256 bytes
+int negative_fetches = 0; // prefetch_more offering fewer than zero bytes, which a real reader copies
 int last_status_size;
 void create_iec_d64_fixture(const char *path);
 void create_iec_d81_fixture(const char *path);
@@ -515,6 +516,11 @@ int read_file(IecDrive *dr, uint8_t chan, uint8_t *out, int len)
     while(len > 0) {
         ret = dr->prefetch_more(256, data, data_size);
         // printf("Ret: %d Count = %d\n", ret, data_size);
+        if (data_size < 0) {
+            printf("TESTDRIVE: channel %u prefetch_more offered %d bytes\n", chan, data_size);
+            negative_fetches++;
+            break;
+        }
         if (data_size == 0) {
             break;
         }
@@ -549,6 +555,11 @@ int read_file_limited(IecDrive *dr, uint8_t chan, uint8_t *out, int len)
     int total_read = 0;
     while(len > 0) {
         ret = dr->prefetch_more(len, data, data_size);
+        if (data_size < 0) {
+            printf("TESTDRIVE: channel %u prefetch_more offered %d bytes\n", chan, data_size);
+            negative_fetches++;
+            break;
+        }
         if (data_size == 0) {
             break;
         }
@@ -4102,6 +4113,538 @@ static void s11_failure_log(FileManager *fm, IecDrive *dr)
 
 }
 
+// A file inside a disk image whose chain links to a track the disk does not have. Working
+// out its size indexed the loop detection map with -1 (found by Suite11-Soak). The drive
+// must answer, and in the AddressSanitizer build nothing may be written outside the map.
+static void s11_crash_damaged_chain(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-Crash-DamagedChain";
+    create_formatted_image(fm, "/Fat/s11_chain.d64", "CHAIN", 683, e_image_d64);
+    dr->add_partition(55, "/Fat/s11_chain.d64", "CHAIN");
+    expect_command_status_prefix(testname, dr, "CP55\r", "02,PARTITION SELECTED");
+    uint8_t data[600];
+    memset(data, 'c', sizeof(data));
+    open_file(dr, 2, "LINKED,S,W");
+    get_status(dr);
+    send_channel_data(dr, 2, data, sizeof(data));
+    close_file(dr, 2);
+    // The file's first sector is the first entry of the directory sector 18/1.
+    open_buffer_channel(testname, dr, 3);
+    expect_command_ok(testname, dr, "U1:3,0,18,1\r");
+    uint8_t dir[256];
+    read_buffer_channel(testname, dr, 3, dir, sizeof(dir));
+    int track = dir[3], sector = dir[4];
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "U1:3,0,%d,%d\r", track, sector);
+    expect_command_ok(testname, dr, cmd);
+    uint8_t block[256];
+    read_buffer_channel(testname, dr, 3, block, sizeof(block));
+    printf("%s: LINKED starts at %d/%d and links to %d/%d; now to 99/0\n", testname, track, sector, block[0], block[1]);
+    block[0] = 99;
+    block[1] = 0;
+    expect_command_ok(testname, dr, "B-P 3 0\r");
+    send_channel_data(dr, 3, block, sizeof(block));
+    snprintf(cmd, sizeof(cmd), "U2:3,0,%d,%d\r", track, sector);
+    expect_command_ok(testname, dr, cmd);
+    close_file(dr, 3);
+    // An append works out the size of the file first.
+    open_file(dr, 2, "LINKED,S,A");
+    get_status(dr);
+    printf("%s: the append answered %s", testname, last_status);
+    close_file(dr, 2);
+    open_file(dr, 2, "LINKED,S,R");
+    get_status(dr);
+    uint8_t back[1024];
+    int got = read_file(dr, 2, back, sizeof(back));
+    close_file(dr, 2);
+    printf("%s: reading the damaged file gave %d bytes\n", testname, got);
+    expect_command_response(testname, dr, "UI\r", "73,U64HD ULTIMATE DOS V2.0,00,00\r");
+}
+
+// A host file whose name is longer than the 40 bytes a listing keeps of it. The name was
+// copied without a terminator, so every use of it read past the buffer (found by
+// Suite11-Soak).
+static void s11_crash_long_host_name(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-Crash-LongHostName";
+    const char *path = s11_partition(fm, dr, "longname");
+    uint32_t tr;
+    REQUIRE(fm->save_file(true, path, "A NAME THAT IS MUCH LONGER THAN FORTY BYTES ON THE HOST.prg",
+                          (const uint8_t *)"x", 1, &tr) == FR_OK);
+    uint8_t listing[4096];
+    int got = read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    printf("%s: the listing is %d bytes\n", testname, got);
+    REQUIRE(got > 64);
+    got = s11_raw_directory(testname, dr, 2, listing, sizeof(listing));
+    REQUIRE(got >= 508);
+    expect_command_response(testname, dr, "UI\r", "73,U64HD ULTIMATE DOS V2.0,00,00\r");
+}
+
+// A record positioned past its last byte: the channel offered a negative number of
+// bytes, which the UCI target passes on as a length to copy (found by Suite11-Soak).
+static void s11_crash_record_past_end(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-Crash-RecordPastEnd";
+    s11_partition(fm, dr, "recordend");
+    expect_rel_open(testname, dr, 2, "RECORDS", 50);
+    expect_rel_position_status(testname, dr, 2, 1, 1, "50,RECORD NOT PRESENT,00,00\r");
+    expect_rel_write(testname, dr, 2, (const uint8_t *)"AB", 2);
+    expect_rel_position_status(testname, dr, 2, 1, 40, "00, OK,00,00\r");
+    negative_fetches = 0;
+    uint8_t out[64];
+    int got = read_file_limited(dr, 2, out, sizeof(out));
+    printf("%s: reading from byte 40 of a record that ends at byte 2 gave %d bytes, %d negative offers\n",
+           testname, got, negative_fetches);
+    REQUIRE(negative_fetches == 0);
+    close_file(dr, 2);
+}
+
+// Every command of one and two bytes, and of each letter followed by the terminator,
+// answers something: a parser that takes a substring past the end of a short command
+// writes outside the heap (found by Suite11-Soak with "E").
+static void s11_short_commands(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-ShortCommands";
+    s11_partition(fm, dr, "short");
+    for (int a = 0; a < 256; a++) {
+        const uint8_t one[1] = { (uint8_t)a };
+        send_command_data(dr, one, 1);
+        get_status(dr);
+        REQUIRE(isdigit((uint8_t)last_status[0]) && isdigit((uint8_t)last_status[1]));
+        const uint8_t with_cr[2] = { (uint8_t)a, 0x0D };
+        send_command_data(dr, with_cr, 2);
+        get_status(dr);
+        REQUIRE(isdigit((uint8_t)last_status[0]) && isdigit((uint8_t)last_status[1]));
+        for (int b = 0; b < 256; b += (a >= 'A' && a <= 'Z') ? 1 : 51) {
+            const uint8_t two[2] = { (uint8_t)a, (uint8_t)b };
+            send_command_data(dr, two, 2);
+            get_status(dr);
+            REQUIRE(isdigit((uint8_t)last_status[0]) && isdigit((uint8_t)last_status[1]));
+        }
+    }
+    send_command(dr, "W-0");
+    send_command(dr, "S-D");
+    expect_command_response(testname, dr, "E\r", "30,SYNTAX ERROR,00,00\r");
+}
+
+// ---------------------------------------------------------------------------
+// Suite11-Soak: randomised use of the drive. Every iteration either follows the
+// pattern C64 OS follows at boot (binary Change Partition, CD to absolute paths, M-R
+// probes, UI, a scratch with a path, a listing abandoned after five bytes, several
+// channels open at once, a file header read and then the whole file again), or runs
+// one of the other command families, or sends hostile input: random command bytes,
+// random names, channels abandoned half way, the menu's Reset and partition changes
+// in between. Individual answers are not checked, only that there is one. What is
+// checked is that the drive survives (run it in the AddressSanitizer build), that it
+// still answers UI with 73 at the end, and that it gives back the memory it took.
+// IECSOAK_ITERATIONS sets the length (default 400), IECSOAK_SEED the sequence, and
+// IECSOAK_VERBOSE=1 prints each step so a failing seed can be followed.
+// ---------------------------------------------------------------------------
+static uint32_t soak_state = 1;
+static bool soak_verbose = false;
+
+static uint32_t soak_rand(void)
+{
+    soak_state ^= soak_state << 13;
+    soak_state ^= soak_state >> 17;
+    soak_state ^= soak_state << 5;
+    return soak_state;
+}
+
+static int soak_pick(int n)
+{
+    return (int)(soak_rand() % (uint32_t)n);
+}
+
+static void soak_step(int iteration, const char *what, const char *detail)
+{
+    if (soak_verbose) {
+        fprintf(stderr, "soak %d: %s %s\n", iteration, what, detail ? detail : "");
+    }
+}
+
+static const char *soak_names[] = {
+    "ONE", "TWO", "GAME", "CONFIG.T", "LIB.O", "A\xA0" "B", "_", "..", "X*", "Y?",
+    "SIXTEENCHARSNAME", "SEVENTEENCHARNAME", "REL", "MY GAME", "IMG.D64", "",
+};
+#define SOAK_NAMES (int)(sizeof(soak_names) / sizeof(soak_names[0]))
+
+static void soak_send_bytes(IecDrive *dr, uint8_t chan_cmd, const uint8_t *data, int len)
+{
+    dr->push_ctrl(SLAVE_CMD_ATN);
+    dr->push_ctrl(chan_cmd);
+    for (int i = 0; i < len; i++) {
+        dr->push_data(data[i]);
+    }
+    dr->push_ctrl(SLAVE_CMD_EOI);
+}
+
+static void soak_command(IecDrive *dr, const char *cmd)
+{
+    send_command(dr, cmd);
+}
+
+static void soak_read(IecDrive *dr, uint8_t chan, int len)
+{
+    static uint8_t sink[4096];
+    if (len > (int)sizeof(sink)) {
+        len = sizeof(sink);
+    }
+    read_file_limited(dr, chan, sink, len);
+}
+
+static void soak_fixture(FileManager *fm)
+{
+    const char *testname = "Suite11-Soak";
+    static const char *dirs[] = { "/Fat/soak", "/Fat/soak/OS", "/Fat/soak/OS/SETTINGS", "/Fat/soak/OS/LIBRARY",
+                                  "/Fat/soak/OS/TEMPORARY", "/Fat/soak/OS/DRIVERS", "/Fat/soak/WORK" };
+    for (int i = 0; i < 7; i++) {
+        FRESULT fres = fm->create_dir(dirs[i]);
+        REQUIRE((fres == FR_OK) || (fres == FR_EXIST));
+    }
+    uint8_t data[3000];
+    for (int i = 0; i < (int)sizeof(data); i++) {
+        data[i] = (uint8_t)(i * 13 + 7);
+    }
+    uint32_t tr;
+    REQUIRE(fm->save_file(true, "/Fat/soak/OS/SETTINGS", "CONFIG.T.seq", data, 13, &tr) == FR_OK);
+    REQUIRE(fm->save_file(true, "/Fat/soak/OS/SETTINGS", "SYSTEM.T.seq", data, 400, &tr) == FR_OK);
+    REQUIRE(fm->save_file(true, "/Fat/soak/OS/LIBRARY", "LIB.O.prg", data, 2957, &tr) == FR_OK);
+    REQUIRE(fm->save_file(true, "/Fat/soak/OS/LIBRARY", "SMALL.O.prg", data, 2, &tr) == FR_OK);
+    REQUIRE(fm->save_file(true, "/Fat/soak/OS/DRIVERS", "KBD.C64.prg", data, 567, &tr) == FR_OK);
+    s11_host_file(fm, "/Fat/soak/OS/LIBRARY", "GAME.P00", "MY GAME", 0, data, 300);
+    create_formatted_image(fm, "/Fat/soak/OS/IMG.D64", "SOAK", 683, e_image_d64);
+}
+
+static void soak_partitions(FileManager *fm, IecDrive *dr)
+{
+    dr->add_partition(60, "/Fat/soak", "SOAK");
+    create_formatted_image(fm, "/Fat/soak_61.d64", "SOAK41", 683, e_image_d64);
+    create_formatted_image(fm, "/Fat/soak_62.d81", "SOAK81", 3200, e_image_d81);
+    create_formatted_image(fm, "/Fat/soak_63.dnp", "SOAKNAT", 4 * 256, e_image_dnp);
+    dr->add_partition(61, "/Fat/soak_61.d64", "SOAK41");
+    dr->add_partition(62, "/Fat/soak_62.d81", "SOAK81");
+    dr->add_partition(63, "/Fat/soak_63.dnp", "SOAKNAT");
+}
+
+// What C64 OS does at boot, from the trace attached to #877.
+static void soak_boot(IecDrive *dr, int iteration)
+{
+    soak_step(iteration, "boot", NULL);
+    const uint8_t cp[3] = { 'C', 0xD0, 60 };
+    soak_send_bytes(dr, 0x6F, cp, 3);
+    get_status(dr);
+    soak_command(dr, "CD//OS\r");
+    static const uint8_t probes[4][2] = { { 0xA4, 0xFE }, { 0xC5, 0xE5 }, { 0xE8, 0xA6 }, { 0x02, 0x00 } };
+    for (int i = 0; i < 4; i++) {
+        const uint8_t mr[6] = { 'M', '-', 'R', probes[i][0], probes[i][1], 2 };
+        soak_send_bytes(dr, 0xFF, mr, 6);
+        get_status(dr);
+        close_file(dr, 15);
+    }
+    soak_command(dr, "UI");
+    soak_command(dr, "S/TEMPORARY/:*");
+    open_file(dr, 0, "$");
+    get_status(dr);
+    soak_read(dr, 0, 5);
+    close_file(dr, 0);
+    open_file(dr, 2, "/SETTINGS/:SYSTEM.T");
+    get_status(dr);
+    soak_read(dr, 2, 1 + soak_pick(40));
+    open_file(dr, 3, "/LIBRARY/:LIB.O");
+    get_status(dr);
+    soak_read(dr, 3, 2);
+    close_file(dr, 3);
+    open_file(dr, 0, "/LIBRARY/:LIB.O");
+    get_status(dr);
+    soak_read(dr, 0, 4096);
+    close_file(dr, 0);
+    open_file(dr, 3, "/TEMPORARY/:UPDATER");
+    get_status(dr);
+    soak_read(dr, 3, 10);
+    close_file(dr, 3);
+    open_file(dr, 14, "/SETTINGS/:CONFIG.T");
+    get_status(dr);
+    soak_read(dr, 14, 16);
+    close_file(dr, 14);
+    soak_command(dr, "CD//OS/DRIVERS/");
+    open_file(dr, 0, "KBD.C64");
+    get_status(dr);
+    soak_read(dr, 0, 4096);
+    close_file(dr, 0);
+    soak_command(dr, "CD//OS");
+    open_file(dr, 0, "$:SYS*");
+    get_status(dr);
+    soak_read(dr, 0, 4096);
+    close_file(dr, 0);
+    soak_read(dr, 2, 4096);
+    close_file(dr, 2);
+}
+
+static void soak_listing(IecDrive *dr, int iteration)
+{
+    static const char *names[] = { "$", "$:*", "$=P", "$=T:*=L", "$//OS/", "$0", "$/NOSUCH/", "$61", "$62:*=S",
+                                   "$63", "$=P:*=N", "$//OS/IMG.D64/", "$:*=H" };
+    const char *name = names[soak_pick(13)];
+    uint8_t chan = (uint8_t)soak_pick(15);
+    soak_step(iteration, "listing", name);
+    open_file(dr, chan, name);
+    get_status(dr);
+    soak_read(dr, chan, soak_pick(2) ? 4096 : soak_pick(200));
+    if (soak_pick(4)) {
+        close_file(dr, chan);
+    }
+}
+
+static void soak_work_dir(IecDrive *dr)
+{
+    const uint8_t cp[3] = { 'C', 0xD0, (uint8_t)(60 + soak_pick(4)) };
+    soak_send_bytes(dr, 0x6F, cp, 3);
+    get_status(dr);
+    if (cp[2] == 60) {
+        soak_command(dr, "CD//WORK/");
+    } else {
+        soak_command(dr, "CD//");
+    }
+}
+
+static void soak_write(IecDrive *dr, int iteration)
+{
+    char name[48];
+    static const char *modes[] = { ",S,W", ",P,W", ",U,W", ",S,A", "" };
+    const char *base = soak_names[soak_pick(SOAK_NAMES)];
+    snprintf(name, sizeof(name), "%s%s%s", soak_pick(3) ? "" : "@:", base, modes[soak_pick(5)]);
+    uint8_t chan = (uint8_t)(1 + soak_pick(14));
+    soak_step(iteration, "write", name);
+    soak_work_dir(dr);
+    open_file(dr, chan, name);
+    get_status(dr);
+    uint8_t data[1600];
+    int len = soak_pick(sizeof(data));
+    for (int i = 0; i < len; i++) {
+        data[i] = (uint8_t)soak_rand();
+    }
+    soak_send_bytes(dr, 0x60 | chan, data, len);
+    if (soak_pick(6)) {
+        close_file(dr, chan);
+    }
+    open_file(dr, chan, base);
+    get_status(dr);
+    soak_read(dr, chan, 4096);
+    close_file(dr, chan);
+}
+
+static void soak_files(IecDrive *dr, int iteration)
+{
+    char cmd[80];
+    const char *a = soak_names[soak_pick(SOAK_NAMES)];
+    const char *b = soak_names[soak_pick(SOAK_NAMES)];
+    switch (soak_pick(9)) {
+    case 0: snprintf(cmd, sizeof(cmd), "S:%s", a); break;
+    case 1: snprintf(cmd, sizeof(cmd), "R:%s=%s", a, b); break;
+    case 2: snprintf(cmd, sizeof(cmd), "C:%s=%s", a, b); break;
+    case 3: snprintf(cmd, sizeof(cmd), "MD:%s", a); break;
+    case 4: snprintf(cmd, sizeof(cmd), "CD:%s", a); break;
+    case 5: snprintf(cmd, sizeof(cmd), "RD:%s", a); break;
+    case 6: snprintf(cmd, sizeof(cmd), "L:%s", a); break;
+    case 7: snprintf(cmd, sizeof(cmd), "S:*"); break;
+    default: snprintf(cmd, sizeof(cmd), "CD_"); break;
+    }
+    soak_step(iteration, "files", cmd);
+    soak_work_dir(dr);
+    soak_command(dr, cmd);
+}
+
+static void soak_relative(IecDrive *dr, int iteration)
+{
+    soak_step(iteration, "relative", NULL);
+    soak_work_dir(dr);
+    char name[16];
+    int n = snprintf(name, sizeof(name), "REL,L,");
+    name[n++] = (char)(1 + soak_pick(254));
+    name[n] = 0;
+    uint8_t chan = (uint8_t)(2 + soak_pick(12));
+    open_file(dr, chan, soak_pick(3) ? name : "REL,L");
+    get_status(dr);
+    for (int i = soak_pick(5); i >= 0; i--) {
+        int record = 1 + soak_pick(soak_pick(4) ? 20 : 2000);
+        const uint8_t p[5] = { 'P', (uint8_t)(0x60 | chan), (uint8_t)record, (uint8_t)(record >> 8), (uint8_t)soak_pick(256) };
+        soak_send_bytes(dr, 0x6F, p, 5);
+        get_status(dr);
+        if (soak_pick(2)) {
+            uint8_t data[300];
+            int len = soak_pick(sizeof(data));
+            for (int k = 0; k < len; k++) {
+                data[k] = (uint8_t)soak_rand();
+            }
+            soak_send_bytes(dr, 0x60 | chan, data, len);
+        } else {
+            soak_read(dr, chan, soak_pick(300));
+        }
+    }
+    close_file(dr, chan);
+}
+
+static void soak_direct(IecDrive *dr, int iteration)
+{
+    soak_step(iteration, "direct", NULL);
+    soak_work_dir(dr);
+    uint8_t chan = (uint8_t)(2 + soak_pick(12));
+    char name[4] = { '#', '#', (char)('0' + soak_pick(11)), 0 };
+    open_file(dr, chan, soak_pick(2) ? "#" : name);
+    get_status(dr);
+    static const char *forms[] = { "U1:%d,0,%d,%d", "U2:%d,0,%d,%d", "B-R:%d,0,%d,%d", "B-W:%d,0,%d,%d",
+                                   "B-P:%d,%d,%d", "B-A:0,%d,%d%.0d", "B-F:0,%d,%d%.0d" };
+    for (int i = soak_pick(6); i >= 0; i--) {
+        char cmd[48];
+        int f = soak_pick(7);
+        if (f >= 5) {
+            snprintf(cmd, sizeof(cmd), forms[f], soak_pick(90), soak_pick(260), 0);
+        } else {
+            snprintf(cmd, sizeof(cmd), forms[f], soak_pick(3) ? chan : soak_pick(16), soak_pick(90), soak_pick(260));
+        }
+        soak_command(dr, cmd);
+        if (soak_pick(2)) {
+            uint8_t data[600];
+            int len = soak_pick(sizeof(data));
+            for (int k = 0; k < len; k++) {
+                data[k] = (uint8_t)soak_rand();
+            }
+            soak_send_bytes(dr, 0x60 | chan, data, len);
+        } else {
+            soak_read(dr, chan, soak_pick(2400));
+        }
+    }
+    close_file(dr, chan);
+}
+
+static void soak_hostile(IecDrive *dr, int iteration)
+{
+    uint8_t data[300];
+    int len = soak_pick(sizeof(data));
+    for (int i = 0; i < len; i++) {
+        data[i] = soak_pick(3) ? (uint8_t)(' ' + soak_pick(64)) : (uint8_t)soak_rand();
+    }
+    if (soak_pick(2)) {
+        soak_step(iteration, "hostile command", NULL);
+        soak_send_bytes(dr, 0x6F, data, len);
+        get_status(dr);
+    } else {
+        uint8_t chan = (uint8_t)soak_pick(16);
+        soak_step(iteration, "hostile open", NULL);
+        soak_send_bytes(dr, 0xF0 | chan, data, len);
+        get_status(dr);
+        soak_read(dr, chan, soak_pick(600));
+        if (soak_pick(2)) {
+            soak_send_bytes(dr, 0x60 | chan, data, soak_pick(len + 1));
+        }
+        if (soak_pick(3)) {
+            close_file(dr, chan);
+        }
+    }
+}
+
+static void soak_misc(IecDrive *dr, int iteration)
+{
+    static const char *cmds[] = { "G-P", "G-P\x01", "T-RI", "T-RA", "T-WI2026-09-13T01:02:03", "I", "V", "UJ",
+                                  "U\xCA", "EL:ONE", "EU:ONE", "EH:ONE", "A:RH=TWO", "XPWD", "R-P:SOAKX=SOAK",
+                                  "R-P:SOAK=SOAKX", "W-1", "M-R\x00\x05\xFF", "M-W\x00\x05\x01\x01", "N:TMP.D64,AB",
+                                  "S:TMP.D64", "CP61", "CP99", "CD//OS/IMG.D64", "CD_", "S-8", "S-D", "U0>\x0B" };
+    const char *cmd = cmds[soak_pick(28)];
+    soak_step(iteration, "misc", cmd);
+    if (strncmp(cmd, "N:", 2) == 0) {
+        soak_work_dir(dr);
+    }
+    if (strncmp(cmd, "M-", 2) == 0) {
+        soak_send_bytes(dr, 0x6F, (const uint8_t *)cmd, (cmd[2] == 'R') ? 6 : 8);
+        get_status(dr);
+    } else {
+        soak_command(dr, cmd);
+    }
+    soak_command(dr, "W-0");
+    soak_command(dr, "S-D");
+}
+
+static void soak_gui(FileManager *fm, IecDrive *dr, int iteration)
+{
+    switch (soak_pick(4)) {
+    case 0:
+        soak_step(iteration, "gui", "reset");
+        dr->reset();
+        break;
+    case 1: {
+        soak_step(iteration, "gui", "partition moves");
+        dr->add_partition(60, soak_pick(2) ? "/Fat/soak" : "/Fat/soak/OS", "SOAK");
+        break;
+    }
+    case 2: {
+        soak_step(iteration, "gui", "info");
+        static char text[4096];
+        StreamTextLog log(sizeof(text), text);
+        dr->info(log);
+        break;
+    }
+    default:
+        soak_step(iteration, "gui", "close channels");
+        for (int c = 0; c < 16; c++) {
+            close_file(dr, (uint8_t)c);
+        }
+        break;
+    }
+}
+
+static void s11_soak(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-Soak";
+    const char *env = getenv("IECSOAK_ITERATIONS");
+    int iterations = env ? atoi(env) : 400;
+    env = getenv("IECSOAK_SEED");
+    soak_state = env ? (uint32_t)strtoul(env, NULL, 0) : 0x1541;
+    if (!soak_state) {
+        soak_state = 1;
+    }
+    soak_verbose = getenv("IECSOAK_VERBOSE") != NULL;
+    printf("%s: %d iterations, seed 0x%x\n", testname, iterations, soak_state);
+    soak_fixture(fm);
+    soak_partitions(fm, dr);
+
+    size_t heap_after_warmup = 0;
+    int warmup = iterations / 5;
+    for (int i = 0; i < iterations; i++) {
+        switch (soak_pick(16)) {
+        case 0: case 1: case 2: case 3: soak_boot(dr, i); break;
+        case 4: case 5: soak_listing(dr, i); break;
+        case 6: case 7: soak_write(dr, i); break;
+        case 8: soak_files(dr, i); break;
+        case 9: soak_relative(dr, i); break;
+        case 10: soak_direct(dr, i); break;
+        case 11: case 12: soak_hostile(dr, i); break;
+        case 13: soak_misc(dr, i); break;
+        default: soak_gui(fm, dr, i); break;
+        }
+        if (i == warmup) {
+            for (int c = 0; c < 16; c++) {
+                close_file(dr, (uint8_t)c);
+            }
+            heap_after_warmup = s11_heap_in_use();
+        }
+    }
+    for (int c = 0; c < 16; c++) {
+        close_file(dr, (uint8_t)c);
+    }
+    soak_command(dr, "W-0");
+    soak_command(dr, "S-D");
+    size_t heap_at_end = s11_heap_in_use();
+    const char *ui = send_command(dr, "UI");
+    printf("%s: after %d iterations UI answered %s", testname, iterations, ui);
+    printf("%s: heap in use %d bytes after warmup, %d at the end\n", testname,
+           (int)heap_after_warmup, (int)heap_at_end);
+    printf("%s: %d reads were offered a negative number of bytes\n", testname, negative_fetches);
+    REQUIRE(strncmp(ui, "73,", 3) == 0);
+    REQUIRE(negative_fetches == 0);
+    REQUIRE(heap_at_end <= heap_after_warmup + 64 * 1024);
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -4164,6 +4707,11 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-CR7-TextLog",             s11_cr7_text_log },
     { "Suite11-CR8-ScratchScan",         s11_cr8_scratch_scan },
     { "Suite11-FailureLog",              s11_failure_log },
+    { "Suite11-Crash-DamagedChain",      s11_crash_damaged_chain },
+    { "Suite11-Crash-LongHostName",      s11_crash_long_host_name },
+    { "Suite11-Crash-RecordPastEnd",     s11_crash_record_past_end },
+    { "Suite11-ShortCommands",           s11_short_commands },
+    { "Suite11-Soak",                    s11_soak },
 };
 
 // Runs every case, or only those whose name contains `only`.

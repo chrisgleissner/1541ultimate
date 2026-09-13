@@ -170,13 +170,19 @@ t_channel_retval IecChannel::prefetch_more(int max_fetch, uint8_t*& datapointer,
     }
     bool last = false;
     if (last_byte >= 0) { // there is a last byte in this block
+        if (prefetch > last_byte) {
+            // Already past it, for example a P into a record beyond its last byte.
+            // Offering a negative count makes the UCI target copy that many bytes.
+            fetched = 0;
+            return IEC_NO_FILE;
+        }
         if (prefetch + max_fetch > last_byte) { // example: prefetch = 0, last_byte = 1 => there are 2 bytes. if max_fetch = 2, it will be set to 2.
             max_fetch = last_byte - prefetch + 1;
             last = true;
         }
     } else {
         if (prefetch + max_fetch > prefetch_max) {
-            max_fetch = prefetch_max - prefetch;
+            max_fetch = (prefetch < prefetch_max) ? (prefetch_max - prefetch) : 0;
         }
     }
     datapointer = &buffer[prefetch];
@@ -1656,7 +1662,7 @@ int IecChannel :: setup_file_access()
     uint8_t wrapped_length = 0;
     filetype_t wrapped_type;
     bool wrapped = false;
-    if (!dataOffset && f->get_size() && x00_path(full_path, &wrapped_type) && (name_to_open.access != e_write)) {
+    if (!dataOffset && (name_to_open.access != e_write) && x00_path(full_path, &wrapped_type) && f->get_size()) {
         if ((f->read(head, X00_HEADER_SIZE, &head_bytes) == FR_OK) &&
             x00_header(head, head_bytes, NULL, &wrapped_length)) {
             dataOffset = X00_HEADER_SIZE;
