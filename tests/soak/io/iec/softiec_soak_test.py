@@ -33,6 +33,11 @@ answer either. The failure names the iteration and the last operations.
 
 Profiles: `stress` runs for ten minutes, `soak` for four hours. `--duration` overrides.
 `--no-lanes` leaves out the REST and FTP lanes, to tell the drive's heap use from theirs.
+On a U2+L, the first session after power-up lost about 25 KB of heap over its first 36
+iterations, which fails the ten minute profile, and most of it came back when the
+session removed its directory. A 45 minute session on the same firmware kept the heap
+flat from its 20th iteration to its 158th. Judge a loss from a run that is not the
+first after power-up, or from a longer one.
 The suite needs a C64 with a standard KERNAL, REST and FTP, and one Software IEC
 partition numbered 1. It uses device 11, and restores the settings, the partition's
 working directory, and removes its own directory.
@@ -478,8 +483,13 @@ def main():
                 if session.lane_errors:
                     detail("lane errors: " + "; ".join(session.lane_errors[:10]))
                 if len(heap) >= 3:
-                    slope = (heap[0] - heap[-1]) / (len(heap) - 1)
-                    detail(f"heap free {heap[0]} after warm-up, {heap[-1]} at the end, "
+                    # A sample taken while a lane holds a transfer buffer reads up to about
+                    # 20 KB low, so the most free heap of the first and the last quarter of
+                    # the samples are compared rather than the first and the last sample.
+                    window = max(1, len(heap) // 4)
+                    first, last = max(heap[:window]), max(heap[-window:])
+                    slope = (first - last) / max(1, len(heap) - window)
+                    detail(f"heap free {first} after warm-up, {last} at the end, "
                            f"{slope:.0f} bytes lost per iteration")
                     if slope > LEAK_TOLERANCE_BYTES_PER_ITERATION:
                         failures.append(f"the heap shrank by {slope:.0f} bytes per iteration")
