@@ -1731,8 +1731,10 @@ path the drive accepts with the setting on, and the AddressSanitizer build fails
 byte outside those buffers. The serial port takes each line one character at a time, so
 with the setting on an operation also takes as long as its line needs to be sent. The
 firmware's `printf` does not keep a line together, so a message another task prints at
-the same moment can split a `SoftIEC:` line in two; during a ten minute soak on an
-Ultimate 64 Elite this happened to one line of 732.
+the same moment can split a `SoftIEC:` line in two, and the rest of the line then
+arrives with the next syslog message. With the firmware also printing its REST and FTP
+requests, this happened to 1 line of 732 during a Software IEC soak on an Ultimate 64
+Elite, and to 15 lines of 668 during `iec-dos-commands` and a soak on a U2+L.
 
 ### 18.1 What PR #881 implements
 
