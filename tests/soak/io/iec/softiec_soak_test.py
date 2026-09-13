@@ -19,7 +19,7 @@ is one the KERNAL puts there. Each iteration is one of:
   * a relative file written record by record, positioned and read back;
   * direct access to a disk image: U2, U1 and B-P on a buffer channel;
   * directories made, entered and removed; a rename and a copy;
-  * listings of every kind, some abandoned part way, including the raw directory;
+  * listings of every kind, some abandoned part way, some on a data channel;
   * the other commands a program uses: G-P, T-RI, I, UJ, M-R, and a few unknown
     commands, which must answer and change nothing.
 
@@ -304,7 +304,7 @@ class Session:
 
     def other_commands(self):
         for text, allowed in (("G-P", None), ("T-RI", None), ("I", (0,)), ("UJ", (73,)),
-                              ("Z9", (31,)), ("E", (30,)), ("XYZ", (30,)), ("V", (0,))):
+                              ("Z9", (31,)), ("E", (30,)), ("XYZ", (30,)), ("V", (31,))):
             if self.random.randrange(2):
                 continue
             if text in ("G-P", "T-RI"):
