@@ -2351,6 +2351,8 @@ static void s11_si033_scratch_nothing(FileManager *fm, IecDrive *dr)
     // The count still counts.
     expect_iec_write_ok(testname, dr, 2, "/TEMPORARY/:GONE,S,W", "x");
     expect_command_response(testname, dr, "S/TEMPORARY/:*\r", "01, FILES SCRATCHED,01,00\r");
+    // A directory that is not there is a path error, not a scratch of nothing.
+    expect_command_response(testname, dr, "S/NOSUCHDIR/:*\r", "71,DIRECTORY ERROR,40,00\r");
 }
 
 // SI-053: I initialises. There is no medium to read in, so it answers OK, and like
@@ -2557,6 +2559,20 @@ static void s11_si022_too_long(FileManager *fm, IecDrive *dr)
     expect_iec_file(testname, dr, 2, "VICTIM,S,R", "keep me");
     cmd[253] = 0; // one byte shorter fits
     expect_command_response(testname, dr, cmd, "01, FILES SCRATCHED,01,00\r");
+
+    // A name that fills the buffer is refused the same way, not created under its first
+    // bytes.
+    char name[300];
+    memset(name, 'B', sizeof(name));
+    memcpy(name, "LONGNAME", 8);
+    name[260] = 0;
+    open_file(dr, 2, name);
+    get_status(dr);
+    expect_current_status(testname, "a 260 byte name", "32,SYNTAX ERROR,00,00\r");
+    close_file(dr, 2);
+    uint8_t listing[4096];
+    int got = read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    REQUIRE(memmem(listing, got, "LONGNAME", 8) == NULL);
 }
 
 // SI-016: a command ending in a carriage return and a line feed, as PRINT# to a logical
@@ -3045,7 +3061,16 @@ static void s11_si071_format(FileManager *fm, IecDrive *dr)
     expect_command_response(testname, dr, "N:HUGE.DNP,255\r", "72,DISK FULL,00,00\r");
     REQUIRE(s11_host_size(fm, path, "HUGE.DNP") == 0);
 
-    expect_command_response(testname, dr, "S:*\r", "01, FILES SCRATCHED,05,00\r");
+    // A full sixteen character label keeps its extension.
+    expect_command_ok(testname, dr, "N:ABCDEFGHIJKLMNOP.D81,AB\r");
+    REQUIRE(s11_host_size(fm, path, "ABCDEFGHIJKLMNOP.D81") == 819200);
+    // Inside a disk image N is refused rather than creating an image in the image.
+    expect_command_ok(testname, dr, "CD:ONE.D64\r");
+    expect_command_response(testname, dr, "N:WORK,01\r", "30,SYNTAX ERROR,00,00\r");
+    expect_iec_file_missing(testname, dr, 2, "WORK.D64,S,R");
+    expect_command_ok(testname, dr, "CD:_\r");
+
+    expect_command_response(testname, dr, "S:*\r", "01, FILES SCRATCHED,06,00\r");
 }
 
 // SI-147 and SI-148: a shifted space ($A0) is a legal byte inside a name and maps to
@@ -3566,6 +3591,34 @@ static void s11_cr8_scratch_scan(FileManager *fm, IecDrive *dr)
     REQUIRE(present);
     expect_command_ok(testname, dr, "L:TWIN\r");
     expect_command_response(testname, dr, "S:TWIN\r", "01, FILES SCRATCHED,01,00\r");
+
+    // Two entries of one name and type, the first locked, as a damaged image can have
+    // them. A delete by name removes the first, so the unlocked second is not scratched
+    // either, and the locked one stays.
+    expect_iec_write_ok(testname, dr, 1, "PAIR", "first");
+    expect_iec_write_ok(testname, dr, 2, "PAIR,S,W", "second");
+    expect_command_ok(testname, dr, "L:PAIR\r");
+    open_buffer_channel(testname, dr, 3);
+    expect_command_ok(testname, dr, "U1:3,0,18,1\r");
+    uint8_t dir[256];
+    read_buffer_channel(testname, dr, 3, dir, sizeof(dir));
+    int seq = -1;
+    for (int e = 0; e < 8; e++) {
+        if (((dir[2 + 32 * e] & 7) == 1) && !memcmp(dir + 5 + 32 * e, "PAIR\xA0", 5)) {
+            seq = e;
+        }
+    }
+    REQUIRE(seq >= 0);
+    dir[2 + 32 * seq] = (dir[2 + 32 * seq] & ~7) | 2; // the SEQ entry becomes a second PRG
+    expect_command_ok(testname, dr, "B-P 3 0\r");
+    send_channel_data(dr, 3, dir, sizeof(dir));
+    expect_command_ok(testname, dr, "U2:3,0,18,1\r");
+    close_file(dr, 3);
+    response = send_command(dr, "S:PAIR\r");
+    printf("%s: with a locked PAIR first, S:PAIR answered %s", testname, response);
+    s11_listing_type(dr, testname, "$", "PAIR", type, &present);
+    printf("%s: the first PAIR is now typed '%s'\n", testname, type);
+    REQUIRE(present && !strcmp(type, "PRG<"));
 }
 
 /* =============================================================================
@@ -3750,6 +3803,16 @@ static void s11_crash_long_host_name(FileManager *fm, IecDrive *dr)
     int got = read_directory_stream(testname, dr, "$", listing, sizeof(listing));
     printf("%s: the listing is %d bytes\n", testname, got);
     REQUIRE(got > 64);
+    // The opens and commands that find the file by its CBM name and then work out its
+    // type copied the name into 48 bytes without a terminator.
+    open_file(dr, 2, "A NAME THAT*");
+    get_status(dr);
+    printf("%s: a typeless open answered %s", testname, last_status);
+    close_file(dr, 2);
+    expect_command_ok(testname, dr, "C:COPY=A NAME THAT*\r");
+    expect_iec_write_ok(testname, dr, 1, "@:A NAME THAT*", "y");
+    expect_command_ok(testname, dr, "R:SHORT=A NAME THAT*\r");
+    expect_iec_file(testname, dr, 0, "SHORT", "y");
     expect_command_response(testname, dr, "UI\r", "73,U64HD ULTIMATE DOS V2.0,00,00\r");
 }
 

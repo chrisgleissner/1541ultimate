@@ -341,7 +341,7 @@ t_channel_retval IecChannel::push_data(uint8_t b)
 
     switch (state) {
     case e_filename:
-        if (pointer < CBMDOS_COMMAND_BUFFER_SIZE) { // names up to 254 bytes (SI-021)
+        if (pointer <= CBMDOS_COMMAND_BUFFER_SIZE) { // one more than open_file() accepts (SI-021)
             buffer[pointer++] = b;
         }
         break;
@@ -1327,12 +1327,12 @@ int IecChannel :: setup_file_access()
             return 0;
         }
         GETPARTITION(name_to_open.file.partition, partition, 0);
-        FileInfo matched(48);
+        FileInfo matched(INFO_SIZE);
         filetype_t found = e_any;
         FRESULT fres = resolve_existing_iec_path(fm, partition, name_to_open.file, e_any,
                                                  false, true, true, work, &matched);
-        if (fres == FR_OK) {
-            char cbm_name[24];
+        char cbm_name[24];
+        if ((fres == FR_OK) && !iec_x00_probe(fm, work.c_str(), cbm_name, &found, NULL)) {
             IecPartition::CreateIecName(&matched, cbm_name, found);
         }
         if ((fres != FR_OK) || (found != name_to_open.filetype) || (found == e_rel)) {
@@ -1351,7 +1351,7 @@ int IecChannel :: setup_file_access()
     // Existing REL files also open by name alone (for example the E.DATA editor).
     // Resolve the type before choosing access flags and setting up record I/O.
     if (name_to_open.filetype == e_any) {
-        FileInfo info(48);
+        FileInfo info(INFO_SIZE);
         FRESULT fres = fm->fstat(full_path, info);
         if (fres == FR_NO_FILE) {
             GETPARTITION(name_to_open.file.partition, partition, 0);
@@ -1540,7 +1540,10 @@ int IecChannel::open_file(void)  // name should be in buffer
     fault_logged = false;
     buffer[pointer] = 0; // string terminator
     DBGIECV("Open file. Raw Filename = '%s'\n", buffer);
-    int parse_err = parse_open((const char *)buffer, name_to_open);
+    // A name that fills the buffer is refused, as a command is, rather than opened under
+    // its first bytes (SI-022).
+    int parse_err = (pointer >= CBMDOS_COMMAND_BUFFER_SIZE) ? ERR_SYNTAX_ERROR_CMDLENGTH :
+                    parse_open((const char *)buffer, name_to_open);
     if (parse_err) {
         state = e_error;
         drive->set_error(parse_err, 0, 0);
@@ -1963,7 +1966,7 @@ int IecCommandChannel::do_copy(filename_t& dest, filename_t sources[], int n)
     // So in order to know the destination extension, we'd need to first open the first file
     // using wildcards and then see what file was opened.
     mstring work;
-    FileInfo info(48);
+    FileInfo info(INFO_SIZE);
     const char *source1 = ConstructPath(work, sources[0], e_any, e_read);
     FRESULT fres = source1 ? fm->fstat(source1, info) : FR_NO_PATH;
     if (fres != FR_OK) {
@@ -2093,19 +2096,32 @@ int IecCommandChannel::do_format(filename_t& dest, const char *id)
         return 0;
     }
 
+    // Inside a disk image N would create an image in the image, which is not what a
+    // program formatting its disk asks for; formatting the mounted image under the file
+    // system that has it open is not safe, so it is refused.
+    FileInfo dir_info(4);
+    Directory *probe = NULL;
+    if (fm->open_directory(dir.c_str(), &probe, &dir_info) == FR_OK) {
+        delete probe;
+        if (dir_info.fs && dir_info.fs->supports_direct_sector_access()) {
+            return ERR_SYNTAX_ERROR_GEN;
+        }
+    }
+
+    // A label of up to 16 characters and a four character extension.
     char name[24];
     char label[24];
-    strncpy(name, dest.filename.c_str(), 19);
-    name[19] = 0;
-    strcpy(label, name);
+    strncpy(name, dest.filename.c_str(), 20);
+    name[20] = 0;
     iec_image_t kind = iec_image_type(name);
     bool extension_given = (kind != e_image_none);
-    if (extension_given) {
-        label[strrchr(label, '.') - label] = 0;
-    } else {
+    if (!extension_given) {
         kind = e_image_d64;
+        name[16] = 0;
         strcat(name, ".D64");
     }
+    strcpy(label, name);
+    label[strrchr(label, '.') - label] = 0;
 
     int idlen = strlen(id);
     if (kind == e_image_dnp) {
@@ -2186,7 +2202,7 @@ int IecCommandChannel::do_rename(filename_t &src, filename_t &dest)
 {
     mstring works, workd;
     const char *src_path = ConstructPath(works, src, e_any, e_read);
-    FileInfo info(48);
+    FileInfo info(INFO_SIZE);
     FRESULT fres = src_path ? fm->fstat(src_path, info) : FR_NO_PATH;
     if (fres != FR_OK) {
         GETPARTITION(src.partition, partition, 0);
@@ -2267,22 +2283,33 @@ static int scratch_matching(FileManager *fm, const char *dir_path, const char *p
         return 0;
     }
     IndexedList<mstring *> victims(8, NULL);
+    IndexedList<mstring *> locked(4, NULL);
     FileInfo info(INFO_SIZE);
     while (dir->get_entry(info) == FR_OK) {
-        // Directories are not scratched, and neither are locked files (SI-076).
-        if ((info.attrib & (AM_DIR | AM_VOL | AM_RDO)) || !info.lfname[0]) {
+        if ((info.attrib & (AM_DIR | AM_VOL)) || !info.lfname[0]) {
             continue;
+        }
+        // Inside a disk image an entry is found by its name with the type extension,
+        // which generate_fat_name() adds; on a host file system it is the name itself.
+        char entry[80];
+        mstring *full = new mstring(dir_path);
+        append_path_component(*full, info.generate_fat_name(entry, sizeof(entry)));
+        // Locked files are not scratched (SI-076). A delete removes the first entry of a
+        // name, so an entry that follows a locked one of the same name, which a damaged
+        // disk image can have, is not scratched either.
+        bool behind_locked = false;
+        for (int i = 0; (i < locked.get_elements()) && !behind_locked; i++) {
+            behind_locked = (strcmp(locked[i]->c_str(), full->c_str()) == 0);
         }
         char cbm_name[24];
         filetype_t ftype = e_any;
         iec_entry_name(fm, dir_path, &info, cbm_name, ftype);
-        if (pattern_match(pattern, cbm_name, false)) {
-            // Inside a disk image an entry is found by its name with the type extension,
-            // which generate_fat_name() adds; on a host file system it is the name itself.
-            char entry[80];
-            mstring *full = new mstring(dir_path);
-            append_path_component(*full, info.generate_fat_name(entry, sizeof(entry)));
+        if (info.attrib & AM_RDO) {
+            locked.append(full);
+        } else if (!behind_locked && pattern_match(pattern, cbm_name, false)) {
             victims.append(full);
+        } else {
+            delete full;
         }
     }
     delete dir;
@@ -2293,6 +2320,9 @@ static int scratch_matching(FileManager *fm, const char *dir_path, const char *p
             scratched++;
         }
         delete victims[i];
+    }
+    for (int i = 0; i < locked.get_elements(); i++) {
+        delete locked[i];
     }
     return scratched;
 }
@@ -2308,9 +2338,11 @@ int IecCommandChannel::do_scratch(filename_t filenames[], int n)
     int scratched = 0;
     for(int i=0;i<n;i++) {
         GETPARTITION(filenames[i].partition, partition, 0);
-        if (resolve_directory_path(fm, partition, filenames[i].path, work) == FR_OK) {
-            scratched += scratch_matching(fm, work.c_str(), filenames[i].filename.c_str());
+        if (resolve_directory_path(fm, partition, filenames[i].path, work) != FR_OK) {
+            drive->set_error(ERR_DIRECTORY_ERROR, partition->GetPartitionNumber(), 0);
+            return 0;
         }
+        scratched += scratch_matching(fm, work.c_str(), filenames[i].filename.c_str());
     }
     // Scratching nothing is not an error: the answer is 01 with a count of zero (SI-033).
     set_error(ERR_FILES_SCRATCHED, scratched);
