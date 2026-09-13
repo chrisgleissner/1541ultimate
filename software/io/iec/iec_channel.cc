@@ -90,11 +90,6 @@ IecChannel::IecChannel(IecDrive *dr, int ch)
     recordDirty = false;
     dir_free = 0;
     buffer_partition = 0;
-    buffer_size = 256;
-    large_buffer = NULL;
-    raw_dir = false;
-    raw_sectors = 0;
-    raw_count = 0;
     pingpong = true;
     swap_buffers();
 }
@@ -384,7 +379,7 @@ t_channel_retval IecChannel::push_data(uint8_t b)
         break;
 
     case e_buffer:
-        if (pointer < buffer_size) {
+        if (pointer < 256) {
             buffer[pointer++] = b;
         }
         break;
@@ -405,37 +400,32 @@ t_channel_retval IecChannel::push_command(uint8_t b)
         pointer = 0;
         break;
     case 0xE0: // close
-        {
-            t_channel_retval rv = IEC_OK;
-            if ((name_to_open.access == e_write) || (name_to_open.access == e_append)) {
-                if (f) {
-                    if (pointer > 0) {
-                        uint32_t dummy;
-                        FRESULT res = f->write(buffer, pointer, &dummy);
-                        if (res != FR_OK) {
-                            state = e_error;
-                            rv = IEC_WRITE_ERROR;
-                        }
+        if ((name_to_open.access == e_write) || (name_to_open.access == e_append)) {
+            if (f) {
+                if (pointer > 0) {
+                    uint32_t dummy;
+                    FRESULT res = f->write(buffer, pointer, &dummy);
+                    if (res != FR_OK) {
+                        state = e_error;
+                        return IEC_WRITE_ERROR;
                     }
-                    if (rv == IEC_OK) {
-                        close_file();
-                        state = e_idle;
-                        name_to_open.access = e_not_set; // closed; closing again is not a write
-                    }
-                } else {
-                    state = e_error;
-                    rv = IEC_WRITE_ERROR;
                 }
-            } else if (state == e_record) {
-                state = e_idle;
-                rv = write_record();
                 close_file();
+                name_to_open.access = e_not_set; // closed: I and UJ closing it again is not a write
             } else {
-                close_file();
-                state = e_idle;
+                state = e_error;
+                return IEC_WRITE_ERROR;
             }
-            return rv;
+        } else if (state == e_record) {
+            state = e_idle;
+            t_channel_retval r = write_record();
+            close_file();
+            return r;
+        } else {
+            close_file();
         }
+        state = e_idle;
+        break;
     case 0x60:
         reset_prefetch();
         break;
@@ -497,11 +487,6 @@ t_channel_retval IecChannel::write_record(void)
 
     if (!recordDirty) {
         return IEC_OK; // do nothing; no data was received
-    }
-    if (int err = drive->refuse_write()) {
-        drive->set_error(err, 0, 0);
-        state = e_error;
-        return IEC_WRITE_ERROR;
     }
     if (f) {
         if ((pointer < recordSize) && (pointer >= 0)) {
@@ -662,17 +647,6 @@ static bool x00_header(const uint8_t *header, uint32_t length, char *cbm_name, u
         *record_length = header[25];
     }
     return true;
-}
-
-static FRESULT x00_write_header(File *f, const char *cbm_name, uint8_t record_length)
-{
-    uint8_t header[X00_HEADER_SIZE];
-    memset(header, 0, sizeof(header));
-    memcpy(header, "C64File", 7);
-    strncpy((char *)header + 8, cbm_name, 16);
-    header[25] = record_length;
-    uint32_t tr;
-    return f->write(header, X00_HEADER_SIZE, &tr);
 }
 
 // The CBM name, and the type, of a host file that is a genuine x00 wrapper; false for any
@@ -1017,9 +991,6 @@ int IecChannel::read_dir_entry(void)
     FileInfo info(40);
     const char *partition_type = NULL;
     FRESULT fres;
-    if (raw_dir && (state == e_dir)) {
-        return read_raw_directory();
-    }
     if (state == e_dir) {
         if (!dir) {
             return -1;
@@ -1095,10 +1066,6 @@ int IecChannel::read_dir_entry(void)
     if (info.attrib & AM_VOL) {
         return 1;
     }    
-    // A hidden entry is listed only when H asks for hidden files (SI-134, SI-077).
-    if ((state == e_dir) && (info.attrib & (AM_HID | AM_SYS)) && !name_to_open.dir_opt.show_hidden) {
-        return 1;
-    }
 
     // convert FAT name to CBM name; an x00 wrapper lists as what it wraps (SI-144)
     char cbm_name[24];
@@ -1313,133 +1280,6 @@ int IecChannel :: setup_directory_read()
         while ((pos < 24) && (*pp))
             buffer[pos++] = toupper(*(pp++));
     }
-    if (channel != 0) {
-        return setup_raw_directory(fs);
-    }
-    return 0;
-}
-
-// SI-137: "$" on a secondary address other than 0 reads the directory the way a 1541
-// stores it, as directory sectors without their two link bytes, following SD
-// load_directory(). A D64, D71 or D81 image has those sectors, so the stream follows
-// the chain from the header sector on its directory track. Any other directory, a
-// DNP included, gets a made up BAM sector built from the header line above, then one
-// 32 byte entry per file. The header line is still in the buffer when this is called.
-int IecChannel :: setup_raw_directory(FileSystem *fs)
-{
-    raw_dir = true;
-    raw_count = 0;
-    raw_sectors = 0;
-    int header_track = 0;
-    if (fs->supports_direct_sector_access()) {
-        switch (fs->get_sectors_in_track(1)) {
-        case 21: header_track = 18; break; // D64 and D71
-        case 40: header_track = 40; break; // D81
-        }
-    }
-    if (header_track) {
-        raw_link[0] = (uint8_t)header_track;
-        raw_link[1] = 0;
-        raw_sectors = 256; // a bound for a damaged chain that loops
-        return read_raw_directory();
-    }
-
-    uint8_t header[32];
-    memcpy(header, buffer, 32);
-    memset(buffer, 0, 256);
-    buffer[0] = 'A';
-    memset(buffer + 0x8E, 0xA0, 27);
-    for (int i = 0; i < 16; i++) {
-        buffer[0x8E + i] = header[8 + i];
-    }
-    for (int i = 15; (i >= 0) && (buffer[0x8E + i] == ' '); i--) {
-        buffer[0x8E + i] = 0xA0;
-    }
-    memcpy(buffer + 0xA0, header + 26, 5);
-    if (buffer[0xA2] == ' ') {
-        buffer[0xA2] = 0xA0;
-    }
-    pointer = 0;
-    prefetch = 0;
-    prefetch_max = 254;
-    last_byte = -1;
-    return 0;
-}
-
-// The next piece of a raw directory: a directory sector of a disk image, or one entry
-// of a made up sector. Returns what read_dir_entry() returns.
-int IecChannel :: read_raw_directory(void)
-{
-    if (raw_sectors > 0) {
-        Path path(dir_path.c_str());
-        FRESULT fres = fm->fs_read_sector(&path, buffer, raw_link[0], raw_link[1]);
-        raw_sectors--;
-        if (fres != FR_OK) {
-            drive->set_error_fres(fres);
-            state = e_complete;
-            return -1;
-        }
-        raw_link[0] = buffer[0];
-        raw_link[1] = buffer[1];
-        pointer = 2;
-        prefetch = 2;
-        prefetch_max = 256;
-        last_byte = -1;
-        if (!buffer[0]) { // the last sector, which says where its data ends
-            last_byte = (buffer[1] < 2) ? 2 : buffer[1];
-        } else if (!raw_sectors) {
-            last_byte = 255;
-        }
-        return 0;
-    }
-
-    FileInfo info(40);
-    bool entry = false;
-    while (dir) {
-        if (dir->get_entry(info) != FR_OK) {
-            delete dir;
-            dir = NULL;
-            break;
-        }
-        if (info.attrib & AM_VOL) {
-            continue;
-        }
-        if ((info.attrib & (AM_HID | AM_SYS)) && !name_to_open.dir_opt.show_hidden) {
-            continue;
-        }
-        entry = true;
-        break;
-    }
-    // After the last file, empty entries complete the sector, and a whole empty sector
-    // follows when the last one was full or there were no files, as in SD
-    // rawdir_dummy_refill().
-    memset(buffer, 0, 32);
-    if (entry) {
-        char cbm_name[24];
-        filetype_t ftype = e_any;
-        info.size -= iec_entry_name(fm, dir_path.c_str(), &info, cbm_name, ftype);
-        const uint8_t codes[] = { 1, 2, 1, 3, 4, 6 }; // any lists as SEQ, as in a listing
-        buffer[2] = 0x80 | codes[(int)ftype];
-        if (info.attrib & AM_RDO) {
-            buffer[2] |= 0x40;
-        }
-        buffer[3] = 1;
-        memset(buffer + 5, 0xA0, 16);
-        for (int i = 0; (i < 16) && cbm_name[i]; i++) {
-            buffer[5 + i] = cbm_name[i];
-        }
-        uint32_t blocks = (info.size + 253) / 254;
-        if (blocks > 65535) {
-            blocks = 65535;
-        }
-        buffer[30] = (uint8_t)blocks;
-        buffer[31] = (uint8_t)(blocks >> 8);
-    }
-    pointer = (raw_count == 0) ? 2 : 0;
-    prefetch = pointer;
-    prefetch_max = 32;
-    raw_count = (raw_count + 1) % 8;
-    last_byte = (!entry && (raw_count == 0)) ? 31 : -1;
     return 0;
 }
 
@@ -1531,17 +1371,6 @@ int IecChannel :: setup_file_access()
         }
     }
 
-    // A save, a write, an append and the creation of a relative file change the medium.
-    if (int err = drive->refuse_write()) {
-        FileInfo existing(4);
-        bool creates_rel = (name_to_open.filetype == e_rel) && (name_to_open.record_size != 0) &&
-                           (fm->fstat(full_path, existing) != FR_OK);
-        if ((name_to_open.access == e_write) || (name_to_open.access == e_append) || creates_rel) {
-            drive->set_error(err, 0, 0);
-            return 0;
-        }
-    }
-
     uint8_t flags;
     switch(name_to_open.access) {
     case e_append:
@@ -1567,75 +1396,18 @@ int IecChannel :: setup_file_access()
     DBGIECV("Setup File Access %s %02x\n", full_path, flags);
 
     // A relative file that already exists is opened by its CBM name, which finds it in an
-    // x00 wrapper too (SI-146). With the x00 File Wrapper setting (SI-145), a new file of a
-    // type it covers is created as an x00 file on a host file system, while a file that
-    // exists under the name is replaced, with @, in the layout it has.
-    bool creates = (name_to_open.access == e_write) || ((name_to_open.filetype == e_rel) && name_to_open.record_size);
-    bool wrap = false;
-    bool rewrap = false;
-    FRESULT fres;
-    if (creates && !name_to_open.file.has_wildcard) {
-        int mode = drive->get_x00_mode();
-        bool covered = (name_to_open.filetype == e_seq) || (name_to_open.filetype == e_usr) ||
-                       (name_to_open.filetype == e_rel) || ((mode == 2) && (name_to_open.filetype == e_prg));
-        if (mode && covered) {
-            GETPARTITION(name_to_open.file.partition, partition, 0);
-            mstring dir;
-            FileInfo dir_info(4);
-            Directory *probe_dir = NULL;
-            if ((resolve_directory_path(fm, partition, name_to_open.file.path, dir) == FR_OK) &&
-                (fm->open_directory(dir.c_str(), &probe_dir, &dir_info) == FR_OK)) {
-                delete probe_dir;
-                wrap = dir_info.fs && !dir_info.fs->supports_direct_sector_access();
-            }
-            if (wrap) {
-                work = dir; // the name is chosen below, unless the file exists
-            }
-        }
-        if (wrap || (name_to_open.filetype == e_rel)) {
-            GETPARTITION(name_to_open.file.partition, partition, 0);
-            mstring existing;
-            if (resolve_existing_iec_path(fm, partition, name_to_open.file, name_to_open.filetype,
-                                          false, true, false, existing) == FR_OK) {
-                if ((name_to_open.access == e_write) && !name_to_open.replace) {
-                    drive->set_error(ERR_FILE_EXISTS, 0, 0);
-                    return 0;
-                }
-                rewrap = (name_to_open.access == e_write) && iec_x00_probe(fm, existing.c_str(), NULL, NULL, NULL);
-                work = existing;
-                full_path = work.c_str();
-                wrap = false;
-            }
+    // x00 wrapper too (SI-146), rather than created again beside it.
+    if ((name_to_open.filetype == e_rel) && name_to_open.record_size && !name_to_open.file.has_wildcard) {
+        GETPARTITION(name_to_open.file.partition, partition, 0);
+        mstring existing;
+        if (resolve_existing_iec_path(fm, partition, name_to_open.file, e_rel,
+                                      false, true, false, existing) == FR_OK) {
+            work = existing;
+            full_path = work.c_str();
         }
     }
 
-    if (wrap) {
-        // The host name is the CBM name with a P, S, U or R and the first two digits that
-        // are not taken.
-        char host[64];
-        petscii_to_fat(name_to_open.file.filename.c_str(), host, sizeof(host) - 5);
-        int len = strlen(host);
-        mstring dir = work;
-        fres = FR_EXIST;
-        for (int n = 0; (n < 100) && (fres == FR_EXIST); n++) {
-            snprintf(host + len, 5, ".%c%02d", "?PSUR"[(int)name_to_open.filetype], n);
-            work = dir;
-            append_path_component(work, host);
-            fres = fm->fopen(work.c_str(), flags | FA_CREATE_NEW, &f);
-        }
-        full_path = work.c_str();
-    } else {
-        fres = fm->fopen(full_path, flags, &f);
-    }
-    if (((fres == FR_OK) && (wrap || rewrap))) {
-        fres = x00_write_header(f, name_to_open.file.filename.c_str(),
-                                (name_to_open.filetype == e_rel) ? name_to_open.record_size : 0);
-        dataOffset = X00_HEADER_SIZE;
-        if (fres != FR_OK) {
-            fm->fclose(f);
-            f = NULL;
-        }
-    }
+    FRESULT fres = fm->fopen(full_path, flags, &f);
     if ((fres == FR_NO_FILE) && ((name_to_open.access == e_read) || (name_to_open.access == e_append))) {
         GETPARTITION(name_to_open.file.partition, partition, 0);
         fres = open_by_rendered_iec_name(fm, partition, name_to_open.file,
@@ -1662,7 +1434,7 @@ int IecChannel :: setup_file_access()
     uint8_t wrapped_length = 0;
     filetype_t wrapped_type;
     bool wrapped = false;
-    if (!dataOffset && (name_to_open.access != e_write) && x00_path(full_path, &wrapped_type) && f->get_size()) {
+    if ((name_to_open.access != e_write) && x00_path(full_path, &wrapped_type) && f->get_size()) {
         if ((f->read(head, X00_HEADER_SIZE, &head_bytes) == FR_OK) &&
             x00_header(head, head_bytes, NULL, &wrapped_length)) {
             dataOffset = X00_HEADER_SIZE;
@@ -1684,10 +1456,6 @@ int IecChannel :: setup_file_access()
                 recordOffset = 2; // First record follows the REL header, also on a reused channel.
                 state = e_record;
             }
-        } else if (dataOffset && !wrapped) { // just created, with an R00 header
-            recordSize = name_to_open.record_size;
-            recordOffset = dataOffset;
-            state = e_record;
         } else { // file already exists
             // The record length is at offset 25 of an R00 header, or the first byte of a
             // plain file, which is this firmware's two byte layout or sd2iec's one byte
@@ -1750,43 +1518,15 @@ int IecChannel :: setup_file_access()
     return 0;
 }
 
-// "#" opens a 256 byte buffer with its pointer at byte 1; "##n", exactly three bytes, a
-// buffer of n times 256 bytes with its pointer at 0 (SI-090, SD README "Large buffers").
-// n is one digit from 1 to 9. Two blocks fit the channel's own block; more are allocated
-// for as long as the channel stays open. A count that is not a digit from 1 to 9, or
-// memory that cannot be had, is refused with 70. The channel keeps the partition that
-// is current now (SI-093).
+// "#" opens a 256 byte buffer with its pointer at byte 1 (SI-090, SD README). The channel
+// keeps the partition that is current now (SI-093).
 int IecChannel::setup_buffer_access(void)
 {
-    const char *name = (const char *)buffer; // may be the large buffer of the last open
-    int blocks = 1;
-    int start = 1;
-    if ((strlen(name) == 3) && (name[1] == '#')) {
-        blocks = name[2] - '0';
-        start = 0;
-    }
-    release_large_buffer();
-    if ((blocks < 1) || (blocks > 9)) {
-        state = e_error;
-        drive->set_error(ERR_NO_CHANNEL, 0, 0);
-        return -1;
-    }
-    if (blocks > 2) {
-        large_buffer = (uint8_t *)malloc(256 * blocks);
-        if (!large_buffer) {
-            state = e_error;
-            drive->set_error(ERR_NO_CHANNEL, 0, 0);
-            return -1;
-        }
-        memset(large_buffer, 0, 256 * blocks);
-        buffer = large_buffer;
-    }
-    pointer = start;
-    buffer_size = 256 * blocks;
-    buffer_partition = drive->vfs->GetTargetPartitionNumber(0);
-    last_byte = buffer_size - 1;
+    last_byte = 255;
+    pointer = 1;
     prefetch = pointer;
-    prefetch_max = buffer_size;
+    prefetch_max = 256;
+    buffer_partition = drive->vfs->GetTargetPartitionNumber(0);
     state = e_buffer;
 
     return 0;
@@ -1812,10 +1552,6 @@ int IecChannel::open_file(void)  // name should be in buffer
 
     recordSize = 0;
     dataOffset = 0;
-    raw_dir = false;
-    if (name_to_open.dir_opt.stream != e_stream_buffer) {
-        release_large_buffer(); // the name is parsed; a buffer open reads it once more
-    }
 
     int result = -1;
     switch(name_to_open.dir_opt.stream) {
@@ -1852,20 +1588,8 @@ int IecChannel::close_file(void) // file should be open
         delete dir;
         dir = NULL;
     }
-    release_large_buffer();
     state = e_idle;
     return 0;
-}
-
-// Gives back the memory of a ##n buffer larger than the channel's own block, and points
-// the channel at its own block again.
-void IecChannel::release_large_buffer(void)
-{
-    if (large_buffer) {
-        free(large_buffer);
-        large_buffer = NULL;
-        buffer = curblk->bufdata;
-    }
 }
 
 int IecChannel::ext_open_file(const char *name)
@@ -2101,7 +1825,7 @@ int IecCommandChannel :: do_block_read(int chan, int part, int track, int sector
     FRESULT fres = fm->fs_read_sector(&path, channel->buffer, track, sector);
     sector_error(fres, track, sector);
     channel->pointer = length_byte ? 1 : 0;
-    channel->last_byte = length_byte ? channel->buffer[0] : (channel->buffer_size - 1);
+    channel->last_byte = length_byte ? channel->buffer[0] : 255;
     channel->reset_prefetch();
     state = e_idle;
     return 0;
@@ -2111,9 +1835,6 @@ int IecCommandChannel :: do_block_read(int chan, int part, int track, int sector
 // pointer minus one in byte 0 (SI-094).
 int IecCommandChannel::do_block_write(int chan, int part, int track, int sector, bool length_byte)
 {
-    if (int err = drive->refuse_write()) {
-        return err;
-    }
     IecChannel *channel = buffer_channel(chan);
     if (!channel) {
         return 0;
@@ -2133,9 +1854,6 @@ int IecCommandChannel::do_block_write(int chan, int part, int track, int sector,
 // parameter is ignored like that of the other direct access commands (SI-013).
 int IecCommandChannel::do_block_allocate(int part, int track, int sector, bool alloc)
 {
-    if (int err = drive->refuse_write()) {
-        return err;
-    }
     GETPARTITION(0, partition, -1);
     Path path(partition->GetFullPath());
     FRESULT fres = fm->fs_allocate_sector(&path, track, sector, alloc);
@@ -2144,16 +1862,14 @@ int IecCommandChannel::do_block_allocate(int part, int track, int sector, bool a
     return 0;
 }
 
-// B-P and P on a buffer channel. The low byte positions within a 256 byte block and the
-// high byte selects the block of a large buffer, wrapping at its end (SI-092).
+// B-P on a buffer channel.
 int IecCommandChannel :: do_buffer_position(int chan, int pos)
 {
     IecChannel *channel = buffer_channel(chan);
     if (!channel) {
         return 0;
     }
-    int blocks = channel->buffer_size / 256;
-    channel->pointer = (((pos >> 8) % blocks) * 256) + (pos & 0xFF);
+    channel->pointer = pos & 0xFF;
     channel->reset_prefetch();
     set_error(ERR_ALL_OK);
     return ERR_ALL_OK;
@@ -2202,9 +1918,6 @@ int IecCommandChannel::do_change_dir(filename_t& dest)
 
 int IecCommandChannel::do_make_dir(filename_t& dest)
 {
-    if (int err = drive->refuse_write()) {
-        return err;
-    }
     mstring work;
     const char *fullpath = ConstructPath(work, dest, e_folder, e_read);
     if (fullpath) {
@@ -2219,9 +1932,6 @@ int IecCommandChannel::do_make_dir(filename_t& dest)
 
 int IecCommandChannel::do_remove_dir(filename_t& dest)
 {
-    if (int err = drive->refuse_write()) {
-        return err;
-    }
     mstring work;
     const char *fullpath = ConstructPath(work, dest, e_folder, e_read);
     if (fullpath) {
@@ -2251,9 +1961,6 @@ int IecCommandChannel::do_remove_dir(filename_t& dest)
 
 int IecCommandChannel::do_copy(filename_t& dest, filename_t sources[], int n)
 {
-    if (int err = drive->refuse_write()) {
-        return err;
-    }
     // Curiously, an original drive takes the file type from the FIRST file it copies.
     // So in order to know the destination extension, we'd need to first open the first file
     // using wildcards and then see what file was opened.
@@ -2380,9 +2087,6 @@ int IecCommandChannel::do_reset(bool cold)
 // existing file is left alone, as an existing DNP always is. A new image needs an id.
 int IecCommandChannel::do_format(filename_t& dest, const char *id)
 {
-    if (int err = drive->refuse_write()) {
-        return err;
-    }
     GETPARTITION(dest.partition, partition, -1);
     mstring dir;
     FRESULT fres = resolve_directory_path(fm, partition, dest.path, dir);
@@ -2482,9 +2186,6 @@ int IecCommandChannel::do_format(filename_t& dest, const char *id)
 
 int IecCommandChannel::do_rename(filename_t &src, filename_t &dest)
 {
-    if (int err = drive->refuse_write()) {
-        return err;
-    }
     mstring works, workd;
     const char *src_path = ConstructPath(works, src, e_any, e_read);
     FileInfo info(48);
@@ -2509,16 +2210,12 @@ int IecCommandChannel::do_rename(filename_t &src, filename_t &dest)
     }
     // ftype is now set to the type of the original file.
     
-    // A rename does not move a file to another directory (SI-074, SD parse_rename()), and
-    // the new name must not be taken by an entry of any type, unless it is the old name
-    // spelled in another case.
-    GETPARTITION(src.partition, src_partition, 0);
+    // The new name must not be taken by an entry of any type, unless it is the old name
+    // spelled in another case (SI-074).
     GETPARTITION(dest.partition, dest_partition, 0);
-    mstring src_dir, dest_dir;
-    if ((resolve_directory_path(fm, src_partition, src.path, src_dir) != FR_OK) ||
-        (resolve_directory_path(fm, dest_partition, dest.path, dest_dir) != FR_OK) ||
-        (strcmp(src_dir.c_str(), dest_dir.c_str()) != 0)) {
-        return ERR_FILE_NOT_FOUND;
+    mstring dest_dir;
+    if (resolve_directory_path(fm, dest_partition, dest.path, dest_dir) != FR_OK) {
+        return ERR_PARTITION_ERROR;
     }
     if (strcasecmp(cbm_name, dest.filename.c_str()) != 0) {
         mstring taken;
@@ -2608,9 +2305,6 @@ static int scratch_matching(FileManager *fm, const char *dir_path, const char *p
 // and deleted a locked entry that followed an unlocked one (CR-8, SI-076).
 int IecCommandChannel::do_scratch(filename_t filenames[], int n)
 {
-    if (int err = drive->refuse_write()) {
-        return err;
-    }
     DBGIECV("Scratch %d files:\n", n);
     mstring work;
     int scratched = 0;
@@ -2838,235 +2532,32 @@ int IecCommandChannel::do_get_partition_info(int part)
 // Byte 30      - CHR$(13)
 }
 
-// R-P:newname=oldname (SI-051). The old name is matched against the name the
-// partition directory shows, and the new one must not be shown by another partition.
-int IecCommandChannel::do_rename_partition(const char *newname, const char *oldname)
+// L[n][path]:name toggles the lock of the first file or directory whose CBM name matches
+// (SI-076, HD 9-30). The entry is found through the directory, as a scratch finds it, so
+// the name matches the entry a listing shows.
+int IecCommandChannel::do_lock(filename_t& name)
 {
-    if (int err = drive->refuse_write()) {
-        return err;
+    GETPARTITION(name.partition, partition, -1);
+    mstring work;
+    FileInfo info(INFO_SIZE);
+    FRESULT fres = resolve_existing_iec_path(fm, partition, name, e_any, true, true, true, work, &info);
+    if (fres == FR_OK) {
+        fres = fm->set_attributes(work.c_str(), info.attrib ^ AM_RDO, AM_RDO);
     }
-    IecPartition *found = NULL;
-    for (int i = 1; i < MAX_PARTITIONS; i++) {
-        IecPartition *p = drive->vfs->GetPartition(i);
-        if (!p || (p->GetPartitionNumber() != i)) {
-            continue;
-        }
-        char shown[24];
-        FileInfo info(40);
-        filetype_t ftype = e_any;
-        strncpy(info.lfname, p->GetName(), info.lfsize);
-        info.lfname[info.lfsize - 1] = 0;
-        IecPartition::CreateIecName(&info, shown, ftype);
-        if (!found && pattern_match(oldname, shown, false)) {
-            found = p;
-        } else if (strcmp(newname, shown) == 0) {
-            return ERR_FILE_EXISTS;
-        }
+    if (fres == FR_NOT_ENABLED) {
+        return ERR_SYNTAX_ERROR_GEN; // the medium has no lock
     }
-    if (!found) {
-        return ERR_FILE_NOT_FOUND;
-    }
-    char host[52];
-    petscii_to_fat(newname, host, sizeof(host) - 1);
-    found->SetName(host);
-    return 0;
-}
-
-// R-H[n][path]:newname (SI-064). A directory on a host file system has no header
-// apart from its name, so the directory itself is renamed; at the root of a partition
-// the header is the partition's name. A partition standing inside the renamed
-// directory follows it.
-int IecCommandChannel::do_rename_header(filename_t& dest)
-{
-    if (int err = drive->refuse_write()) {
-        return err;
-    }
-    GETPARTITION(dest.partition, partition, -1);
-    char host[52];
-    petscii_to_fat(dest.filename.c_str(), host, sizeof(host) - 1);
-
-    mstring full_path, relative;
-    FRESULT fres = resolve_directory_path(fm, partition, dest.path, full_path, &relative);
     if (fres != FR_OK) {
         drive->set_error_fres(fres);
-        return 0;
-    }
-    if (strcmp(relative.c_str(), "/") == 0) {
-        partition->SetName(host);
-        return 0;
-    }
-
-    // relative is /A/B/C/: the parent is /A/B/ and the directory is C.
-    char rel[256];
-    strncpy(rel, relative.c_str(), sizeof(rel) - 1);
-    rel[sizeof(rel) - 1] = 0;
-    int len = strlen(rel);
-    if (len && (rel[len - 1] == '/')) {
-        rel[--len] = 0;
-    }
-    char *last = strrchr(rel, '/');
-    if (!last) {
-        drive->set_error(ERR_DIRECTORY_ERROR, partition->GetPartitionNumber(), 0);
-        return 0;
-    }
-    *last = 0; // rel is now the parent, without its trailing slash
-
-    mstring old_full(partition->GetRootPath());
-    old_full += relative.c_str() + 1;
-    mstring new_full(partition->GetRootPath());
-    new_full += rel[0] ? (rel + 1) : "";
-    if (rel[0]) {
-        new_full += "/";
-    }
-    new_full += host;
-
-    const char *o = old_full.c_str();
-    if (old_full.length() && (o[old_full.length() - 1] == '/')) {
-        mstring trimmed(o, 0, old_full.length() - 2);
-        old_full = trimmed;
-    }
-    fres = fm->rename(old_full.c_str(), new_full.c_str());
-    if (fres != FR_OK) {
-        drive->set_error_fres(fres);
-        return 0;
-    }
-
-    // Follow the partition's working directory into the new name.
-    const char *cwd = partition->GetRelativePath();
-    int rlen = relative.length();
-    if (strncmp(cwd, relative.c_str(), rlen) == 0) {
-        mstring moved(rel);
-        moved += "/";
-        moved += host;
-        moved += "/";
-        moved += cwd + rlen;
-        partition->cd(moved.c_str());
     }
     return 0;
 }
 
-// The host file of the disk image a partition's working directory is inside, or false
-// when it is on the host file system.
-static bool image_of_working_directory(FileManager *fm, IecPartition *partition, mstring& image)
-{
-    mstring path(partition->GetFullPath());
-    while (path.length() > 1) {
-        const char *p = path.c_str();
-        int len = path.length();
-        if (p[len - 1] == '/') {
-            len--;
-        }
-        mstring trimmed(p, 0, len - 1);
-        FileInfo info(8);
-        if ((fm->fstat(trimmed.c_str(), info) == FR_OK) && !(info.attrib & AM_DIR)) {
-            image = trimmed;
-            return true;
-        }
-        const char *slash = strrchr(trimmed.c_str(), '/');
-        if (!slash) {
-            break;
-        }
-        mstring parent(trimmed.c_str(), 0, slash - trimmed.c_str());
-        path = parent;
-    }
-    return false;
-}
-
-// L, EL, EU, EH and A: (SI-076, SI-077). A toggle (L, EH) and A: act on the first entry
-// that matches, file or directory; EL and EU on every file each pattern matches, and
-// with $ on the disk image the working directory is in.
-int IecCommandChannel::do_attributes(filename_t names[], int n, uint8_t attrib, uint8_t mask, bool toggle)
-{
-    if (int err = drive->refuse_write()) {
-        return err;
-    }
-    for (int i = 0; i < n; i++) {
-        GETPARTITION(names[i].partition, partition, -1);
-        FRESULT fres = FR_OK;
-        if (names[i].filename == "$") {
-            mstring image;
-            if (!image_of_working_directory(fm, partition, image)) {
-                return ERR_SYNTAX_ERROR_GEN;
-            }
-            fres = fm->set_attributes(image.c_str(), attrib, mask);
-        } else if (toggle || (mask != CBMDOS_ATTR_LOCKED)) {
-            mstring work;
-            FileInfo info(48);
-            // The canonical host name first, which also finds a hidden entry; then the
-            // rendered names, which find what the canonical mapping cannot produce.
-            const char *direct = names[i].has_wildcard ? NULL : ConstructPath(work, names[i], e_any, e_read);
-            fres = direct ? fm->fstat(direct, info) : FR_NO_FILE;
-            if (fres == FR_OK) {
-                mstring dir;
-                resolve_directory_path(fm, partition, names[i].path, dir);
-                char entry[80];
-                work = dir.c_str();
-                append_path_component(work, (info.name_format & NAME_FORMAT_CBM) ?
-                                      info.generate_fat_name(entry, sizeof(entry)) : info.lfname);
-            } else {
-                fres = resolve_existing_iec_path(fm, partition, names[i], e_any, true, true, true, work, &info);
-            }
-            if (fres == FR_OK) {
-                uint8_t value = toggle ? (info.attrib ^ attrib) : attrib;
-                fres = fm->set_attributes(work.c_str(), value, mask);
-            }
-        } else {
-            mstring dir;
-            fres = resolve_directory_path(fm, partition, names[i].path, dir);
-            Directory *listing = NULL;
-            if (fres == FR_OK) {
-                fres = fm->open_directory(dir.c_str(), &listing);
-            }
-            if (fres == FR_OK) {
-                IndexedList<mstring *> matched(8, NULL);
-                FileInfo info(INFO_SIZE);
-                while (listing->get_entry(info) == FR_OK) {
-                    if ((info.attrib & (AM_DIR | AM_VOL)) || !info.lfname[0]) {
-                        continue;
-                    }
-                    char cbm_name[24];
-                    filetype_t ftype = e_any;
-                    IecPartition::CreateIecName(&info, cbm_name, ftype);
-                    if (pattern_match(names[i].filename.c_str(), cbm_name, false)) {
-                        char entry[80];
-                        mstring *full = new mstring(dir.c_str());
-                        append_path_component(*full, info.generate_fat_name(entry, sizeof(entry)));
-                        matched.append(full);
-                    }
-                }
-                delete listing;
-                for (int m = 0; m < matched.get_elements(); m++) {
-                    FRESULT one = fm->set_attributes(matched[m]->c_str(), attrib, mask);
-                    if (one != FR_OK) {
-                        fres = one;
-                    }
-                    delete matched[m];
-                }
-            }
-        }
-        if (fres == FR_NOT_ENABLED) {
-            return ERR_SYNTAX_ERROR_GEN; // the medium has no such attribute
-        }
-        if (fres != FR_OK) {
-            drive->set_error_fres(fres);
-            return 0;
-        }
-    }
-    return 0;
-}
-
-// U0>, S-8, S-9 and S-D (SI-100, SI-101). The drive answers this command on the
-// number it was addressed on and every later one on the new number.
+// U0> (SI-100). The drive answers this command on the number it was addressed on and
+// every later one on the new number.
 int IecCommandChannel::do_set_device_number(int dev)
 {
     drive->set_device_number(dev);
-    return 0;
-}
-
-// W-0 and W-1 (SI-102).
-int IecCommandChannel::do_write_protect(bool on)
-{
-    drive->set_write_protect(on);
     return 0;
 }
 

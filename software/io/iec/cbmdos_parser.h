@@ -50,10 +50,9 @@ typedef struct {
     uint32_t max_datetime;
     uint8_t filetypes; // P,S,U,R, B/D
     uint8_t partition_types; // one bit per CMD partition type; zero means all of them
-    bool show_hidden; // H: also list hidden files; not a file type (SI-134)
 } dir_options_t;
 
-const dir_options_t c_dir_options_init = { e_stream_file, e_stamp_none, 0, 0, 0x00, 0x00, false };
+const dir_options_t c_dir_options_init = { e_stream_file, e_stamp_none, 0, 0, 0x00, 0x00 };
 
 typedef struct {
     filename_t file;
@@ -71,11 +70,6 @@ typedef struct {
 #define ERR_ILLEGAL_NAME  33 // a wildcard or a character a name cannot carry
 #define ERR_NO_NAME       34 // no name, or a colon with nothing after it
 #define ERR_REPLACE_TYPE  64 // FILE TYPE MISMATCH: @ names nothing that can be replaced
-
-// The attributes L, EL, EU, EH and A: set, in the bits the FAT file system uses for them.
-#define CBMDOS_ATTR_LOCKED   0x01 // AM_RDO; the lock bit of a CBM directory entry
-#define CBMDOS_ATTR_HIDDEN   0x02 // AM_HID
-#define CBMDOS_ATTR_ARCHIVE  0x20 // AM_ARC
 
 // The command buffer holds 254 bytes, as on the CMD HD (HD 4-6) and on sd2iec's uIEC
 // (CONFIG_COMMAND_BUFFER_SIZE). A command that fills it is refused, because whether
@@ -108,12 +102,8 @@ public:
     virtual int do_set_position(int chan, uint32_t pos, int recnr, int recoffset) { return 0; }
     virtual int do_pwd_command() { return 0; }
     virtual int do_get_partition_info(int part) { return 0; }
-    virtual int do_rename_partition(const char *newname, const char *oldname) { return 0; }
-    virtual int do_rename_header(filename_t& dest) { return 0; }
-    virtual int do_set_device_number(int dev) { return 0; } // 0: the configured number
-    virtual int do_write_protect(bool on) { return 0; }
-    // Sets, or with toggle flips, the attribute bits in mask on the entries named.
-    virtual int do_attributes(filename_t names[], int n, uint8_t attrib, uint8_t mask, bool toggle) { return 0; }
+    virtual int do_set_device_number(int dev) { return 0; }
+    virtual int do_lock(filename_t& name) { return 0; } // L: toggles the lock of one entry
 };
 
 class IecParser
@@ -130,19 +120,11 @@ class IecParser
     int rename_command(const uint8_t *buffer, int len);
     int scratch_command(const uint8_t *buffer, int len);
     int time_command(const uint8_t *buffer, int len);
-    int time_write(const uint8_t *buffer, int len);
     int user_command(const uint8_t *buffer, int len);
     int extended_command(const uint8_t *buffer, int len);
     int get_command(const uint8_t *buffer, int len);
-    int rename_sub_command(const uint8_t *buffer, int len);
-    int swap_command(const uint8_t *buffer, int len);
-    int write_protect_command(const uint8_t *buffer, int len);
     int memory_command(const uint8_t *buffer, int len);
-    int header_command(const char *text);
     int lock_command(const uint8_t *buffer, int len);
-    int attribute_command(const uint8_t *buffer, int len);
-    int e_command(const uint8_t *buffer, int len);
-    int direct_command(const uint8_t *buffer, int len);
 
 public:
     IecParser(IecCommandExecuter *e) : exec(e) { }

@@ -197,7 +197,7 @@ def check_compatibility(agent, api, password, folder, root):
 
     The host suites check each requirement against the same code; these are the ones
     whose answer depends on something only the device has: the IEC processor's device
-    number slots (U0> and S-D), the CPU the firmware runs on, whose char is signed on
+    number slots (U0>), the CPU the firmware runs on, whose char is signed on
     the Nios II of an Ultimate 64 and unsigned on the RISC-V of an Ultimate 64 II and an
     Ultimate II+L (the shifted space rule, SI-147), and the real bus timing of a command
     that fills the 254 byte buffer.
@@ -269,7 +269,7 @@ def check_compatibility(agent, api, password, folder, root):
             # Back to device 11 whatever happened, so the checks after this one still
             # have their drive.
             try:
-                agent.call(2, 15, b"S-D\r", device=12)
+                agent.call(2, 15, b"U0>" + bytes([11]) + b"\r", device=12)
             except Failure:
                 pass
             close_quietly(12)
@@ -312,40 +312,6 @@ def check_compatibility(agent, api, password, folder, root):
         detail(f"MADE.D64 is {len(image)} bytes, label {image[BAM_OFFSET + 144:BAM_OFFSET + 148]!r}")
         if len(image) != 174848 or image[BAM_OFFSET + 144:BAM_OFFSET + 148] != b"MADE":
             raise Failure("N did not create a formatted 1541 image")
-
-    def raw_directory():
-        agent.command(b"CD//" + here + b"\r")
-        agent.call(1, channel=3, data=b"$", secondary=3)
-        try:
-            agent.status()
-            raw = agent.read_stream(channel=3)
-        finally:
-            agent.call(4, channel=3)
-            agent.command(b"CD//\r")
-        detail(f"{len(raw)} bytes, starting {raw[:4].hex()}, label {raw[0x8E:0x9E]!r}")
-        if len(raw) < 508 or len(raw) % 254 or raw[0] != ord("A"):
-            raise Failure(f"$ on secondary address 3 returned {len(raw)} bytes starting {raw[:4].hex()}")
-        if not raw[0x8E:0x9E].rstrip(b"\xa0") == here[:16]:
-            raise Failure(f"the made up BAM sector names {raw[0x8E:0x9E]!r}")
-
-    def clock_write():
-        def clock():
-            return agent.command_reply(b"T-RI\r", 24).decode("ascii").strip()
-
-        before = clock()
-        started = time.monotonic()
-        detail(f"the clock read {before!r}")
-        try:
-            agent.command(b"T-WI2031-01-02T03:04:05\r")
-            after = clock()
-            detail(f"after T-WI2031-01-02T03:04:05 it reads {after!r}")
-            if not after.startswith("2031-01-02T03:04:0") or not after.endswith("THU"):
-                raise Failure(f"the clock reads {after!r} after T-W")
-            agent.command(b"T-WI2031-01-02T24:04:05\r", allowed=(30,))
-        finally:
-            restored = datetime.datetime.strptime(before[:19], "%Y-%m-%dT%H:%M:%S")
-            restored += datetime.timedelta(seconds=round(time.monotonic() - started))
-            agent.command(b"T-WI" + restored.strftime("%Y-%m-%dT%H:%M:%S").encode("ascii") + b"\r")
 
     def resets():
         agent.call(1, channel=4, data=b"//" + here + b"/:KEPT,S,W")
@@ -404,24 +370,6 @@ def check_compatibility(agent, api, password, folder, root):
         if not response.startswith("01, FILES SCRATCHED,01") or "GAME.P00" in left:
             raise Failure(f"S:TUNE answered {response!r} and left {sorted(left)}")
 
-    def x00_write():
-        api.configs.set("SoftIEC Drive Settings", "x00 File Wrapper", "SEQ, USR and REL")
-        try:
-            agent.call(1, channel=3, data=b"//" + here + b"/:WRAPPED,S,W")
-            try:
-                agent.status()
-                agent.call(2, channel=3, data=b"hello")
-            finally:
-                agent.call(4, channel=3)
-        finally:
-            api.configs.set("SoftIEC Drive Settings", "x00 File Wrapper", "Off")
-        with ftp.session(api.host, password) as client:
-            entries = ftp.names(client, directory)
-            stored = ftp.retrieve(client, f"{directory}/WRAPPED.S00") if "WRAPPED.S00" in entries else b""
-        detail(f"WRAPPED is stored as {sorted(e for e in entries if e.startswith('WRAPPED'))}, {stored!r}")
-        if stored != x00_header(b"WRAPPED") + b"hello":
-            raise Failure(f"WRAPPED.S00 holds {stored!r}")
-
     def rel_layouts():
         # sd2iec's layout: the record length in one byte, then records of three bytes.
         with ftp.session(api.host, password) as client:
@@ -445,16 +393,13 @@ def check_compatibility(agent, api, password, folder, root):
             ("SI-053: I answers OK, UI the DOS version", initialize),
             ("SI-105: M-R answers the two bytes C64 OS asks for, all zero", memory_read),
             ("SI-045, SI-046, SI-130: the partition directory", partition_directory),
-            ("SI-100, SI-101: U0> moves the drive to device 12 on the bus, S-D moves it back", device_number),
+            ("SI-100: U0> moves the drive to device 12 on the bus, and U0> moves it back", device_number),
             ("SI-014: a left arrow between slashes is a directory name", left_arrow),
             ("SI-147, SI-148: a shifted space in a name, on this CPU", shifted_space),
             ("SI-021, SI-022: a 253 byte command runs, a 254 byte one is refused", command_length),
             ("SI-071: N creates a D64 image", format_image),
-            ("SI-137: $ on a secondary address other than 0 is the raw directory", raw_directory),
-            ("SI-120: T-WI sets the clock, and an impossible date answers 30", clock_write),
             ("SI-103: UJ closes the channels and U+shifted J returns to the root, and the drive still answers", resets),
             ("SI-144: a P00 file lists, loads, renames and scratches under the name in its header", x00_read),
-            ("SI-145: with the x00 File Wrapper on, a SEQ file is written as an S00 file", x00_write),
             ("SI-084: a relative file in sd2iec's one byte layout reads its records", rel_layouts),
     ):
         try:

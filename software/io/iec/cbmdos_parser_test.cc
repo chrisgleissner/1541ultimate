@@ -299,26 +299,10 @@ void test_dispatch_text(const char *cmd, int len, int exp_retval, const char *wh
 // them before it falls through to rename and scratch.
 void test_added_commands(void)
 {
-    // SI-051: R-P renames a partition. It must not reach the file rename.
-    test_dispatch_text("R-P:WORK=NATIVE 1", 17, 0, "rename partition", "WORK|NATIVE 1");
-    test_dispatch_text("R-P:WORK=NATIVE 1\r", 18, 0, "rename partition", "WORK|NATIVE 1");
-    test_dispatch("R-P:WORK", 8, 30, NULL);
-    test_dispatch("R-P:=OLD", 8, 34, NULL);
-    test_dispatch("R-P:NEW=", 8, 34, NULL);
-    test_dispatch("R-X:FOO", 7, 30, NULL);
-    // SI-064: R-H renames the header of a directory, with a partition and a path.
-    test_dispatch_text("R-H:WORK", 8, 0, "rename header", "-1||WORK");
-    test_dispatch_text("R-H3:DOWNLOADS\r", 15, 0, "rename header", "3||DOWNLOADS");
-    test_dispatch_text("R-H1//ASSEM/:BUDDY64", 20, 0, "rename header", "1|//ASSEM/|BUDDY64");
-    test_dispatch("R-H:NAME*", 9, 33, NULL);
-    test_dispatch("R-H:ABCDEFGHIJKLMNOPQ", 21, 34, NULL); // 17 characters
-
-    // SI-101: S-8, S-9 and S-D swap the device number; they are not a scratch of a
-    // file called -8. Zero asks for the configured number.
-    test_dispatch("S-8", 3, 0, "device number", 8);
-    test_dispatch("S-9\r", 4, 0, "device number", 9);
-    test_dispatch("S-D", 3, 0, "device number", 0);
-    test_dispatch("S-X", 3, 30, NULL);
+    // S-8, S-9 and S-D swap device numbers, which this drive does not do; they are not a
+    // scratch of a file called -8 (SD parse_doscommand()).
+    test_dispatch("S-8", 3, 31, NULL);
+    test_dispatch("S-D\r", 4, 31, NULL);
     // SI-100: U0> followed by the device number as a byte.
     test_dispatch("U0>\x0C", 4, 0, "device number", 12);
     test_dispatch("U0>\x1E\r", 5, 0, "device number", 30);
@@ -328,24 +312,21 @@ void test_added_commands(void)
     test_dispatch("U0", 2, 30, NULL);
     test_dispatch("U0+", 3, 30, NULL);
 
-    // SI-102: W-1 and W-0 set and clear the write protect.
-    test_dispatch("W-1", 3, 0, "write protect", 1);
-    test_dispatch("W-0\r", 4, 0, "write protect", 0);
-    test_dispatch("W-2", 3, 30, NULL);
-    test_dispatch("W", 1, 30, NULL);
-
     // SI-105 and SI-112: M-R answers the number of bytes asked for, every one of them
     // zero; no count means one, a count of zero means 256, and it stops at the end of
-    // the page. M-W and M-E are accepted and do nothing.
+    // the page. M-W and M-E are refused, because this drive runs no drive code.
     test_dispatch("M-R\xA4\xFE\x02", 6, 0, "command response", 2);
     test_dispatch("M-R\x02\x00\x02\r", 7, 0, "command response", 2);
     test_dispatch("M-R\xA4\xFE", 5, 0, "command response", 1);
     test_dispatch("M-R\x00\xFE\x00", 6, 0, "command response", 256);
     test_dispatch("M-R\xF0\x00\x20", 6, 0, "command response", 16);
     test_dispatch("M-R\xA4", 4, 30, NULL);
-    test_dispatch("M-W\x00\x05\x01\xEA", 7, 0, NULL);
-    test_dispatch("M-E\x00\x05", 5, 0, NULL);
+    test_dispatch("M-W\x00\x05\x01\xEA", 7, 30, NULL);
+    test_dispatch("M-E\x00\x05", 5, 30, NULL);
     test_dispatch("M-X", 3, 30, NULL);
+    // SI-120: the clock belongs to the system, so T-W answers 30 rather than an OK that
+    // would set nothing.
+    test_dispatch("T-WI2026-09-12T13:02:03", 23, 30, NULL);
     test_dispatch("MD:DIR", 6, 0, NULL); // still a directory command
 }
 
@@ -361,7 +342,7 @@ void test_command_length_and_terminator(void)
     test_dispatch(cmd, 254, 32, NULL);
     test_dispatch(cmd, 255, 32, NULL);
 
-    test_dispatch_text("R-H:WORK\rX", 10, 0, "rename header", "-1||WORK");
+    test_dispatch("B-P:2,144\rX", 11, 0, "buffer position", 2, 144);
 }
 
 // SI-060 and SI-063: MD requires a colon and refuses a name that is a shifted space;
@@ -418,33 +399,20 @@ void test_name_mapping(void)
     check_fat_name("escaped length guard", "A\xC1\xC2\xC3\xC4\xC5\xC6", 12, "A{C1C2C3C4}");
 }
 
-// SI-076 and SI-077: the lock and attribute commands, and the header forms sd2iec also
-// accepts. The stub records the attribute bits asked for and which of them are set:
-// a = value, b = mask, c = 1 for a toggle.
-void test_attribute_commands(void)
+// SI-076: L toggles the lock of one entry.
+void test_lock_command(void)
 {
-    test_dispatch_text("L:TEST", 6, 0, "attributes", "-1||TEST", 0x01);
-    test_dispatch_text("L1//:TEST\r", 10, 0, "attributes", "1|//|TEST", 0x01);
+    test_dispatch_text("L:TEST", 6, 0, "lock", "-1||TEST");
+    test_dispatch_text("L1//:TEST\r", 10, 0, "lock", "1|//|TEST");
     test_dispatch("L:", 2, 34, NULL);
-    test_dispatch_text("EL:ONE,TWO", 10, 0, "attributes", "-1||ONE,-1||TWO", 0x01);
-    test_dispatch_text("EU:ONE", 6, 0, "attributes", "-1||ONE", 0x00);
-    test_dispatch_text("EH/:FILE", 8, 0, "attributes", "-1|/|FILE", 0x02);
-    test_dispatch_text("A:RH=FILE", 9, 0, "attributes", "-1||FILE", 0x03);
-    test_dispatch_text("A:=FILE\r", 8, 0, "attributes", "-1||FILE", 0x00);
-    test_dispatch("A:RH", 4, 30, NULL);
-    // The header forms: EH with a colon straight after the partition, XH and D.
-    test_dispatch_text("EH:WORK,AB", 10, 0, "rename header", "-1||WORK");
-    test_dispatch_text("XH:WORK", 7, 0, "rename header", "-1||WORK");
-    test_dispatch_text("D:WORK,AB\r", 10, 0, "rename header", "-1||WORK");
-    test_dispatch("DI", 2, 30, NULL);
 }
 
-// SI-092: B-P takes an optional third number, the high byte of the position.
-void test_buffer_position_high_byte(void)
+// B-P positions within the 256 byte buffer; a third number is ignored, as the ROM ignores it.
+// SI-094: B-R and B-W use the first byte of the block as a length, U1 and U2 do not.
+void test_block_positions_and_lengths(void)
 {
-    test_dispatch("B-P 9 4 1", 9, 0, "buffer position", 9, 260);
+    test_dispatch("B-P 9 4 1", 9, 0, "buffer position", 9, 4);
     test_dispatch("B-P:2,144", 9, 0, "buffer position", 2, 144);
-    // SI-094: B-R and B-W use the first byte of the block as a length, U1 and U2 do not.
     test_dispatch("B-R:2,0,18,1", 12, 0, "block read", 2, 0, 18, 1);
     test_dispatch("U1:2,0,18,1", 11, 0, "block read", 2, 0, 18, 1);
     if (!last_stub_call.text[0] || strcmp(last_stub_call.text, "no length")) {
@@ -468,6 +436,7 @@ void test_error_codes(void)
     // SI-031: not a command letter. CHR$(0) and A are what the reporter measured on
     // #877; Z and Q never become commands.
     test_dispatch("\0", 1, 31, NULL);
+    test_dispatch("A", 1, 31, NULL);
     test_dispatch("Z", 1, 31, NULL);
     test_dispatch("Q\r", 2, 31, NULL);
     // A colon with nothing after it.
@@ -486,14 +455,11 @@ void test_error_codes(void)
     test_dispatch("XFOO", 4, 30, NULL);
     test_dispatch("EFOO", 4, 30, NULL);
 
-    // SI-053 and SI-054: I and V are commands of their own. I releases the channels a
-    // program left open and answers OK; UI is the reset that answers with the DOS
-    // version; V has nothing to validate and answers OK.
+    // SI-053: I is a command of its own. It releases the channels a program left open and
+    // answers OK; UI is the reset that answers with the DOS version.
     test_dispatch("I", 1, 0, "initialize buffers");
     test_dispatch("I0:\r", 4, 0, "initialize buffers");
     test_dispatch("UI", 2, 73, "initialize");
-    test_dispatch("V", 1, 0, NULL);
-    test_dispatch("V0:\r", 4, 0, NULL);
 
     // An open name carrying a character a name cannot carry.
     open_t o;
@@ -563,68 +529,6 @@ void test_log_formatters(void)
     test_log_render("quoting", quoting, 3, "22 5C 0A", "\\\"\\\\\\n");
 
     test_log_truncation();
-}
-
-// The clock a T-W command sets. The firmware's set_current_time() sets the real time
-// clock; this one records what it was given, and has_clock chooses whether there is a
-// clock at all.
-static int clock_values[7];
-static bool has_clock = true;
-extern "C" int set_current_time(int wd, int year, int month, int day, int hour, int min, int sec)
-{
-    if (!has_clock) {
-        return -1;
-    }
-    int v[7] = { wd, year, month, day, hour, min, sec };
-    memcpy(clock_values, v, sizeof(v));
-    return 0;
-}
-
-static void expect_clock(const char *cmd, int len, int exp_retval, int wd, int year, int month, int day,
-                         int hour, int min, int sec)
-{
-    memset(clock_values, 0xFF, sizeof(clock_values));
-    int retval = parser.execute_command((const uint8_t *)cmd, len);
-    int v[7] = { wd, year, month, day, hour, min, sec };
-    bool ok = (retval == exp_retval);
-    if (exp_retval == 0) {
-        ok = ok && (memcmp(clock_values, v, sizeof(v)) == 0);
-    }
-    if (!ok) {
-        printf("Clock command '%.4s' returned %d and set %d %d-%d-%d %d:%d:%d, expected %d and %d %d-%d-%d %d:%d:%d\n",
-               cmd, retval, clock_values[0], clock_values[1], clock_values[2], clock_values[3],
-               clock_values[4], clock_values[5], clock_values[6],
-               exp_retval, wd, year, month, day, hour, min, sec);
-        failures++;
-    } else {
-        printf("Clock command '%.4s' => OK!\n", cmd);
-    }
-}
-
-// SI-120: T-WA, T-WB, T-WD and T-WI set the clock in the formats T-R reads it in, with the
-// year taken as 1980 to 2079, and answer 30 when the time is not one or there is no clock.
-static void test_clock_write(void)
-{
-    expect_clock("T-WATUES 09/12/26 01:02:03 PM\r", 30, 0, 2, 2026, 9, 12, 13, 2, 3);
-    expect_clock("T-WAMON. 01/01/80 12:00:00 AM", 29, 0, 1, 1980, 1, 1, 0, 0, 0);
-    expect_clock("T-WASAT. 09/12/26 12:30:00 PM", 29, 0, 6, 2026, 9, 12, 12, 30, 0);
-    expect_clock("T-WAFRI. 12/31/79 23:59:58", 26, 0, 5, 2079, 12, 31, 23, 59, 58); // 24 hour, no marker
-    expect_clock("T-WB\x06\x26\x09\x12\x01\x02\x03\x01\r", 13, 0, 6, 2026, 9, 12, 13, 2, 3);
-    expect_clock("T-WD\x06\x7E\x09\x0C\x0C\x02\x03\x00\r", 13, 0, 6, 2026, 9, 12, 0, 2, 3);
-    expect_clock("T-WI2026-09-12T13:02:03 SAT\r", 28, 0, 6, 2026, 9, 12, 13, 2, 3);
-    expect_clock("T-WI1980-01-01T00:00:00", 23, 0, 2, 1980, 1, 1, 0, 0, 0);
-
-    expect_clock("T-WASUN. 13/07/25 09:34:13 PM", 29, 30, 0, 0, 0, 0, 0, 0, 0); // month 13
-    expect_clock("T-WAXYZ. 09/12/26 01:02:03 PM", 29, 30, 0, 0, 0, 0, 0, 0, 0); // no such day
-    expect_clock("T-WA", 4, 30, 0, 0, 0, 0, 0, 0, 0);
-    expect_clock("T-WB\x06\x26\x09", 7, 30, 0, 0, 0, 0, 0, 0, 0);
-    expect_clock("T-WD\x06\x7E\x09\x00\x0C\x02\x03\x00", 12, 30, 0, 0, 0, 0, 0, 0, 0); // day 0
-    expect_clock("T-WI2026-09-12T24:00:00", 23, 30, 0, 0, 0, 0, 0, 0, 0);
-    expect_clock("T-WI1979-12-31T23:59:59", 23, 30, 0, 0, 0, 0, 0, 0, 0); // before the clock's epoch
-    expect_clock("T-WX", 4, 30, 0, 0, 0, 0, 0, 0, 0);
-    has_clock = false;
-    expect_clock("T-WI2026-09-12T13:02:03", 23, 30, 0, 0, 0, 0, 0, 0, 0);
-    has_clock = true;
 }
 
 int main(int argc, const char *argv[])
@@ -799,15 +703,11 @@ int main(int argc, const char *argv[])
 
     d_parse_open("$=P:*=X", o, ERR_SYNTAX);
 
-    // SI-134: H is not a file type but a flag that shows hidden files, so it must not
-    // set a type bit: $:*=H lists what $:* lists.
+    // SI-134: H is not a file type but asks for hidden files, which are listed anyway, so
+    // it must not set a type bit: $:*=H lists what $:* lists.
     d_parse_open("$:*=H", o, 0,
                 { -1, "", "*", true, false, e_any, e_not_set,
                   e_stream_dir, e_stamp_none, 0x0, 0x00, 0x00 });
-    if (!o.dir_opt.show_hidden) {
-        printf("Open '$:*=H' does not ask for hidden files\n");
-        failures++;
-    }
     d_parse_open("$:*=P,H", o, 0,
                 { -1, "", "*", true, false, e_any, e_not_set,
                   e_stream_dir, e_stamp_none, 0x0, 0x00, 0x02 });
@@ -848,9 +748,8 @@ int main(int argc, const char *argv[])
     test_command_length_and_terminator();
     test_md_rd_grammar();
     test_name_mapping();
-    test_attribute_commands();
-    test_clock_write();
-    test_buffer_position_high_byte();
+    test_lock_command();
+    test_block_positions_and_lengths();
     test_command(34, (const uint8_t *)"C99:EMPTY=", 10);
     test_command( 0, (const uint8_t *)"C1:FCOPY=3:FCOPY", 16);
     test_command( 0, (const uint8_t *)"C:FULLSTATS=STAT1,3:STAT3", 25);

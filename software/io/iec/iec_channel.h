@@ -321,21 +321,11 @@ class IecChannel {
     bool recordDirty;
 
     // A direct access channel (#): the partition that was current when it was opened, which
-    // its block commands use (SI-093), and its size, 256 bytes or n times that for ##n (SI-090).
-    // Up to two blocks fit the channel's own 512 byte block; a larger ##n gets large_buffer.
+    // its block commands use (SI-093).
     int buffer_partition;
-    int buffer_size;
-    uint8_t *large_buffer;
 
-    // The directory a listing reads, which x00 names are probed in (SI-144). A raw directory,
-    // "$" on a secondary address other than 0 (SI-137), in a disk image reads raw_link, the
-    // next directory sector, of which raw_sectors more may be read; elsewhere raw_count
-    // counts the entries of the current sector.
+    // The directory a listing reads, which x00 names are probed in (SI-144).
     mstring dir_path;
-    bool raw_dir;
-    uint8_t raw_link[2];
-    int raw_sectors;
-    int raw_count;
 
     // temporaries
     uint8_t flags;
@@ -352,11 +342,8 @@ class IecChannel {
 private:
     int setup_partition_read();
     int setup_directory_read();
-    int setup_raw_directory(FileSystem *fs);
-    int read_raw_directory(void);
     int setup_file_access();
     int setup_buffer_access(void);
-    void release_large_buffer(void);
     int init_iec_transfer(void);
 
     int open_file(void);  // name should be in buffer
@@ -426,11 +413,8 @@ class IecCommandChannel: public IecChannel, public IecCommandExecuter {
     int do_set_position(int chan, uint32_t pos, int recnr, int recoffset);
     int do_pwd_command();
     int do_get_partition_info(int part);
-    int do_rename_partition(const char *newname, const char *oldname);
-    int do_rename_header(filename_t& dest);
     int do_set_device_number(int dev);
-    int do_write_protect(bool on);
-    int do_attributes(filename_t names[], int n, uint8_t attrib, uint8_t mask, bool toggle);
+    int do_lock(filename_t& name);
 public:
     IecCommandChannel(IecDrive *dr, int ch);
     virtual ~IecCommandChannel();

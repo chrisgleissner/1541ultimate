@@ -6,7 +6,8 @@ file and symbol, and every such citation is labelled as current behaviour. A rea
 who wants to know what the firmware does now should read
 [software/test/iecdrive/doc.md](../software/test/iecdrive/doc.md),
 [doc/filenames_design.txt](filenames_design.txt) and
-[tests/e2e/io/iec/README.md](../tests/e2e/io/iec/README.md).
+[tests/e2e/io/iec/README.md](../tests/e2e/io/iec/README.md). Section 18.1 lists the
+requirements that PR #881 does not implement.
 
 The goal is that an Ultimate 64 or Ultimate II+ can be the system drive of C64 OS,
 and that in doing so it also becomes a closer replacement for an sd2iec, a CMD HD, a
@@ -1536,6 +1537,28 @@ open that fails and the first failure of a channel, with the bytes the host sent
 Successful operations write nothing, so the log costs nothing on the path of a
 successful command or byte and still shows every incompatibility of the kind TRACE
 was collected for.
+
+### 18.1 What PR #881 implements
+
+PR #881 implements the requirements that fix a defect, or that the reporter of #877 and
+#890 or the C64 OS author's gap analysis (GAP) names. The requirements below are
+specified but not implemented by it, because no report and no program named so far
+needs them; each answers as stated.
+
+| Requirement | Answer now |
+| --- | --- |
+| SI-051 `R-P`, SI-064 `R-H` | `30` |
+| SI-054 `V` | `31` |
+| SI-074, C14: a rename into another directory | the file moves, as before |
+| SI-077 `EL:`, `EU:`, `EH:`, `XH:` | `30`; `A:` and `D:` answer `31` |
+| SI-090 to SI-092 `##n` large buffers and the `B-P` high byte | `##n` opens a standard buffer; the high byte is ignored |
+| SI-101 `S-8`, `S-9`, `S-D` | `31`, as sd2iec answers |
+| SI-102 `W-0`, `W-1` | `31` |
+| SI-105 `M-W`, `M-E` | `30`, because no drive code runs |
+| SI-120 `T-W` | `30`, which SI-120 allows |
+| SI-134 hidden files left out of a listing | hidden files are listed, as before; `=H` filters nothing |
+| SI-137 the raw directory on a secondary address other than 0 | the listing, as before |
+| SI-145 writing x00 files | not written; x00 files are read (SI-144) |
 
 ---
 

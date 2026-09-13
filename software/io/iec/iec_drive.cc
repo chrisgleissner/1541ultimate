@@ -22,15 +22,10 @@
 #define CFG_IEC_ENABLE   0x51
 #define CFG_IEC_BUS_ID   0x52
 #define CFG_IEC_PATH     0x53
-#define CFG_IEC_X00      0x54
-
-// sd2iec's extension modes 0, 1 and 2 for new files (SI-145).
-static const char *x00_modes[] = { "Off", "SEQ, USR and REL", "All files" };
 
 static struct t_cfg_definition iec_config[] = {
     { CFG_IEC_ENABLE,    CFG_TYPE_ENUM,   "IEC Drive",         "%s", en_dis, 0,  1, 0 },
     { CFG_IEC_BUS_ID,    CFG_TYPE_VALUE,  "Soft Drive Bus ID", "%d", NULL,   8, 30, 11 },
-    { CFG_IEC_X00,       CFG_TYPE_ENUM,   "x00 File Wrapper",  "%s", x00_modes, 0, 2, 0 },
     { 0xFF, CFG_TYPE_END, "", "", NULL, 0, 0, 0 }
 };
 
@@ -147,7 +142,6 @@ IecDrive :: IecDrive() : SubSystem(SUBSYSID_IEC)
     cfg->set_sort_order(SORT_ORDER_CFG_SOFTIEC);
 
     enable = false;
-    write_protected = false;
     cmd_path = fm->get_new_path("IEC Gui Path");
 
     last_error_code = ERR_DOS;
@@ -234,11 +228,6 @@ void IecDrive :: effectuate_settings(void)
     enable = uint8_t(cfg->get_value(CFG_IEC_ENABLE));
 
     intf->configure();
-}
-
-int IecDrive :: get_x00_mode(void)
-{
-    return cfg->get_value(CFG_IEC_X00);
 }
 
 void IecDrive :: create_task_items(void)
@@ -401,24 +390,13 @@ void IecDrive :: talk(void)
     channels[current_channel]->talk();
 }
 
-// The device number for as long as the drive runs, from U0> or S-8, S-9 and S-D (SI-100,
-// SI-101). It is not written to the configuration: HD 9-49 describes the change as
-// temporary. 0 asks for the configured number back.
+// The device number for as long as the drive runs, from U0> (SI-100). It is not written to
+// the configuration: HD 9-49 describes the change as temporary.
 void IecDrive :: set_device_number(int dev)
 {
-    if (dev == 0) {
-        dev = cfg->get_value(CFG_IEC_BUS_ID);
-    }
     my_bus_id = dev;
     cmd_if.set_kernal_device_id(my_bus_id);
     intf->readdress(slot_id);
-}
-
-// While the software write protect is on, every command and every open that would
-// change the medium answers 26 (SI-102). Returns the error to answer, or 0.
-int IecDrive :: refuse_write(void)
-{
-    return write_protected ? ERR_WRITE_PROTECT_ON : 0;
 }
 
 // called from IEC task, statically

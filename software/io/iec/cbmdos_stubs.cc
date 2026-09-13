@@ -53,11 +53,8 @@ public:
     int do_set_position(int chan, uint32_t pos, int recnr, int recoffset);
     int do_pwd_command();
     int do_get_partition_info(int part);
-    int do_rename_partition(const char *newname, const char *oldname);
-    int do_rename_header(filename_t& dest);
     int do_set_device_number(int dev);
-    int do_write_protect(bool on);
-    int do_attributes(filename_t names[], int n, uint8_t attrib, uint8_t mask, bool toggle);
+    int do_lock(filename_t& name);
 };
 
 
@@ -183,40 +180,16 @@ int IecCommandExecuterStubs::do_cmd_response(uint8_t *data, int len)
     return 0;
 }
 
-int IecCommandExecuterStubs::do_rename_partition(const char *newname, const char *oldname)
-{
-    record_stub_call("rename partition");
-    snprintf(last_stub_call.text, sizeof(last_stub_call.text), "%s|%s", newname, oldname);
-    return 0;
-}
-
-int IecCommandExecuterStubs::do_rename_header(filename_t& dest)
-{
-    record_stub_call("rename header");
-    record_stub_name(dest);
-    return 0;
-}
-
 int IecCommandExecuterStubs::do_set_device_number(int dev)
 {
     record_stub_call("device number", dev);
     return 0;
 }
 
-int IecCommandExecuterStubs::do_attributes(filename_t names[], int n, uint8_t attrib, uint8_t mask, bool toggle)
+int IecCommandExecuterStubs::do_lock(filename_t& name)
 {
-    record_stub_call("attributes", attrib, mask, toggle ? 1 : 0);
-    int used = 0;
-    for (int i = 0; i < n; i++) {
-        used += snprintf(last_stub_call.text + used, sizeof(last_stub_call.text) - used, "%s%d|%s|%s",
-                         i ? "," : "", names[i].partition, names[i].path.c_str(), names[i].filename.c_str());
-    }
-    return 0;
-}
-
-int IecCommandExecuterStubs::do_write_protect(bool on)
-{
-    record_stub_call("write protect", on ? 1 : 0);
+    record_stub_call("lock");
+    record_stub_name(name);
     return 0;
 }
 
