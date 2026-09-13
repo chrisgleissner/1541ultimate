@@ -4,7 +4,6 @@
 #include "file_device.h"
 #include "filesystem_fat.h"
 #include "macros.h"
-#include "iec_trace.h" // #877 diagnostics; removed with them
 #include <unistd.h>
 #include <string.h>
 
@@ -3982,6 +3981,127 @@ static void s11_cr8_scratch_scan(FileManager *fm, IecDrive *dr)
     expect_command_response(testname, dr, "S:TWIN\r", "01, FILES SCRATCHED,01,00\r");
 }
 
+/* =============================================================================
+ * Software IEC failure log.
+ *
+ * The drive writes one line, starting with "SoftIEC: ", for a command that leaves an
+ * error, an open that fails and the first failure of a channel, and nothing for an
+ * operation that succeeds. This suite captures what the drive writes while it runs
+ * operations of both kinds.
+ * ============================================================================= */
+
+static char log_capture[256 * 1024];
+
+static void log_capture_begin(int &saved_fd, FILE *&sink)
+{
+    const char *testname = "Suite11-FailureLog";
+    fflush(stdout);
+    saved_fd = dup(fileno(stdout));
+    sink = fopen("log_capture.txt", "w+");
+    REQUIRE(saved_fd >= 0);
+    REQUIRE(sink != NULL);
+    dup2(fileno(sink), fileno(stdout));
+}
+
+static void log_capture_end(int saved_fd, FILE *sink)
+{
+    const char *testname = "Suite11-FailureLog";
+    fflush(stdout);
+    dup2(saved_fd, fileno(stdout));
+    close(saved_fd);
+    fseek(sink, 0, SEEK_SET);
+    size_t got = fread(log_capture, 1, sizeof(log_capture) - 1, sink);
+    log_capture[got] = 0;
+    fclose(sink);
+    remove("log_capture.txt");
+}
+
+static void expect_log_line(const char *testname, const char *what, const char *needle)
+{
+    if (strstr(log_capture, needle) == NULL) {
+        printf("%s: %s: no log line containing '%s' in:\n%s\n", testname, what, needle, log_capture);
+    }
+    REQUIRE(strstr(log_capture, needle) != NULL);
+}
+
+// Lines of the failure log, and of the diagnostics that came before it.
+static int count_log_lines(void)
+{
+    int n = 0;
+    for (const char *p = log_capture; (p = strstr(p, "SoftIEC: ")) != NULL; p++) {
+        n++;
+    }
+    for (const char *p = log_capture; (p = strstr(p, "SOFTIEC-TRACE")) != NULL; p++) {
+        n++;
+    }
+    return n;
+}
+
+static void s11_failure_log(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-FailureLog";
+
+    // A partition of its own, so the state the earlier suites left behind cannot
+    // change what this one sees.
+    save_fixture_file(fm, "/Temp", "LOGGED.seq", "LOG PAYLOAD");
+    dr->add_partition(9, "/Temp", "LOGPART");
+    expect_command_response(testname, dr, "CP9\r", "02,PARTITION SELECTED,09,00\r");
+
+    int saved_fd = -1;
+    FILE *sink = NULL;
+
+    // Operations that succeed write nothing: a command with a reply, the binary Change
+    // Partition, UI, which answers 73, and an open, a read and a close.
+    log_capture_begin(saved_fd, sink);
+    send_command(dr, "G-P\r");
+    static const uint8_t change_partition[] = { 'C', 0xD0, 0x09 };
+    send_command_data(dr, change_partition, 3);
+    get_status(dr);
+    send_command(dr, "UI\r");
+    uint8_t body[64];
+    open_file(dr, 2, "9:LOGGED,S,R");
+    get_status(dr);
+    int got = read_file(dr, 2, body, sizeof(body));
+    close_file(dr, 2);
+    log_capture_end(saved_fd, sink);
+    REQUIRE(got == 11);
+    printf("%s: %d log lines for operations that succeeded\n", testname, count_log_lines());
+    REQUIRE(count_log_lines() == 0);
+
+    // A command that fails is logged with its bytes, the carriage return still told apart
+    // from a printable byte, and the answer.
+    log_capture_begin(saved_fd, sink);
+    send_command(dr, "ZZ\r");
+    log_capture_end(saved_fd, sink);
+    expect_log_line(testname, "failed command",
+                    "SoftIEC: command failed dev=11 len=3 hex=[5A 5A 0D] txt=\"ZZ\\r\" -> 31,SYNTAX ERROR,00,00");
+    REQUIRE(count_log_lines() == 1);
+
+    // An open that fails is logged with the name as the bus delivered it.
+    log_capture_begin(saved_fd, sink);
+    open_file(dr, 3, "9:NOSUCH,S,R");
+    get_status(dr);
+    close_file(dr, 3);
+    log_capture_end(saved_fd, sink);
+    expect_log_line(testname, "failed open",
+                    "SoftIEC: open failed dev=11 chan=3 len=12 hex=[39 3A 4E 4F 53 55 43 48 2C 53 2C 52] "
+                    "txt=\"9:NOSUCH,S,R\" -> 62,FILE NOT FOUND,00,00");
+    REQUIRE(count_log_lines() == 1);
+
+    // SI-152: a command longer than the rendering reports its real length, and the
+    // rendering says where it was cut.
+    char long_cmd[201];
+    memset(long_cmd, ' ', 200);
+    memcpy(long_cmd, "ZZ", 2);
+    long_cmd[200] = 0;
+    log_capture_begin(saved_fd, sink);
+    send_command(dr, long_cmd);
+    log_capture_end(saved_fd, sink);
+    expect_log_line(testname, "long command length", "SoftIEC: command failed dev=11 len=200 ");
+    expect_log_line(testname, "long command cut", "20 20 20..] txt=");
+
+}
+
 struct Suite11Case {
     const char *name;
     void (*run)(FileManager *fm, IecDrive *dr);
@@ -4043,6 +4163,7 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-CR6-Lock",                s11_cr6_lock },
     { "Suite11-CR7-TextLog",             s11_cr7_text_log },
     { "Suite11-CR8-ScratchScan",         s11_cr8_scratch_scan },
+    { "Suite11-FailureLog",              s11_failure_log },
 };
 
 // Runs every case, or only those whose name contains `only`.
@@ -4067,165 +4188,6 @@ void execute_suite11(FileManager *fm, IecDrive *dr, const char *only)
     printf("Suite11 completed successfully!\n");
 }
 
-
-/* =============================================================================
- * SOFTIEC-TRACE diagnostics, GideonZ/1541ultimate#877.
- *
- * TEMPORARY. This whole block and its single call in main() are removed together
- * with the diagnostics themselves. It captures what the drive writes while a few
- * representative operations run, and checks that each one produced a line under
- * the shared prefix, with the payload bytes the operation actually carried.
- * ============================================================================= */
-
-#if SOFTIEC_TRACE_ENABLED
-
-static char trace_capture[256 * 1024];
-
-static void trace_capture_begin(int &saved_fd, FILE *&sink)
-{
-    const char *testname = "SoftIecTrace";
-    fflush(stdout);
-    saved_fd = dup(fileno(stdout));
-    sink = fopen("trace_capture.txt", "w+");
-    REQUIRE(saved_fd >= 0);
-    REQUIRE(sink != NULL);
-    dup2(fileno(sink), fileno(stdout));
-}
-
-static void trace_capture_end(int saved_fd, FILE *sink)
-{
-    const char *testname = "SoftIecTrace";
-    fflush(stdout);
-    dup2(saved_fd, fileno(stdout));
-    close(saved_fd);
-    fseek(sink, 0, SEEK_SET);
-    size_t got = fread(trace_capture, 1, sizeof(trace_capture) - 1, sink);
-    trace_capture[got] = 0;
-    fclose(sink);
-    remove("trace_capture.txt");
-}
-
-static void expect_trace_line(const char *testname, const char *what, const char *needle)
-{
-    if (strstr(trace_capture, needle) == NULL) {
-        printf("%s: %s: no SOFTIEC-TRACE line containing '%s' in:\n%s\n", testname, what, needle,
-               trace_capture);
-    }
-    REQUIRE(strstr(trace_capture, needle) != NULL);
-}
-
-// Every diagnostic line has to start with the shared prefix, so that removing the
-// feature is a matter of finding one string. Other output the firmware writes during
-// the same operations is left alone; what is checked is that nothing mentions the
-// prefix anywhere but at the start of a line.
-static void expect_every_line_prefixed(const char *testname)
-{
-    const char *p = trace_capture;
-    int traced = 0;
-    while (*p) {
-        const char *end = strchr(p, '\n');
-        int len = end ? (int)(end - p) : (int)strlen(p);
-        if (strncmp(p, SOFTIEC_TRACE_PREFIX, strlen(SOFTIEC_TRACE_PREFIX)) == 0) {
-            traced++;
-        } else if (memmem(p, len, SOFTIEC_TRACE_PREFIX, strlen(SOFTIEC_TRACE_PREFIX))) {
-            printf("%s: a line mentions the prefix but does not start with it: '%.*s'\n",
-                   testname, len, p);
-            REQUIRE(false);
-        }
-        if (!end) {
-            break;
-        }
-        p = end + 1;
-    }
-    if (traced < 8) {
-        printf("%s: only %d diagnostic lines were captured\n", testname, traced);
-    }
-    REQUIRE(traced >= 8);
-}
-
-static void run_softiec_trace_suite(FileManager *fm, IecDrive *dr)
-{
-    const char *testname = "SoftIecTrace";
-    print_scenario("SoftIecTrace", "SOFTIEC-TRACE diagnostics (#877)");
-
-    // A partition of its own, so the state the earlier suites left behind cannot
-    // change what this one sees.
-    save_fixture_file(fm, "/Temp", "TRACED.seq", "TRACE PAYLOAD");
-    dr->add_partition(9, "/Temp", "TRACEPART");
-    expect_command_response(testname, dr, "CP9\r", "02,PARTITION SELECTED,09,00\r");
-
-    int saved_fd = -1;
-    FILE *sink = NULL;
-    trace_capture_begin(saved_fd, sink);
-
-    // A textual command with the carriage return PRINT# appends.
-    send_command(dr, "G-P\r");
-
-    // Change Partition in its binary form, carrying partition 13 as a byte. The
-    // command and the terminator are the same byte, which is the whole of #881.
-    static const uint8_t change_partition[] = { 'C', 0xD0, 0x0D };
-    send_command_data(dr, change_partition, 3);
-    get_status(dr);
-
-    // An OPEN, a read and a CLOSE on a data channel.
-    uint8_t body[64];
-    open_file(dr, 2, "9:TRACED,S,R");
-    get_status(dr);
-    int got = read_file(dr, 2, body, sizeof(body));
-    close_file(dr, 2);
-
-    trace_capture_end(saved_fd, sink);
-
-    if (got != 13) {
-        printf("%s: read %d bytes from the fixture, expected 13\n", testname, got);
-    }
-    REQUIRE(got == 13);
-    expect_every_line_prefixed(testname);
-
-    // The command bytes, in hex and in the escaped form, with the carriage return
-    // still distinguishable from a printable byte.
-    expect_trace_line(testname, "G-P command", "CMD dev=");
-    expect_trace_line(testname, "G-P command bytes", "hex=[47 2D 50 0D]");
-    expect_trace_line(testname, "G-P command text", "txt=\"G-P\\r\"");
-    expect_trace_line(testname, "G-P reply", "REPLY dev=");
-    expect_trace_line(testname, "G-P reply length", "len=31");
-
-    // Partition 13 arrives as a byte and is not confused with the terminator.
-    expect_trace_line(testname, "binary change partition", "hex=[43 D0 0D]");
-    expect_trace_line(testname, "binary change partition text", "txt=\"C\\xD0\\r\"");
-
-    // The open carries the name the bus delivered and where it landed.
-    expect_trace_line(testname, "open name", "hex=[39 3A 54 52 41 43 45 44 2C 53 2C 52]");
-    expect_trace_line(testname, "open host path", "host=/Temp/TRACED.seq");
-
-    // The close reports how much crossed the channel and what the data began with.
-    expect_trace_line(testname, "close byte count", "read=13 [54 52 41 43 45 20 50 41 59 4C 4F 41 44]");
-    expect_trace_line(testname, "close write count", "written=0");
-
-    // The error channel read the host performs after each operation.
-    expect_trace_line(testname, "status read", "STATUS dev=");
-
-    // SI-152: a command longer than the rendering still reports its real length, and
-    // the rendering says where it was cut.
-    char long_cmd[201];
-    memset(long_cmd, ' ', 200);
-    memcpy(long_cmd, "B-P:2,144", 9);
-    long_cmd[200] = 0;
-    trace_capture_begin(saved_fd, sink);
-    send_command(dr, long_cmd);
-    trace_capture_end(saved_fd, sink);
-    expect_trace_line(testname, "long command length", "CMD dev=11 sa=$6F chan=15 len=200 ");
-    expect_trace_line(testname, "long command cut", "20 20 20..] txt=");
-
-    printf("SoftIecTrace completed successfully!\n");
-}
-
-#else /* the diagnostics are compiled out, so there is nothing to check */
-
-static void run_softiec_trace_suite(FileManager *fm, IecDrive *dr) { }
-
-#endif
-/* ===================== end of the #877 diagnostics suite ===================== */
 
 int main(int argc, const char **argv)
 {
@@ -4254,7 +4216,6 @@ int main(int argc, const char **argv)
         execute_suite6(fm, dr);
         execute_suite7(fm, dr);
         execute_suite10(fm, dr);
-        run_softiec_trace_suite(fm, dr); // #877 diagnostics; removed with them
     }
     execute_suite11(fm, dr, only);
 

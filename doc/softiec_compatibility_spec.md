@@ -1405,9 +1405,10 @@ both plain layouts and keeps writing the existing one, and SI-146 provides the
 interchange, so there is nothing to migrate. The number is left retired rather than
 reused, so that a reference to it in an older note resolves to this paragraph.
 
-**SI-152.** Raising the command buffer (SI-021) changes the `SOFTIEC_TRACE_MAX_BYTES`
-assumption in `software/io/iec/iec_trace.h`, which is 64 because the buffers are 64.
-The diagnostics must keep rendering a whole command or mark the cut.
+**SI-152.** Raising the command buffer (SI-021) changes the `SOFTIEC_LOG_MAX_BYTES`
+assumption in `software/io/iec/iec_log.h`, which is 64 because the buffers were 64.
+The failure log must keep reporting a command's real length and mark where its
+rendering is cut.
 
 **SI-153.** Three existing tests encode behaviour this specification changes, and
 each must be updated in the same commit as the change, not separately.
@@ -1490,8 +1491,10 @@ classes qualify and both have already caught defects:
   device.
 
 **T4. The C64 OS acceptance test.** Install C64 OS on a Software IEC partition, boot
-it, and compare the resulting `SOFTIEC-TRACE` log against TRACE. The criterion is
-that no line carries an error code that a CMD HD would not also produce. TRACE gives
+it, and compare the `SoftIEC:` lines of the resulting log against TRACE. The drive
+logs a line only for a failed command, a failed open and a channel fault, so the
+criterion is that no such line carries an error code that a CMD HD would not also
+produce. TRACE gives
 the baseline: 68 commands, 107 opens, 108 closes and 80 status reads in one boot, and
 of its 601 lines 11 carry `33,SYNTAX ERROR` and 9 carry `62,FILE NOT FOUND`.
 
@@ -1527,9 +1530,12 @@ which is the relative file reader the wrapper completes.
 **Group 7, the rest.** SI-090 to SI-092 large buffers, SI-094 `B-R` and `B-W`,
 SI-077 the sd2iec attribute commands, SI-120 clock writes.
 
-The `SOFTIEC-TRACE` diagnostics added by PR #881 stay until group 1 and group 4 are
-finished and the reporter confirms that a C64 OS boot produces no error this document
-does not allow, then are removed by the procedure their own header describes.
+The `SOFTIEC-TRACE` diagnostics added by PR #881 were reduced, before release, to an
+always-enabled failure log: one `SoftIEC:` line for a command that leaves an error, an
+open that fails and the first failure of a channel, with the bytes the host sent.
+Successful operations write nothing, so the log costs nothing on the path of a
+successful command or byte and still shows every incompatibility of the kind TRACE
+was collected for.
 
 ---
 

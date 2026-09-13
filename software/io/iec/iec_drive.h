@@ -99,7 +99,6 @@ public:
     int get_x00_mode(void); // 0 plain files, 1 x00 for SEQ, USR and REL, 2 x00 for all (SI-145)
     int refuse_write(void);
     void set_error(int err, int track, int sector);
-    void trace_configuration(const char *when); // #877 diagnostics only
     void set_error_fres(FRESULT fres);
 
     int get_error_string(char *); // writes string into buffer

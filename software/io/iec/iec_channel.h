@@ -342,24 +342,12 @@ class IecChannel {
     IecPartition *partition;
     char fs_filename[64];
 
-    // #877 diagnostics only: what has crossed this channel since it was opened. The
-    // first sixteen bytes and the last sixteen are kept so a log line can show that
-    // the right data went by without carrying the data itself. trace_dropped counts
-    // the bytes the name buffer had no room for, and trace_faulted keeps a
-    // channel that fails on every byte to one line.
-    uint32_t trace_rd;
-    uint32_t trace_wr;
-    uint8_t trace_rd_head[16];
-    uint8_t trace_rd_ring[16];
-    uint8_t trace_wr_head[16];
-    uint8_t trace_wr_ring[16];
-    uint16_t trace_dropped;
-    bool trace_faulted;
-    void trace_record_read(const uint8_t *data, int len);
-    void trace_record_pop(int n);
-    void trace_record_write(uint8_t b);
-    void trace_reset_counters(void);
-    void trace_fault(const char *what, int rv);
+    // Set when a failure of this channel has been logged, so a channel that fails on every
+    // byte writes one line (see iec_log.h).
+    bool fault_logged;
+    bool drive_failed(void);
+    void log_failure(const char *what, const uint8_t *payload, int len);
+    void log_fault(const char *what);
 
 private:
     int setup_partition_read();
@@ -385,9 +373,6 @@ public:
     IecChannel(IecDrive *dr, int ch);
     virtual ~IecChannel();
     virtual void reset(void);
-    // Not traced: the interface layer calls this on every transmit FIFO refill, so a
-    // JiffyDOS load would produce a line per block. The addressing is traced instead,
-    // in push_command(), which happens once per transfer.
     virtual void talk(void)
     {
     }
@@ -415,11 +400,6 @@ class IecCommandChannel: public IecChannel, public IecCommandExecuter {
     // the last one.
     uint8_t wr_buffer[CBMDOS_COMMAND_BUFFER_SIZE + 1];
     int wr_pointer;
-    // #877 diagnostics only: the secondary address that carried the command bytes,
-    // so a log line can tell an OPEN 15,dev,15,"..." from a PRINT#15, and the count
-    // of command bytes the command buffer had no room for.
-    uint8_t trace_secondary;
-    uint16_t trace_cmd_dropped;
 
     void mem_read(void);
     void mem_write(void);
