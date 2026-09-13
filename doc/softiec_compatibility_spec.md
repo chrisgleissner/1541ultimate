@@ -1720,30 +1720,124 @@ was collected for.
 ### 18.1 What PR #881 implements
 
 PR #881 implements a requirement when it fixes a defect, or when the reporter of #877 or
-#890, GAP or TRACE names it. The requirements below were decided against or narrowed in a
-review of the implementation against that rule; each has a **Decision (PR #881)**
-paragraph with the full reason, and the tests assert the answer in the last column.
+#890, GAP or TRACE names it. A review of the implementation against that rule decided
+against the requirements in the first table and narrowed the ones in the list after it.
+Each of them also has a **Decision (PR #881)** paragraph below the requirement itself, and
+the tests assert the answer given here. The requirements not named in this section are
+implemented as written; the **Decision (PR #881)** paragraphs of SI-076, SI-084, SI-100,
+SI-144 and SI-152 only record how they were implemented.
 
-| Requirement | Decision | Reason, in short | Answer now |
-| --- | --- | --- | --- |
-| SI-016 | in part | the ROM's second branch cuts a binary parameter of 13 short | a CR LF is dropped; a lone CR answers `31` |
-| SI-018 | with a difference | a plain file's position from BASIC must not take the CR as a byte | record and offset as sent, position without the CR |
-| SI-051 `R-P` | not implemented | nothing uses it | `30` |
-| SI-054 `V` | not implemented | an OK inside a disk image would claim a validation that did not happen | `31` |
-| SI-064 `R-H` | not implemented | on a host directory it would rename the directory, which a CMD HD's header rename does not do | `30` |
-| SI-071 `N` | in part | formatting an image under its own mount is not safe | `30` inside a disk image |
-| SI-074 | in part | the move into another directory worked before and a `master` test asserted it | the file moves |
-| SI-077 `EL:`, `EU:`, `EH:`, `A:`, `XH:`, `D:` | not implemented | `L` covers locking; hiding needs listings that hide | `30` for `E`, `X`; `31` for `A`, `D` |
-| SI-090 `##n`, SI-092 | not implemented | large buffers serve sd2iec's 512 byte sector commands, which are out of scope | a standard buffer; a third `B-P` number is ignored |
-| SI-101 `S-8`, `S-9`, `S-D` | not implemented | there is nothing to swap with | `31`, as sd2iec |
-| SI-102 `W-0`, `W-1` | not implemented | nothing asks for it; a check in every write path | `31` |
-| SI-105 `M-W`, `M-E` | not implemented | an OK would tell a loader its drive code runs | `30` |
-| SI-120 `T-W` | not implemented | the clock belongs to the system; C64 OS sets it through UCI | `30`, which SI-120 allows |
-| SI-134 | in part | hidden files were listed before and C64 OS hides by name | `H` filters nothing; hidden files listed |
-| SI-137 | not implemented | it would change what programs reading `$` on a data channel receive | the listing |
-| SI-142 | in part | the length guard difference changes no name | `*` and `?` escaped; guard kept |
-| SI-145 | not implemented | a new setting nobody asks for | x00 files are read, not written |
-| SI-146 | in part | follows SI-145 | `R00` files read and written in place |
+**Not implemented.** No command in TRACE uses any of these, so a C64 OS boot is not
+affected by them.
+
+| Requirement | Why it is not implemented | What the drive answers |
+| --- | --- | --- |
+| SI-051 `R-P` | No report, GAP or TRACE uses it, and the new name would only live in memory until the partition list is saved from the menu | `30` |
+| SI-054 `V` | Inside a disk image, an OK would claim a validation of the block map that did not happen | `31` |
+| SI-064 `R-H` | On a host directory it would rename the directory itself, which a CMD HD's header rename does not do; sd2iec does not support it either | `30` |
+| SI-077 `EL:`, `EU:`, `EH:`, `A:`, `XH:`, `D:` | `L` (SI-076) provides lock and unlock; hiding files has no effect while listings show hidden files; the header forms are `R-H` | `30` for the `E` and `X` forms, `31` for `A` and `D` |
+| SI-090 `##n`, SI-092 | Large buffers serve sd2iec's 512 byte sector commands `DR` and `DW`, which are out of scope (SI-096); this drive's block commands use 256 byte sectors | `##n` opens a standard buffer; a third `B-P` number is ignored |
+| SI-101 `S-8`, `S-9`, `S-D` | There is no second drive to swap with | `31`, as sd2iec answers |
+| SI-102 `W-0`, `W-1` | No report or program asks for a software write protect, and it needs a check in every path that writes | `31` |
+| SI-105 `M-W`, `M-E` | Nothing written is kept and nothing is run, so an OK would tell a fast loader its drive code runs | `30` |
+| SI-120 `T-WA`, `T-WB`, `T-WD`, `T-WI` | The clock belongs to the system, and C64 OS sets it through its UCI clock driver (GAP) | `30`, which SI-120 allows |
+| SI-137 raw directory | It would change what existing programs, and clients of the UCI target, receive when they open `$` on a data channel | the listing, as before |
+| SI-145 writing x00 files | A new user setting that no report asks for; reading x00 files (SI-144) already gives the interchange | new files are written plain |
+
+**Implemented in part, or with a difference.** For each: what is implemented, what is
+not, why, and whether a C64 OS boot as recorded in TRACE is affected.
+
+* **SI-016, the command terminator.**
+  * Implemented: a carriage return at the end of a command is dropped (the ROM's first
+    branch), except after `C`+shifted P (SI-017). A carriage return followed by a line
+    feed at the end is dropped as well, and a lone carriage return answers `31`.
+  * Not implemented: the ROM's second branch, which also ends a command at a carriage
+    return second to last when the last byte is something else, dropping that byte. Here
+    both bytes stay part of the command, so `S:NAME`+`CHR$(13)`+`X` scratches nothing
+    where a 1541 scratches `NAME`.
+  * Why: that branch cuts a binary parameter of 13 short, such as the high byte of an
+    `M-R` address or its count, and the reporter asked on #877 for it not to be reproduced.
+  * C64 OS: not affected. None of the 68 commands in TRACE has a carriage return before its
+    last byte.
+* **SI-018, `P`.**
+  * Implemented: the record number and the offset of a relative file are taken from the
+    command as sent, so an offset of 13 is kept.
+  * Different: the position in a plain file is taken from the command without its
+    terminator, where sd2iec takes it from the command as sent. `"P"+CHR$(2)+CHR$(100)`
+    from BASIC positions to byte 100 here and to byte 3,428 on sd2iec.
+  * Why: this drive positioned to byte 100 before PR #881, and that is what GSD's
+    documented form means.
+  * C64 OS: not affected; TRACE has no `P`.
+* **SI-022, commands that fill the buffer.**
+  * Implemented: a command of 254 bytes or more answers `32` and is not executed.
+  * Different: an OPEN name of 254 bytes or more also answers `32` and opens nothing; the
+    requirement names only commands.
+  * Why: a name cut short would create or read a file under its first bytes, the same data
+    loss the requirement prevents for commands.
+  * C64 OS: not affected; its longest open name in TRACE is 26 bytes.
+* **SI-033, scratching nothing.**
+  * Implemented: a scratch that matches nothing answers `01,FILES SCRATCHED,00,00`, which
+    is what C64 OS's `S/TEMPORARY/:*` receives at boot.
+  * Different: a scratch whose path does not exist answers `71,DIRECTORY ERROR` instead.
+  * Why: a mistyped path should be reported rather than look like an empty directory;
+    sd2iec reports it as well.
+  * C64 OS: not affected. Its system directory contains `temporary/`, whose files it
+    scratches at boot (C64 OS file system documentation).
+* **SI-071, `N`.**
+  * Implemented: creating and formatting D64, D71, D81 and DNP images in a host directory.
+  * Not implemented: `N` inside a mounted disk image, which sd2iec answers by formatting
+    that image. Here it answers `30`.
+  * Why: the image file would be rewritten under the file system that has it mounted and
+    caches its block map.
+  * C64 OS: not affected; TRACE has no `N`.
+* **SI-074, rename.**
+  * Implemented: `34` for an empty new name, `33` for a wildcard in it, `63` for a name any
+    entry already has.
+  * Not implemented: `62` for a rename into another directory or partition. The file is
+    moved, as it was before PR #881 (decision C14 is reversed).
+  * Why: the move worked on `master`, a `master` test asserted it, and IDE64 documents it;
+    no program has been named that needs the `62`.
+  * C64 OS: not affected; TRACE has no `R`.
+* **SI-090, direct access buffers.**
+  * Implemented: `#` opens a 256 byte buffer with its pointer at byte 1, block commands on a
+    channel not opened with `#` answer `70`, and the channel keeps its partition (SI-093).
+  * Not implemented: `##n`; see the table above.
+  * C64 OS: not affected; TRACE has no `#`.
+* **SI-105, memory commands.**
+  * Implemented: `M-R`, the four probes C64 OS sends at boot, answers the requested count of
+    `$00` bytes.
+  * Not implemented: `M-W` and `M-E`; see the table above.
+  * C64 OS: `M-R` is the part it uses.
+* **SI-134, directory filters.**
+  * Implemented: the type filters, and `H`, which no longer sets a type bit, so `$:*=H`
+    lists every entry instead of none.
+  * Not implemented: leaving hidden files out of a listing unless `H` is given. Hidden
+    files are listed, as before PR #881.
+  * Why: C64 OS hides files by a leading dot rather than by an attribute, and no report
+    asks for the change.
+  * C64 OS: not affected; TRACE lists with `$` and `$:pattern` only.
+* **SI-136, wildcard matching.**
+  * Implemented: the full glob with any number of `*`, as the requirement records.
+  * Different: the requirement calls the matcher unchanged, but it had two defects that PR
+    #881 fixed. It took time exponential in the number of stars, so one command such as
+    `S:****************Q` kept the IEC task busy for minutes, and it matched a name that
+    ended where the pattern had a `*`, whatever followed, so `S:FOO*X` scratched `FOO`.
+  * Why: both are defects, and the second deletes files the pattern does not name.
+  * C64 OS: not affected. The only pattern in a command in TRACE is `S/TEMPORARY/:*`, and
+    its listings use `$:MENU.M` and `$:UTILITIES.M`, which contain no star.
+* **SI-142, host names.**
+  * Implemented: `*` and `?` are escaped as `{2A}` and `{3F}`, and scratch, `RD` and opens
+    by pattern match through a directory scan.
+  * Not implemented: sd2iec's length guard.
+  * Why: the difference is only in what the length parameter means, and changing it changes
+    no host name the drive produces; the one overrun that existed, the `{}` appended to a
+    long name ending in `.prg`, is fixed.
+  * C64 OS: not affected.
+* **SI-146, relative files in x00 wrappers.**
+  * Implemented: an existing `R00` file is read and written through its header.
+  * Not implemented: creating one; a new relative file is written in the plain two byte
+    layout, because SI-145 is not implemented.
+  * C64 OS: not affected; TRACE opens no relative file.
 
 ### 18.2 Defects fixed alongside
 
