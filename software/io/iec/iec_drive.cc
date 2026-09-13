@@ -22,10 +22,12 @@
 #define CFG_IEC_ENABLE   0x51
 #define CFG_IEC_BUS_ID   0x52
 #define CFG_IEC_PATH     0x53
+#define CFG_IEC_LOG      0x55
 
 static struct t_cfg_definition iec_config[] = {
     { CFG_IEC_ENABLE,    CFG_TYPE_ENUM,   "IEC Drive",         "%s", en_dis, 0,  1, 0 },
     { CFG_IEC_BUS_ID,    CFG_TYPE_VALUE,  "Soft Drive Bus ID", "%d", NULL,   8, 30, 11 },
+    { CFG_IEC_LOG,       CFG_TYPE_ENUM,   "Log Every Operation", "%s", en_dis, 0, 1, 0 },
     { 0xFF, CFG_TYPE_END, "", "", NULL, 0, 0, 0 }
 };
 
@@ -389,6 +391,12 @@ void IecDrive :: talk(void)
 {
     IecDriveLock guard(this);
     channels[current_channel]->talk();
+}
+
+// Whether every command, open and close is logged, and not only the failures (iec_log.h).
+bool IecDrive :: log_every_operation(void)
+{
+    return cfg->get_value(CFG_IEC_LOG) > 0;
 }
 
 // The device number for as long as the drive runs, from U0> (SI-100). It is not written to

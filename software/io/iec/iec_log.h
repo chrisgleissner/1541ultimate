@@ -1,12 +1,14 @@
 /*
- * iec_log.h - the Software IEC failure log.
+ * iec_log.h - the Software IEC log.
  *
- * The drive writes one line for a command channel command that leaves an error, for an
- * open that fails, and for the first failure of a channel, and nothing for an operation
- * that succeeds. Each line starts with SOFTIEC_LOG_PREFIX and carries the bytes the host
- * sent, so an incompatibility with a program can be diagnosed from a device log without
- * a special build. Logging only failures keeps it off the path of every successful
- * command, open and byte.
+ * The drive always writes one line for a command channel command that leaves an error, for
+ * an open that fails, and for the first failure of a channel. With the setting "Log Every
+ * Operation" in the Software IEC settings on, it also writes one line for every other
+ * command, open and close, with the reply of a command that answers with data, the host
+ * file an open reached or the first bytes of a listing, and the last line of a listing.
+ * Each line starts with SOFTIEC_LOG_PREFIX and carries the bytes the host sent, the current
+ * partition and directory, and the error channel's answer, so what a program does can be
+ * followed in a device log without a special build. Bytes are never logged per bus byte.
  *
  * The formatter below takes an explicit length and never treats IEC data as a C string,
  * so an embedded zero, a carriage return and a shifted PETSCII character all survive

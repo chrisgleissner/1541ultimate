@@ -2263,6 +2263,7 @@ void execute_suite10(FileManager *fm, IecDrive *dr)
 // ---------------------------------------------------------------------------
 
 #include "iec_channel.h"
+#include "iec_log.h"
 
 // A fresh directory on the FAT file, mounted as partition 40, selected, and entered at
 // its root.
@@ -3804,7 +3805,7 @@ static void s11_failure_log(FileManager *fm, IecDrive *dr)
     send_command(dr, "ZZ\r");
     log_capture_end(saved_fd, sink);
     expect_log_line(testname, "failed command",
-                    "SoftIEC: command failed dev=11 len=3 txt=\"ZZ\\r\" -> 31,SYNTAX ERROR,00,00");
+                    "SoftIEC: command failed dev=11 chan=15 part=9 dir=\"/\" len=3 txt=\"ZZ\\r\" -> 31,SYNTAX ERROR,00,00");
     REQUIRE(count_log_lines() == 1);
 
     // An open that fails is logged with the name as the bus delivered it.
@@ -3814,7 +3815,7 @@ static void s11_failure_log(FileManager *fm, IecDrive *dr)
     close_file(dr, 3);
     log_capture_end(saved_fd, sink);
     expect_log_line(testname, "failed open",
-                    "SoftIEC: open failed dev=11 chan=3 len=12 txt=\"9:NOSUCH,S,R\" -> 62,FILE NOT FOUND,00,00");
+                    "SoftIEC: open failed dev=11 chan=3 part=9 dir=\"/\" len=12 txt=\"9:NOSUCH,S,R\" -> 62,FILE NOT FOUND,00,00");
     REQUIRE(count_log_lines() == 1);
 
     // SI-152: a command longer than the rendering reports its real length, and the
@@ -3826,9 +3827,138 @@ static void s11_failure_log(FileManager *fm, IecDrive *dr)
     log_capture_begin(saved_fd, sink);
     send_command(dr, long_cmd);
     log_capture_end(saved_fd, sink);
-    expect_log_line(testname, "long command length", "SoftIEC: command failed dev=11 len=200 ");
+    expect_log_line(testname, "long command length", "SoftIEC: command failed dev=11 chan=15 part=9 dir=\"/\" len=200 ");
     expect_log_line(testname, "long command cut", "\\x01..\" -> 31");
 
+}
+
+static ConfigStore *s11_softiec_settings(void)
+{
+    const char *testname = "Suite11";
+    ConfigStore *cfg = ConfigManager::getConfigManager()->find_store((uint32_t)0x49454300);
+    REQUIRE(cfg);
+    return cfg;
+}
+
+// With "Log Every Operation" on, every command, open and close writes a line with the
+// current partition and directory, a command that answers with data adds its reply, an open
+// adds the host file or the first bytes of a listing, and a listing logs its last line.
+// With the setting off again, operations that succeed write nothing.
+static void s11_operation_log(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-OperationLog";
+    save_fixture_file(fm, "/Temp", "OPLOG.seq", "LOG PAYLOAD");
+    dr->add_partition(9, "/Temp", "LOGPART");
+    expect_command_response(testname, dr, "CP9\r", "02,PARTITION SELECTED,09,00\r");
+    ConfigStore *cfg = s11_softiec_settings();
+    cfg->set_value(0x55, 1);
+    REQUIRE(dr->log_every_operation());
+
+    int saved_fd = -1;
+    FILE *sink = NULL;
+    log_capture_begin(saved_fd, sink);
+    send_command(dr, "CD//\r");
+    const uint8_t mr[6] = { 'M', '-', 'R', 0x00, 0x05, 0x02 };
+    send_command_data(dr, mr, sizeof(mr));
+    uint8_t reply[8];
+    read_command_channel(dr, reply, sizeof(reply));
+    uint8_t body[64];
+    open_file(dr, 2, "9:OPLOG,S,R");
+    get_status(dr);
+    read_file(dr, 2, body, sizeof(body));
+    close_file(dr, 2);
+    uint8_t listing[4096];
+    read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    log_capture_end(saved_fd, sink);
+    printf("%s: %d lines\n", testname, count_log_lines());
+    expect_log_line(testname, "command", "SoftIEC: command dev=11 chan=15 part=9 dir=\"/\" len=5 txt=\"CD//\\r\" -> 00, OK,00,00");
+    expect_log_line(testname, "reply", "txt=\"M-R\\0\\x05\\x02\" reply=\"\\0\\0\" -> 00, OK,00,00");
+    expect_log_line(testname, "open", "SoftIEC: open dev=11 chan=2 part=9 dir=\"/\" len=11 txt=\"9:OPLOG,S,R\" host=\"/Temp/OPLOG.seq\"");
+    expect_log_line(testname, "close", "SoftIEC: close dev=11 chan=2 ");
+    expect_log_line(testname, "listing", "txt=\"$\" data=\"\\x01\\x04\\x01\\x01");
+    expect_log_line(testname, "listing end", "SoftIEC: listing end dev=11 chan=0 part=9 dir=\"/\" len=32 txt=\"");
+    REQUIRE(count_log_lines() >= 7);
+
+    cfg->set_value(0x55, 0);
+    REQUIRE(!dr->log_every_operation());
+    log_capture_begin(saved_fd, sink);
+    send_command(dr, "CD//\r");
+    read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    log_capture_end(saved_fd, sink);
+    REQUIRE(count_log_lines() == 0);
+}
+
+// The operation log with the longest inputs it takes: a working directory near the length
+// a command can name, a 253 byte command, names that fill the buffer, and replies of 256
+// bytes. Every line must stay within its buffers; the AddressSanitizer build of this suite
+// fails on any byte written or read outside them.
+static void s11_operation_log_bounds(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-OperationLogBounds";
+    s11_partition(fm, dr, "logbounds");
+    ConfigStore *cfg = s11_softiec_settings();
+    cfg->set_value(0x55, 1);
+    // Directories of 40 characters, deeper than one rendering holds.
+    char name[48];
+    char cmd[300];
+    for (int depth = 0; depth < 7; depth++) {
+        memset(name, 'D' + depth, 40);
+        name[40] = 0;
+        snprintf(cmd, sizeof(cmd), "MD:%s\r", name);
+        send_command(dr, cmd);
+        snprintf(cmd, sizeof(cmd), "CD:%s\r", name);
+        send_command(dr, cmd);
+    }
+    open_file(dr, 2, "LONGFILE,S,W");
+    get_status(dr);
+    send_channel_data(dr, 2, (const uint8_t *)"DATA", 4);
+    close_file(dr, 2);
+    int saved_fd = -1;
+    FILE *sink = NULL;
+    log_capture_begin(saved_fd, sink);
+    // The host path of this file is longer than one rendering holds.
+    open_file(dr, 2, "LONGFILE,S,R");
+    get_status(dr);
+    close_file(dr, 2);
+    memset(cmd, 0xFF, 253);
+    cmd[0] = 'Z';
+    cmd[253] = 0;
+    send_command(dr, cmd);
+    uint8_t mr[6] = { 'M', '-', 'R', 0x00, 0xFE, 0xFF };
+    uint8_t reply[300];
+    send_command_data(dr, mr, sizeof(mr));
+    read_command_channel(dr, reply, sizeof(reply));
+    mr[5] = 0x00;
+    send_command_data(dr, mr, sizeof(mr));
+    read_command_channel(dr, reply, sizeof(reply));
+    char open_name[300];
+    memset(open_name, 0xA5, 253);
+    open_name[253] = 0;
+    open_file(dr, 2, open_name);
+    get_status(dr);
+    close_file(dr, 2);
+    open_name[260] = 0;
+    memset(open_name, 'N', 260);
+    open_file(dr, 3, open_name);
+    get_status(dr);
+    close_file(dr, 3);
+    uint8_t listing[4096];
+    read_directory_stream(testname, dr, "$", listing, sizeof(listing));
+    log_capture_end(saved_fd, sink);
+    cfg->set_value(0x55, 0);
+    // No line is longer than the three renderings, the answer and the fixed text allow.
+    int longest = 0;
+    for (const char *p = log_capture; (p = strstr(p, "SoftIEC: ")) != NULL; p++) {
+        const char *end = strchr(p, '\n');
+        int n = end ? (int)(end - p) : (int)strlen(p);
+        longest = (n > longest) ? n : longest;
+    }
+    printf("%s: %d lines, the longest %d characters\n", testname, count_log_lines(), longest);
+    REQUIRE(count_log_lines() >= 7);
+    REQUIRE(longest < 3 * SOFTIEC_LOG_TEXT_SIZE + 200);
+    expect_log_line(testname, "long directory cut", "DDDDDDDD/EEEE");
+    expect_log_line(testname, "long host path cut", "host=\"/Fat/s11_logbounds/DDDD");
+    expect_command_response(testname, dr, "UI\r", "73,U64HD ULTIMATE DOS V2.0,00,00\r");
 }
 
 // A file inside a disk image whose chain links to a track the disk does not have. Working
@@ -4423,6 +4553,8 @@ static void s11_soak(FileManager *fm, IecDrive *dr)
         soak_state = 1;
     }
     soak_verbose = getenv("IECSOAK_VERBOSE") != NULL;
+    // With IECSOAK_LOG set, the drive also writes its "Log Every Operation" lines.
+    s11_softiec_settings()->set_value(0x55, getenv("IECSOAK_LOG") ? 1 : 0);
     printf("%s: %d iterations, seed 0x%x\n", testname, iterations, soak_state);
     soak_fixture(fm);
     soak_partitions(fm, dr);
@@ -4515,6 +4647,8 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-CR6-Lock",                s11_cr6_lock },
     { "Suite11-CR8-ScratchScan",         s11_cr8_scratch_scan },
     { "Suite11-FailureLog",              s11_failure_log },
+    { "Suite11-OperationLog",            s11_operation_log },
+    { "Suite11-OperationLogBounds",      s11_operation_log_bounds },
     { "Suite11-Crash-DamagedChain",      s11_crash_damaged_chain },
     { "Suite11-Crash-LongHostName",      s11_crash_long_host_name },
     { "Suite11-Crash-RecordPastEnd",     s11_crash_record_past_end },

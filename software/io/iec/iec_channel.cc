@@ -7,9 +7,10 @@
 #include <stdlib.h>
 
 /* ------------------------------------------------------------------------------
- * The failure log (see iec_log.h): one line for a command that leaves an error, an open
- * that fails and the first failure of a channel, and nothing for an operation that
- * succeeds.
+ * The log (see iec_log.h): always one line for a command that leaves an error, an open
+ * that fails and the first failure of a channel. With the drive's "Log Every Operation"
+ * setting on, also one line for every other command, open and close, and for the last
+ * line of each listing.
  * ------------------------------------------------------------------------------ */
 
 // Whether the error channel now holds an error. 00 to 19 are not errors in CBM DOS, and 73
@@ -19,13 +20,17 @@ bool IecChannel::drive_failed(void)
     return (drive->last_error_code >= 20) && (drive->last_error_code != ERR_DOS);
 }
 
-// Writes one line: what failed, the bytes involved and the error channel's answer. The
-// payload is passed with its length and never treated as a string. The buffers are static
-// to keep them off the IEC task's small stack; every caller holds the drive's lock (CR-6),
-// so two lines cannot be built at once.
-void IecChannel::log_failure(const char *what, const uint8_t *payload, int len)
+// Writes one line: what happened, the current partition and its working directory, the
+// bytes involved, optionally a labelled second set of bytes, and the error channel's answer.
+// Bytes are passed with their length and never treated as a string, and every rendering is
+// bounded by its buffer. The buffers are static to keep them off the IEC task's small
+// stack; every caller holds the drive's lock (CR-6), so two lines cannot be built at once.
+void IecChannel::log_line(const char *what, const uint8_t *payload, int len,
+                          const char *label, const uint8_t *extra, int extra_len)
 {
     static char txt[SOFTIEC_LOG_TEXT_SIZE];
+    static char more[SOFTIEC_LOG_TEXT_SIZE];
+    static char dir[SOFTIEC_LOG_TEXT_SIZE];
     static char err[80];
 
     // The drive's rendering of the error channel, without the carriage return it ends in,
@@ -39,18 +44,15 @@ void IecChannel::log_failure(const char *what, const uint8_t *payload, int len)
     }
     err[n] = 0;
 
-    if (payload) {
-        softiec_log_text(payload, len, txt, sizeof(txt));
-        if (channel == 15) {
-            printf(SOFTIEC_LOG_PREFIX "%s dev=%d len=%d txt=\"%s\" -> %s\n",
-                   what, (int)drive->get_address(), len, txt, err);
-        } else {
-            printf(SOFTIEC_LOG_PREFIX "%s dev=%d chan=%d len=%d txt=\"%s\" -> %s\n",
-                   what, (int)drive->get_address(), channel, len, txt, err);
-        }
-    } else {
-        printf(SOFTIEC_LOG_PREFIX "%s dev=%d chan=%d -> %s\n", what, (int)drive->get_address(), channel, err);
-    }
+    IecPartition *part = drive->vfs ? drive->vfs->GetPartition(0) : NULL;
+    const char *cwd = part ? part->GetRelativePath() : NULL;
+    softiec_log_text((const uint8_t *)cwd, cwd ? strlen(cwd) : 0, dir, sizeof(dir));
+    softiec_log_text(payload, payload ? len : 0, txt, sizeof(txt));
+    softiec_log_text(extra, extra ? extra_len : 0, more, sizeof(more));
+    printf(SOFTIEC_LOG_PREFIX "%s dev=%d chan=%d part=%d dir=\"%s\" len=%d txt=\"%s\"%s%s%s%s%s -> %s\n",
+           what, (int)drive->get_address(), channel, part ? part->GetPartitionNumber() : 0, dir,
+           payload ? len : 0, txt, label ? " " : "", label ? label : "", label ? "=\"" : "",
+           label ? more : "", label ? "\"" : "", err);
 }
 
 // One line the first time a channel fails after it was opened, so a channel that fails
@@ -63,7 +65,7 @@ void IecChannel::log_fault(const char *what)
     fault_logged = true;
     static char detail[96];
     snprintf(detail, sizeof(detail), "channel fault in %s, state %d", what, (int)state);
-    log_failure(detail, NULL, 0);
+    log_line(detail, NULL, 0, NULL, NULL, 0);
 }
 
 IecChannel::IecChannel(IecDrive *dr, int ch)
@@ -398,6 +400,9 @@ t_channel_retval IecChannel::push_command(uint8_t b)
         pointer = 0;
         break;
     case 0xE0: // close
+        if (drive->log_every_operation()) {
+            log_line("close", NULL, 0, NULL, NULL, 0);
+        }
         if ((name_to_open.access == e_write) || (name_to_open.access == e_append)) {
             if (f) {
                 if (pointer > 0) {
@@ -1069,6 +1074,9 @@ int IecChannel::read_dir_entry(void)
             last_byte = 1;
             prefetch_max = 1;
             state = e_dir; // with no directory open, the next call returns -1
+            if (drive->log_every_operation()) {
+                log_line("listing end", buffer, 2, NULL, NULL, 0);
+            }
             return 0;
         }
 
@@ -1087,6 +1095,9 @@ int IecChannel::read_dir_entry(void)
         prefetch_max = 31;
         prefetch = 0;
         state = e_dir; // This causes a -1 to be returned next time this function is called
+        if (drive->log_every_operation()) {
+            log_line("listing end", buffer, 32, NULL, NULL, 0);
+        }
         return 0;
     }
         
@@ -1594,7 +1605,7 @@ int IecChannel::open_file(void)  // name should be in buffer
     if (parse_err) {
         state = e_error;
         drive->set_error(parse_err, 0, 0);
-        log_failure("open failed", raw_name, raw_len);
+        log_line("open failed", raw_name, raw_len, NULL, NULL, 0);
         return -1;
     }
 
@@ -1620,7 +1631,17 @@ int IecChannel::open_file(void)  // name should be in buffer
         break;
     }
     if ((state == e_error) && drive_failed()) {
-        log_failure("open failed", raw_name, raw_len);
+        log_line("open failed", raw_name, raw_len, NULL, NULL, 0);
+    } else if (drive->log_every_operation()) {
+        // The host file the name reached, or the first bytes of a listing.
+        if (f) {
+            const char *host = f->get_path();
+            log_line("open", raw_name, raw_len, "host", (const uint8_t *)host, host ? strlen(host) : 0);
+        } else if ((state == e_dir) || (state == e_partlist)) {
+            log_line("open", raw_name, raw_len, "data", buffer, (prefetch_max < 32) ? prefetch_max : 32);
+        } else {
+            log_line("open", raw_name, raw_len, NULL, NULL, 0);
+        }
     }
     return result;
 }
@@ -2698,7 +2719,11 @@ t_channel_retval IecCommandChannel::push_command(uint8_t b)
             err = parser->execute_command(wr_buffer, wr_pointer);
             if (err) set_error(err);
             if (drive_failed()) {
-                log_failure("command failed", wr_buffer, wr_pointer);
+                log_line("command failed", wr_buffer, wr_pointer, NULL, NULL, 0);
+            } else if (drive->log_every_operation()) {
+                // A command that answers with data, such as M-R or G-P, has it in the buffer.
+                bool reply = (state == e_status) && (last_byte >= 0) && (last_byte < 256);
+                log_line("command", wr_buffer, wr_pointer, reply ? "reply" : NULL, buffer, reply ? (last_byte + 1) : 0);
             }
         }
         wr_pointer = 0;

@@ -336,7 +336,8 @@ class IecChannel {
     // byte writes one line (see iec_log.h).
     bool fault_logged;
     bool drive_failed(void);
-    void log_failure(const char *what, const uint8_t *payload, int len);
+    void log_line(const char *what, const uint8_t *payload, int len,
+                  const char *label, const uint8_t *extra, int extra_len);
     void log_fault(const char *what);
 
 private:
