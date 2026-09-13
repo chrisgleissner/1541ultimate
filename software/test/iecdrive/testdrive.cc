@@ -3457,6 +3457,96 @@ static void s11_si084_rel_layouts(FileManager *fm, IecDrive *dr)
     REQUIRE(s11_read_host_file(fm, path, "WRAPREL.rel", host, sizeof(host)) < 0);
 }
 
+// SI-144 on the paths that do not find a file through its CBM name: an open without a
+// type, for which ConstructPath() makes a pattern; the creation of a name an x00 file
+// carries; a copy; a rename into another directory; and a host name longer than a
+// listing entry used to hold.
+static void s11_x00_paths(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI144-X00Paths";
+    const char *path = s11_partition(fm, dr, "x00paths");
+    uint8_t host[128];
+    s11_host_file(fm, path, "DATA.S00", "DATA", 0, (const uint8_t *)"payload", 7);
+    expect_iec_file(testname, dr, 2, "DATA", "payload");
+    // A copy takes the data and the type, not the header.
+    expect_command_ok(testname, dr, "C:COPY=DATA\r");
+    int got = s11_read_host_file(fm, path, "COPY.seq", host, sizeof(host));
+    printf("%s: COPY.seq is %d bytes\n", testname, got);
+    REQUIRE((got == 7) && (memcmp(host, "payload", 7) == 0));
+    // The name is taken: 63 without @, and with @ the new file takes the x00 file's place.
+    open_file(dr, 2, "DATA,S,W");
+    get_status(dr);
+    expect_current_status(testname, "DATA,S,W", "63,FILE EXISTS,00,00\r");
+    close_file(dr, 2);
+    expect_iec_write_ok(testname, dr, 2, "@:DATA,S,W", "new");
+    REQUIRE(s11_read_host_file(fm, path, "DATA.S00", host, sizeof(host)) < 0);
+    expect_iec_file(testname, dr, 2, "DATA,S", "new");
+    // A rename into another directory moves an x00 file, under its host name.
+    s11_host_file(fm, path, "MOVE.P00", "MOVER", 0, (const uint8_t *)"m", 1);
+    expect_command_ok(testname, dr, "MD:SUB\r");
+    expect_command_ok(testname, dr, "R/SUB/:MOVED=MOVER\r");
+    expect_iec_file(testname, dr, 0, "/SUB/:MOVED", "m");
+    // A host name longer than forty characters still lists under the CBM name.
+    s11_host_file(fm, path, "A HOST NAME THAT IS LONGER THAN FORTY CHARACTERS.P00", "LONGWRAP", 0,
+                  (const uint8_t *)"l", 1);
+    expect_directory_contains(testname, dr, "$", "\"LONGWRAP\"");
+}
+
+// SI-084 inside a disk image: the image presents the two byte layout, so a size that is
+// not a whole number of records does not select the one byte layout.
+static void s11_rel_in_image(FileManager *fm, IecDrive *dr)
+{
+    const char *testname = "Suite11-SI084-RelInImage";
+    create_formatted_image(fm, "/Fat/s11_relimg.d64", "RELIMG", 683, e_image_d64);
+    dr->add_partition(56, "/Fat/s11_relimg.d64", "RELIMG");
+    expect_command_status_prefix(testname, dr, "CP56\r", "02,PARTITION SELECTED");
+    expect_rel_open(testname, dr, 2, "RECS", 4);
+    expect_rel_position_status(testname, dr, 2, 2, 1, "50,RECORD NOT PRESENT,00,00\r");
+    expect_rel_position_status(testname, dr, 2, 1, 1, "00, OK,00,00\r");
+    expect_rel_write(testname, dr, 2, (const uint8_t *)"AAAA", 4);
+    expect_rel_write(testname, dr, 2, (const uint8_t *)"BBBB", 4);
+    close_file(dr, 2);
+
+    // Shorten the last data sector of the file by one byte.
+    open_buffer_channel(testname, dr, 3);
+    expect_command_ok(testname, dr, "U1:3,0,18,1\r");
+    uint8_t dir[256];
+    read_buffer_channel(testname, dr, 3, dir, sizeof(dir));
+    int entry = -1;
+    for (int e = 0; e < 8; e++) {
+        if (((dir[2 + 32 * e] & 7) == 4) && !memcmp(dir + 5 + 32 * e, "RECS\xA0", 5)) {
+            entry = e;
+        }
+    }
+    REQUIRE(entry >= 0);
+    int track = dir[3 + 32 * entry], sector = dir[4 + 32 * entry];
+    uint8_t block[256];
+    char cmd[32];
+    for (int hops = 0; hops < 100; hops++) {
+        snprintf(cmd, sizeof(cmd), "U1:3,0,%d,%d\r", track, sector);
+        expect_command_ok(testname, dr, cmd);
+        read_buffer_channel(testname, dr, 3, block, sizeof(block));
+        if (!block[0]) {
+            break;
+        }
+        track = block[0];
+        sector = block[1];
+    }
+    printf("%s: the last data sector %d/%d ends at byte %d\n", testname, track, sector, block[1]);
+    REQUIRE(block[0] == 0);
+    block[1]--;
+    expect_command_ok(testname, dr, "B-P 3 0\r");
+    send_channel_data(dr, 3, block, sizeof(block));
+    snprintf(cmd, sizeof(cmd), "U2:3,0,%d,%d\r", track, sector);
+    expect_command_ok(testname, dr, cmd);
+    close_file(dr, 3);
+
+    expect_rel_open(testname, dr, 2, "RECS", 0);
+    expect_rel_position_status(testname, dr, 2, 1, 1, "00, OK,00,00\r");
+    expect_rel_read(testname, dr, 2, (const uint8_t *)"AAAA", 4);
+    close_file(dr, 2);
+}
+
 // CR-4: a listing that is abandoned releases its directory when the channel closes, so
 // the heap is back where it was once the channel is closed. A full listing first puts
 // everything the file manager caches for the directory in place.
@@ -4320,6 +4410,8 @@ static const Suite11Case suite11_cases[] = {
     { "Suite11-SI103-Resets",            s11_si103_resets },
     { "Suite11-SI144-ReadX00",           s11_si144_read_x00 },
     { "Suite11-SI084-RelLayouts",        s11_si084_rel_layouts },
+    { "Suite11-SI144-X00Paths",          s11_x00_paths },
+    { "Suite11-SI084-RelInImage",        s11_rel_in_image },
     { "Suite11-CR4-AbandonedListing",    s11_cr4_abandoned_listing },
     { "Suite11-CR5-FailedDirectoryOpen", s11_cr5_failed_directory_open },
     { "Suite11-CR6-Lock",                s11_cr6_lock },

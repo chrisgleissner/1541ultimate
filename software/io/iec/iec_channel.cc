@@ -691,6 +691,36 @@ int iec_entry_name(FileManager *fm, const char *dir_path, FileInfo *info, char *
     return X00_HEADER_SIZE;
 }
 
+// Moves a file opened for reading past its x00 header when it has one, and returns the
+// size of the header, 0 or X00_HEADER_SIZE (SI-144).
+static uint32_t skip_x00_header(File *f, const char *path, uint8_t *record_length)
+{
+    filetype_t type;
+    uint8_t head[X00_HEADER_SIZE];
+    uint32_t got = 0;
+    if (!x00_path(path, &type) || !f->get_size()) {
+        return 0;
+    }
+    if ((f->read(head, X00_HEADER_SIZE, &got) == FR_OK) && x00_header(head, got, NULL, record_length)) {
+        return X00_HEADER_SIZE;
+    }
+    f->seek(0);
+    return 0;
+}
+
+// ConstructPath() names a file of any type with the pattern .???, which fstat() matches.
+// This puts the name fstat() found in place of the pattern, because an x00 file is told
+// by its real name (SI-144).
+static void use_found_name(mstring& path, FileInfo& info)
+{
+    const char *p = path.c_str();
+    const char *slash = strrchr(p, '/');
+    mstring found(p, 0, slash ? (int)(slash - p) : -1);
+    char entry[80];
+    found += (info.name_format & NAME_FORMAT_CBM) ? info.generate_fat_name(entry, sizeof(entry)) : info.lfname;
+    path = found;
+}
+
 static void partition_relative_to_full_path(IecPartition *partition, Path& relative, mstring& full_path)
 {
     full_path = partition->GetRootPath();
@@ -986,7 +1016,7 @@ static const char *cbm_partition_type_name(cbm_partition_type_t type)
 
 int IecChannel::read_dir_entry(void)
 {
-    FileInfo info(40);
+    FileInfo info(INFO_SIZE); // the whole host name, which an x00 file is probed by
     const char *partition_type = NULL;
     FRESULT fres;
     if (state == e_dir) {
@@ -1357,8 +1387,10 @@ int IecChannel :: setup_file_access()
             GETPARTITION(name_to_open.file.partition, partition, 0);
             fres = resolve_existing_iec_path(fm, partition, name_to_open.file, e_any,
                                              false, true, true, work, &info);
-            full_path = work.c_str();
+        } else if (fres == FR_OK) {
+            use_found_name(work, info);
         }
+        full_path = work.c_str();
         if (fres != FR_OK) {
             drive->set_error_fres(fres);
             return 0;
@@ -1366,6 +1398,24 @@ int IecChannel :: setup_file_access()
         char cbm_name[24];
         if (!iec_x00_probe(fm, full_path, cbm_name, &name_to_open.filetype, NULL)) {
             IecPartition::CreateIecName(&info, cbm_name, name_to_open.filetype);
+        }
+    }
+
+    // A name that an x00 file carries is taken, as in SD file_open(): without @ the answer is
+    // 63, and with @ the x00 file makes way for the new file.
+    if ((name_to_open.access == e_write) && !name_to_open.file.has_wildcard) {
+        GETPARTITION(name_to_open.file.partition, partition, 0);
+        FileInfo existing(4);
+        mstring wrapped;
+        if ((fm->fstat(full_path, existing) == FR_NO_FILE) &&
+            (resolve_existing_iec_path(fm, partition, name_to_open.file, name_to_open.filetype,
+                                       false, true, false, wrapped) == FR_OK) &&
+            iec_x00_probe(fm, wrapped.c_str(), NULL, NULL, NULL)) {
+            if (!name_to_open.replace) {
+                drive->set_error(ERR_FILE_EXISTS, 0, 0);
+                return 0;
+            }
+            fm->delete_file(wrapped.c_str());
         }
     }
 
@@ -1427,20 +1477,11 @@ int IecChannel :: setup_file_access()
     state = e_file;
 
     // An existing file with an x00 name is read past its header when it has one (SI-144).
-    uint8_t head[X00_HEADER_SIZE];
-    uint32_t head_bytes = 0;
     uint8_t wrapped_length = 0;
-    filetype_t wrapped_type;
-    bool wrapped = false;
-    if ((name_to_open.access != e_write) && x00_path(full_path, &wrapped_type) && f->get_size()) {
-        if ((f->read(head, X00_HEADER_SIZE, &head_bytes) == FR_OK) &&
-            x00_header(head, head_bytes, NULL, &wrapped_length)) {
-            dataOffset = X00_HEADER_SIZE;
-            wrapped = true;
-        } else {
-            f->seek(0);
-        }
+    if (name_to_open.access != e_write) {
+        dataOffset = skip_x00_header(f, full_path, &wrapped_length);
     }
+    bool wrapped = (dataOffset != 0);
 
     if (name_to_open.filetype == e_rel) {
         uint32_t tr;
@@ -1460,14 +1501,20 @@ int IecChannel :: setup_file_access()
             // layout (SI-084): a non-zero second byte can only be the one byte layout, and
             // otherwise the size leaves 2 mod r over for the one and 1 mod r for the other.
             // A record length of 1 leaves both the same and is read as the two byte layout.
+            // A disk image always presents the two byte layout, whatever its size.
             int length = wrapped_length;
             fres = FR_OK;
             if (!wrapped) {
+                uint8_t head[2] = { 0, 0 };
+                uint32_t head_bytes = 0;
                 fres = f->read(head, 2, &head_bytes);
                 length = head[0];
                 uint32_t size = f->get_size();
+                bool in_image = f->get_file_system() && f->get_file_system()->supports_direct_sector_access();
                 dataOffset = 2;
-                if ((head_bytes >= 2) && head[1]) {
+                if (in_image) {
+                    // the two byte layout
+                } else if ((head_bytes >= 2) && head[1]) {
                     dataOffset = 1;
                 } else if ((length > 1) && ((size % length) != (2 % length)) && ((size % length) == (1 % length))) {
                     dataOffset = 1;
@@ -1969,21 +2016,25 @@ int IecCommandChannel::do_copy(filename_t& dest, filename_t sources[], int n)
     FileInfo info(INFO_SIZE);
     const char *source1 = ConstructPath(work, sources[0], e_any, e_read);
     FRESULT fres = source1 ? fm->fstat(source1, info) : FR_NO_PATH;
-    if (fres != FR_OK) {
+    if (fres == FR_OK) {
+        use_found_name(work, info);
+    } else {
         GETPARTITION(sources[0].partition, partition, 0);
         fres = resolve_existing_iec_path(fm, partition, sources[0], e_any,
                                          false, true, sources[0].has_wildcard,
                                          work, &info);
-        source1 = work.c_str();
     }
+    source1 = work.c_str();
     if (fres != FR_OK) {
         drive->set_error_fres(fres);
         return ERR_FILE_NOT_FOUND;
     }
-    // convert FAT name to CBM name
+    // convert FAT name to CBM name, or take it from an x00 header (SI-144)
     char cbm_name[24];
     filetype_t ftype = e_any;
-    IecPartition::CreateIecName(&info, cbm_name, ftype);
+    if (!iec_x00_probe(fm, source1, cbm_name, &ftype, NULL)) {
+        IecPartition::CreateIecName(&info, cbm_name, ftype);
+    }
     // ftype is now set to the type of the first original file.
 
     // Now the real copy action can begin
@@ -2009,7 +2060,13 @@ int IecCommandChannel::do_copy(filename_t& dest, filename_t sources[], int n)
         } else {
             DBGIECV("  %d. unresolved by canonical path\n", i);
         }
-        fres = frompath ? fm->fopen(frompath, FA_READ, &fi) : FR_NO_PATH;
+        FileInfo found(INFO_SIZE);
+        fres = frompath ? fm->fstat(frompath, found) : FR_NO_PATH;
+        if (fres == FR_OK) {
+            use_found_name(work, found);
+            frompath = work.c_str();
+            fres = fm->fopen(frompath, FA_READ, &fi);
+        }
         if (fres != FR_OK) {
             GETPARTITION(sources[i].partition, partition, 0);
             fres = open_by_rendered_iec_name(fm, partition, sources[i], e_any,
@@ -2023,6 +2080,7 @@ int IecCommandChannel::do_copy(filename_t& dest, filename_t sources[], int n)
             drive->set_error_fres(fres);
             break;
         }
+        skip_x00_header(fi, frompath, NULL); // an x00 file copies its data, not its header
         uint32_t bytes_read, bytes_written;
         do {
             fres = fi->read(databuf, 32768, &bytes_read);
@@ -2204,13 +2262,15 @@ int IecCommandChannel::do_rename(filename_t &src, filename_t &dest)
     const char *src_path = ConstructPath(works, src, e_any, e_read);
     FileInfo info(INFO_SIZE);
     FRESULT fres = src_path ? fm->fstat(src_path, info) : FR_NO_PATH;
-    if (fres != FR_OK) {
+    if (fres == FR_OK) {
+        use_found_name(works, info);
+    } else {
         GETPARTITION(src.partition, partition, 0);
         fres = resolve_existing_iec_path(fm, partition, src, e_any,
                                          false, true, src.has_wildcard,
                                          works, &info);
-        src_path = works.c_str();
     }
+    src_path = works.c_str();
     if (fres != FR_OK) {
         drive->set_error_fres(fres);
         return 0;
@@ -2239,7 +2299,8 @@ int IecCommandChannel::do_rename(filename_t &src, filename_t &dest)
         }
     }
 
-    // An x00 file keeps its host name and gets the new name in its header.
+    // An x00 file keeps its host name and gets the new name in its header; into another
+    // directory it moves under that host name.
     if (wrapped) {
         File *file = NULL;
         fres = fm->fopen(src_path, FA_READ | FA_WRITE, &file);
@@ -2253,6 +2314,11 @@ int IecCommandChannel::do_rename(filename_t &src, filename_t &dest)
                 fres = file->write(name, sizeof(name), &tr);
             }
             fm->fclose(file);
+        }
+        mstring moved(dest_dir.c_str());
+        append_path_component(moved, strrchr(src_path, '/') + 1);
+        if ((fres == FR_OK) && strcmp(moved.c_str(), src_path)) {
+            fres = fm->rename(src_path, moved.c_str());
         }
         if (fres != FR_OK) {
             drive->set_error_fres(fres);
