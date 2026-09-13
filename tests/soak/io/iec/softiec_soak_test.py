@@ -33,9 +33,9 @@ answer either. The failure names the iteration and the last operations.
 
 Profiles: `stress` runs for ten minutes, `soak` for four hours. `--duration` overrides.
 `--no-lanes` leaves out the REST and FTP lanes, to tell the drive's heap use from theirs.
-On a U2+L, the first session after power-up lost about 25 KB of heap over its first 36
-iterations, which fails the ten minute profile, and most of it came back when the
-session removed its directory. A 45 minute session on the same firmware kept the heap
+On a U2+L, one first session after power-up lost about 25 KB of heap over its first 36
+iterations, which failed the ten minute profile, and most of it came back when the
+session removed its directory; another passed. A 45 minute session on the same firmware kept the heap
 flat from its 20th iteration to its 158th. Judge a loss from a run that is not the
 first after power-up, or from a longer one.
 The suite needs a C64 with a standard KERNAL, REST and FTP, and one Software IEC
