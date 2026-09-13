@@ -1583,7 +1583,8 @@ rendering is cut.
 **Decision (PR #881): implemented.** A log line carries one rendering of the bytes, as
 text with every byte that is not printable ASCII written as `\xNN`, which loses nothing.
 A rendering that does not fit its 260 character buffer ends in `..`, and the line still
-carries the real length.
+carries the real length. The lines of the setting **Log Every Operation** (section 18)
+render the directory, the host path and a reply the same way.
 
 **SI-153.** Three existing tests encode behaviour this specification changes, and
 each must be updated in the same commit as the change, not separately.
@@ -1710,12 +1711,24 @@ SI-077 the sd2iec attribute commands, SI-120 clock writes.
 Several requirements in groups 3, 5, 6 and 7 were then decided against; section 18.1
 lists them.
 
-The `SOFTIEC-TRACE` diagnostics added by PR #881 were reduced, before release, to an
-always-enabled failure log: one `SoftIEC:` line for a command that leaves an error, an
-open that fails and the first failure of a channel, with the bytes the host sent.
-Successful operations write nothing, so the log costs nothing on the path of a
-successful command or byte and still shows every incompatibility of the kind TRACE
-was collected for.
+The `SOFTIEC-TRACE` diagnostics added by PR #881 were reduced, before release, to two
+kinds of `SoftIEC:` line. The drive always writes one for a command that leaves an
+error, an open that fails and the first failure of a channel. With the setting **Log
+Every Operation** in the SoftIEC Drive Settings, which is off by default, it also writes
+one for every other command, open and close. Such a line adds the reply of a command
+that answers with data, such as `M-R`, the host file an open reached or the first 32
+bytes of a listing, and a listing writes its last line as well. Every line carries the
+bytes the host sent, the partition, the current directory and the error channel's
+answer. With the setting off, a successful command costs one read of the setting and
+writes nothing. The setting exists so that a trace like TRACE, of what a program sends
+and what the drive answers, can be recorded with a release build.
+
+Each part of a line is rendered into a fixed buffer of 260 characters that the rendering
+never passes, and the lines are written while the drive lock is held.
+`Suite11-OperationLogBounds` sends the longest command, name, reply, directory and host
+path the drive accepts with the setting on, and the AddressSanitizer build fails on a
+byte outside those buffers. The serial port takes each line one character at a time, so
+with the setting on an operation also takes as long as its line needs to be sent.
 
 ### 18.1 What PR #881 implements
 
