@@ -32,6 +32,7 @@ The firmware is declared dead when a transaction does not finish and REST does n
 answer either. The failure names the iteration and the last operations.
 
 Profiles: `stress` runs for ten minutes, `soak` for four hours. `--duration` overrides.
+`--no-lanes` leaves out the REST and FTP lanes, to tell the drive's heap use from theirs.
 The suite needs a C64 with a standard KERNAL, REST and FTP, and one Software IEC
 partition numbered 1. It uses device 11, and restores the settings, the partition's
 working directory, and removes its own directory.
@@ -377,8 +378,8 @@ class Session:
     def run(self, duration):
         heap = []
         deadline = time.monotonic() + duration
-        lanes = [threading.Thread(target=self.rest_lane, daemon=True),
-                 threading.Thread(target=self.ftp_lane, daemon=True)]
+        lanes = [] if self.args.no_lanes else [threading.Thread(target=self.rest_lane, daemon=True),
+                                               threading.Thread(target=self.ftp_lane, daemon=True)]
         for lane in lanes:
             lane.start()
         failures = []
@@ -436,6 +437,8 @@ def main():
     parser.add_argument("--profile", choices=sorted(PROFILES), default="stress")
     parser.add_argument("--duration", type=float, help="seconds, instead of the profile's")
     parser.add_argument("--seed", type=int, default=877)
+    parser.add_argument("--no-lanes", action="store_true",
+                        help="only the C64's operations, to tell the drive's heap use from REST's and FTP's")
     args = parser.parse_args()
     duration = args.duration if args.duration else PROFILES[args.profile]
     session = Session(args)
