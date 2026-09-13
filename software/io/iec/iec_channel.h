@@ -322,8 +322,10 @@ class IecChannel {
 
     // A direct access channel (#): the partition that was current when it was opened, which
     // its block commands use (SI-093), and its size, 256 bytes or n times that for ##n (SI-090).
+    // Up to two blocks fit the channel's own 512 byte block; a larger ##n gets large_buffer.
     int buffer_partition;
     int buffer_size;
+    uint8_t *large_buffer;
 
     // The directory a listing reads, which x00 names are probed in (SI-144). A raw directory,
     // "$" on a secondary address other than 0 (SI-137), in a disk image reads raw_link, the
@@ -366,6 +368,7 @@ private:
     int read_raw_directory(void);
     int setup_file_access();
     int setup_buffer_access(void);
+    void release_large_buffer(void);
     int init_iec_transfer(void);
 
     int open_file(void);  // name should be in buffer

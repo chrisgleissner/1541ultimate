@@ -3368,32 +3368,57 @@ static void s11_si090_buffer_pointer(FileManager *fm, IecDrive *dr)
     close_file(dr, 2);
 }
 
-// SI-090 and SI-092: "##n" chains n 256 byte buffers with the pointer at 0, B-P takes
-// the high byte of the position, and a buffer too large for the channel is refused.
+// SI-090 and SI-092: "##n" chains n 256 byte buffers, for n from 1 to 9, with the pointer
+// at 0, and B-P takes the high byte of the position. A count that is not a digit from 1
+// to 9 is refused with 70. Opening the channel again gives it a buffer of the new size.
 static void s11_si090_large_buffer(FileManager *fm, IecDrive *dr)
 {
     const char *testname = "Suite11-SI090-LargeBuffer";
     s11_partition(fm, dr, "si090l");
     const uint8_t chan = 3;
-    open_file(dr, chan, "##2");
-    get_status(dr);
-    expect_status_ok(testname, "##2");
-    uint8_t pattern[512];
-    for (int i = 0; i < 512; i++) {
-        pattern[i] = (uint8_t)(i % 251);
+    static const int counts[] = { 2, 4, 9, 1 };
+    for (int c = 0; c < 4; c++) {
+        int size = 256 * counts[c];
+        char name[4] = { '#', '#', (char)('0' + counts[c]), 0 };
+        open_file(dr, chan, name);
+        get_status(dr);
+        printf("%s: %s answered %s", testname, name, last_status);
+        expect_status_ok(testname, name);
+        uint8_t pattern[2304];
+        for (int i = 0; i < size; i++) {
+            pattern[i] = (uint8_t)((i * 7 + counts[c]) % 251);
+        }
+        send_channel_data(dr, chan, pattern, size);
+        // The last byte of the last block, and a byte in the second block.
+        char bp[24];
+        snprintf(bp, sizeof(bp), "B-P 3 255 %d\r", counts[c] - 1);
+        expect_command_ok(testname, dr, bp);
+        uint8_t one[1];
+        read_buffer_channel(testname, dr, chan, one, 1);
+        printf("%s: byte at %d is %02X, expected %02X\n", testname, size - 1, one[0], pattern[size - 1]);
+        REQUIRE(one[0] == pattern[size - 1]);
+        if (counts[c] > 1) {
+            expect_command_ok(testname, dr, "B-P 3 4 1\r");
+            read_buffer_channel(testname, dr, chan, one, 1);
+            REQUIRE(one[0] == pattern[260]);
+        }
+        expect_command_ok(testname, dr, "B-P 3 0 0\r");
+        uint8_t all[2304];
+        read_buffer_channel(testname, dr, chan, all, size);
+        REQUIRE(memcmp(all, pattern, size) == 0);
+        close_file(dr, chan);
     }
-    send_channel_data(dr, chan, pattern, sizeof(pattern));
-    expect_command_ok(testname, dr, "B-P 3 4 1\r");
-    uint8_t one[1];
-    read_buffer_channel(testname, dr, chan, one, 1);
-    printf("%s: byte at 260 is %02X, expected %02X\n", testname, one[0], pattern[260]);
-    REQUIRE(one[0] == pattern[260]);
-    expect_command_ok(testname, dr, "B-P 3 0 0\r");
-    uint8_t all[512];
-    read_buffer_channel(testname, dr, chan, all, sizeof(all));
-    REQUIRE(memcmp(all, pattern, sizeof(all)) == 0);
+    expect_iec_open_status_prefix(testname, dr, chan, "##0", "70,NO CHANNEL");
     close_file(dr, chan);
-    expect_iec_open_status_prefix(testname, dr, chan, "##9", "70,NO CHANNEL");
+    expect_iec_open_status_prefix(testname, dr, chan, "##:", "70,NO CHANNEL");
+    close_file(dr, chan);
+    // A plain buffer after a large one is 256 bytes again, with the pointer at 1.
+    open_buffer_channel(testname, dr, chan);
+    send_channel_data(dr, chan, (const uint8_t *)"XY", 2);
+    expect_command_ok(testname, dr, "B-P 3 0\r");
+    uint8_t head[3];
+    read_buffer_channel(testname, dr, chan, head, 3);
+    REQUIRE((head[1] == 'X') && (head[2] == 'Y'));
     close_file(dr, chan);
 }
 

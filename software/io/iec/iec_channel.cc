@@ -5,6 +5,7 @@
 #include "blockdev_file.h"
 #include "filesystem_d64.h"
 #include <stdarg.h>
+#include <stdlib.h>
 
 /* ------------------------------------------------------------------------------
  * Software IEC compatibility diagnostics for GideonZ/1541ultimate#877.
@@ -245,6 +246,7 @@ IecChannel::IecChannel(IecDrive *dr, int ch)
     dir_free = 0;
     buffer_partition = 0;
     buffer_size = 256;
+    large_buffer = NULL;
     raw_dir = false;
     raw_sectors = 0;
     raw_count = 0;
@@ -1921,22 +1923,36 @@ int IecChannel :: setup_file_access()
 
 // "#" opens a 256 byte buffer with its pointer at byte 1; "##n", exactly three bytes, a
 // buffer of n times 256 bytes with its pointer at 0 (SI-090, SD README "Large buffers").
-// The channel's own block holds 512 bytes, so n is 1 or 2, and anything else is refused
-// with 70. The channel keeps the partition that is current now (SI-093).
+// n is one digit from 1 to 9. Two blocks fit the channel's own block; more are allocated
+// for as long as the channel stays open. A count that is not a digit from 1 to 9, or
+// memory that cannot be had, is refused with 70. The channel keeps the partition that
+// is current now (SI-093).
 int IecChannel::setup_buffer_access(void)
 {
-    const char *name = (const char *)buffer;
+    const char *name = (const char *)buffer; // may be the large buffer of the last open
     int blocks = 1;
-    pointer = 1;
+    int start = 1;
     if ((strlen(name) == 3) && (name[1] == '#')) {
         blocks = name[2] - '0';
-        pointer = 0;
-        if ((blocks < 1) || (blocks > 2)) {
+        start = 0;
+    }
+    release_large_buffer();
+    if ((blocks < 1) || (blocks > 9)) {
+        state = e_error;
+        drive->set_error(ERR_NO_CHANNEL, 0, 0);
+        return -1;
+    }
+    if (blocks > 2) {
+        large_buffer = (uint8_t *)malloc(256 * blocks);
+        if (!large_buffer) {
             state = e_error;
             drive->set_error(ERR_NO_CHANNEL, 0, 0);
             return -1;
         }
+        memset(large_buffer, 0, 256 * blocks);
+        buffer = large_buffer;
     }
+    pointer = start;
     buffer_size = 256 * blocks;
     buffer_partition = drive->vfs->GetTargetPartitionNumber(0);
     last_byte = buffer_size - 1;
@@ -1975,6 +1991,9 @@ int IecChannel::open_file(void)  // name should be in buffer
     recordSize = 0;
     dataOffset = 0;
     raw_dir = false;
+    if (name_to_open.dir_opt.stream != e_stream_buffer) {
+        release_large_buffer(); // the name is parsed; a buffer open reads it once more
+    }
 
     int result = -1;
     switch(name_to_open.dir_opt.stream) {
@@ -2031,8 +2050,20 @@ int IecChannel::close_file(void) // file should be open
         delete dir;
         dir = NULL;
     }
+    release_large_buffer();
     state = e_idle;
     return 0;
+}
+
+// Gives back the memory of a ##n buffer larger than the channel's own block, and points
+// the channel at its own block again.
+void IecChannel::release_large_buffer(void)
+{
+    if (large_buffer) {
+        free(large_buffer);
+        large_buffer = NULL;
+        buffer = curblk->bufdata;
+    }
 }
 
 int IecChannel::ext_open_file(const char *name)
