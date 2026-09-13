@@ -1729,7 +1729,10 @@ never passes, and the lines are written while the drive lock is held.
 `Suite11-OperationLogBounds` sends the longest command, name, reply, directory and host
 path the drive accepts with the setting on, and the AddressSanitizer build fails on a
 byte outside those buffers. The serial port takes each line one character at a time, so
-with the setting on an operation also takes as long as its line needs to be sent.
+with the setting on an operation also takes as long as its line needs to be sent. The
+firmware's `printf` does not keep a line together, so a message another task prints at
+the same moment can split a `SoftIEC:` line in two; during a ten minute soak on an
+Ultimate 64 Elite this happened to one line of 732.
 
 ### 18.1 What PR #881 implements
 
