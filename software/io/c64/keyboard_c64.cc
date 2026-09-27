@@ -109,6 +109,7 @@ Keyboard_C64 :: Keyboard_C64(GenericHost *h, volatile uint8_t *row, volatile uin
     mtrx_prev  = 0xFF;
     shift_prev = 0xFF;
     delay_count = first_delay;
+    armed = true;
 }
 
 Keyboard_C64 :: ~Keyboard_C64()
@@ -256,6 +257,7 @@ void Keyboard_C64 :: scan(void)
         } else if (!software_joy_only) { // no key pressed
             mtrx_prev = 0xFF;
             shift_prev = 0xFF;
+            armed = true;
 #if U64 == 2
     MATRIX_WASD_TO_JOY = wasd_to_joy;
     BLING_RX_FLAGS = 0x00; // reenable shift lock
@@ -280,6 +282,11 @@ void Keyboard_C64 :: scan(void)
     if(!key) { // no sensible key pressed, clear history
         mtrx_prev = 0xFF;
         shift_prev = 0xFF;
+        armed = armed || !joy; // only modifiers held, e.g. SHIFT LOCK
+        return;
+    }
+
+    if(!armed) {
         return;
     }
 
@@ -383,6 +390,14 @@ void Keyboard_C64 :: set_delays(int initial, int repeat)
 {
     first_delay  = initial;
     repeat_speed = repeat;
+}
+
+void Keyboard_C64 :: ignore_held_input(void)
+{
+    key_head = key_tail = 0;
+    mtrx_prev = 0xFF;
+    shift_prev = 0xFF;
+    armed = false;
 }
 
 void Keyboard_C64 :: clear_buffer(void)
