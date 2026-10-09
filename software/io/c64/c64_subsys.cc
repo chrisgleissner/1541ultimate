@@ -33,6 +33,32 @@
 extern uint8_t _bootcrt_65_start;
 extern uint8_t _bootcrt_65_end;
 
+// Overridden on U64, which restores the settings the SID player session changed.
+void SidPlayerSessionEnd(void) __attribute__((weak));
+
+void SidPlayerSessionEnd(void) { }
+
+// Commands that take the C64 away from whatever it runs, the SID player included.
+// The SID and MUS carts are the only carts that require the UCI at $DFFC.
+static bool leaves_running_program(SubsysCommand *cmd)
+{
+    switch (cmd->functionID) {
+        case MENU_C64_RESET:
+        case MENU_C64_REBOOT:
+        case MENU_C64_CLEARMEM:
+        case MENU_C64_HARD_BOOT:
+        case C64_DMA_LOAD:
+        case C64_DMA_LOAD_MNT:
+        case C64_DMA_LOAD_RAW:
+        case C64_DRIVE_LOAD:
+            return true;
+        case C64_START_CART:
+            return !cmd->mode || !(((cart_def *)cmd->mode)->require & CART_UCI_DFFC);
+        default:
+            return false;
+    }
+}
+
 static bool contains_path_separator(const char *name)
 {
     while (*name) {
@@ -216,6 +242,10 @@ SubsysResultCode_e C64_Subsys::executeCommand(SubsysCommand *cmd)
     char buffer[64] = "memory";
     uint8_t *pb;
     SubsysResultCode_e result = SSRET_OK;
+
+    if (leaves_running_program(cmd)) {
+        SidPlayerSessionEnd();
+    }
 
     switch (cmd->functionID) {
         case C64_PUSH_BUTTON:

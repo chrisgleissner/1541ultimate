@@ -12,7 +12,7 @@
 #include "userinterface.h"
 #include <stdio.h>
 
-extern uint8_t _sidcrt_bin_start[8192];
+extern uint8_t _sidcrt_bin_start[];
 extern uint8_t _sidcrt_bin_end;
 extern uint8_t _muscrt_bin_start[8192];
 extern uint8_t _muscrt_bin_end;
@@ -72,9 +72,13 @@ static void initSidCart(void *object, void *param)
     sid_cart.type = CART_TYPE_16K;
     sid_cart.require = CART_UCI_DFFC;
 
-    memcpy(sid_rom_area, _sidcrt_bin_start, size);
-    printf("%d bytes copied into sid_cart.\n", size);
+    // ROML is the player; ROMH is BASIC with the player's code for $AC00 on top
     memcpy(sid_rom_area + 0x2000, _basic_bin_start, 8192);
+    memcpy(sid_rom_area, _sidcrt_bin_start, (size < 0x2000) ? size : 0x2000);
+    if (size > 0x2C00) {
+        memcpy(sid_rom_area + 0x2C00, _sidcrt_bin_start + 0x2C00, size - 0x2C00);
+    }
+    printf("%d bytes copied into sid_cart.\n", size);
 
     int mus_crt_size = (int)&_muscrt_bin_end - (int)_muscrt_bin_start;
     uint8_t *mus_rom_area = new uint8_t[16384];
@@ -95,6 +99,11 @@ InitFunction sidCart_initializer("SID Cart", initSidCart, NULL, NULL);
 bool SidAutoConfig(int count, t_sid_definition *requests) __attribute__((weak));
 
 bool SidAutoConfig(int count, t_sid_definition *requests) { return true; }
+
+// Overridden on U64, which can switch the video standard and offers turbo registers.
+void SidPlayerSessionBegin(int clockFlags) __attribute__((weak));
+
+void SidPlayerSessionBegin(int clockFlags) { }
 
 bool FileTypeSID ::ConfigSIDs(void)
 {
@@ -712,6 +721,9 @@ SubsysResultCode_e FileTypeSID ::prepare(bool use_default)
     // Now, start to access the C64..
     SubsysCommand *c64_command = new SubsysCommand(cmd->user_interface, SUBSYSID_C64, C64_STOP_COMMAND, (int)0, "", "");
     c64_command->execute();
+
+    // while the C64 is stopped, so the reset below boots on the new video standard
+    SidPlayerSessionBegin(mus_file ? 0 : flags);
 
     memset((void *)C64_MEMORY_BASE, 0, 1024);
     // make memory testing obsolete
