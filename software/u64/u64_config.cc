@@ -2110,6 +2110,64 @@ bool SidAutoConfig(int count, t_sid_definition *requested)
     return u64_configurator->SidAutoConfig(count, requested);
 }
 
+// Experiment: while the SID player runs, the machine uses the video standard
+// the tune was made for, and the player may set the CPU speed through $D031
+// for fast forward and rewind. Nothing is written to flash, and the user's
+// settings come back when the C64 leaves the player.
+static struct {
+    bool active;
+    bool flashStale;
+    int  systemMode;
+    int  speedRegs;
+    int  speedPref;
+} sidSession;
+
+void SidPlayerSessionBegin(int clockFlags)
+{
+    if (!u64_configurator) {
+        return;
+    }
+    ConfigStore *cfg = u64_configurator->cfg;
+    if (!sidSession.active) {
+        sidSession.active     = true;
+        sidSession.flashStale = cfg->is_flash_stale();
+        sidSession.systemMode = cfg->get_value(CFG_SYSTEM_MODE);
+        sidSession.speedRegs  = cfg->get_value(CFG_SPEED_REGS);
+        sidSession.speedPref  = cfg->get_value(CFG_SPEED_PREF);
+    }
+    int mode = sidSession.systemMode;
+    bool palTiming = !(color_timings[mode]->mode_bits & (VIDEO_FMT_CYCLES_64 | VIDEO_FMT_CYCLES_65));
+    int clock = (clockFlags >> 2) & 3; // SID header: 1 = PAL, 2 = NTSC, 3 = both
+    if ((clock == 1) && !palTiming) {
+        mode = 0; // PAL
+    } else if ((clock == 2) && palTiming) {
+        mode = 1; // NTSC
+    }
+    printf("SID session: system mode %d -> %d\n", sidSession.systemMode, mode);
+    cfg->set_value(CFG_SYSTEM_MODE, mode);
+    if (sidSession.speedRegs == 0) {
+        cfg->set_value(CFG_SPEED_PREF, 0); // with the turbo off before, the tune still plays at 1 MHz
+    }
+    cfg->set_value(CFG_SPEED_REGS, 2); // U64 Turbo Registers
+    cfg->effectuate();
+    cfg->set_need_flash_write(sidSession.flashStale);
+}
+
+void SidPlayerSessionEnd(void)
+{
+    if (!sidSession.active || !u64_configurator) {
+        return;
+    }
+    sidSession.active = false;
+    ConfigStore *cfg = u64_configurator->cfg;
+    printf("SID session ends: system mode back to %d\n", sidSession.systemMode);
+    cfg->set_value(CFG_SYSTEM_MODE, sidSession.systemMode);
+    cfg->set_value(CFG_SPEED_PREF, sidSession.speedPref);
+    cfg->set_value(CFG_SPEED_REGS, sidSession.speedRegs);
+    cfg->effectuate();
+    cfg->set_need_flash_write(sidSession.flashStale);
+}
+
 extern "C" {
     void ResetInterruptHandlerU64()
     {
