@@ -12,6 +12,8 @@
 #include "network_interface.h"
 
 class BrowsableQueryResults;
+void configure_assembly_search_server(UserInterface *ui);
+void toggle_assembly_search_server(UserInterface *ui, bool search_open);
 
 class AssemblySearchForm: public TreeBrowserState
 {
@@ -48,6 +50,7 @@ public:
 
 class AssemblySearch: public TreeBrowser
 {
+    void set_server_footer(void);
 public:
     AssemblySearch(UserInterface *ui, Browsable *);
     virtual ~AssemblySearch();
@@ -245,6 +248,7 @@ class AssemblyInGui : public ObjectWithMenu
 {
     TaskCategory *taskItemCategory;
     BrowsableAssemblyRoot * root;
+    bool root_stale;
 
     static SubsysResultCode_e S_OpenSearch(SubsysCommand *cmd) {
         UserInterface *cmd_ui = cmd->user_interface;
@@ -255,6 +259,7 @@ class AssemblyInGui : public ObjectWithMenu
 public:
     AssemblyInGui() {
         root = NULL;
+        root_stale = false;
         taskItemCategory = TasksCollection :: getCategory("Assembly 64", SORT_ORDER_ASSEMBLY);
     }
 
@@ -262,7 +267,29 @@ public:
         // unregister taskItemCategory
     }
 
+    void resetRoot(void)
+    {
+        delete root;
+        root = NULL;
+        root_stale = false;
+    }
+
+    void markRootStale(void)
+    {
+        root_stale = true;
+    }
+
+    bool isRootStale(void) const
+    {
+        return root_stale;
+    }
+    void prepareRoot(void);
+
     static void S_OpenSearch(UserInterface *cmd_ui) {
+
+        assembly_gui.prepareRoot();
+
+        configure_assembly_search_server(cmd_ui);
 
         if (!NetworkInterface :: DoWeHaveLink()) {
             if (cmd_ui)
