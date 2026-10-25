@@ -164,14 +164,21 @@ seek            jsr clock.countClock
                 cmp keyboard.seekTarget
                 lda clock.elapsedSec + 1
                 sbc keyboard.seekTarget + 1
+                bcs seekComplete
+                lda #$00
+                jsr keyboard.setVolume
                 lda #$8f            ; top speed of the machine (48, 64 or 80 MHz), badlines off
                 ldy #$01            ; and stay in the player's fast forward loop
-                bcc +
-                dey                 ; target reached
+                jsr keyboard.setTurbo
+                jmp keyboard.fastForward
+
+seekComplete   ldy #$00
                 sty keyboard.seeking
                 sty keyboard.holdTicks
                 lda keyboard.origTurbo
-+               jsr keyboard.setTurbo
+                jsr keyboard.setTurbo
+                lda #$1f
+                jsr keyboard.setVolume
                 jmp keyboard.fastForward
 
 selectSubTune   sei

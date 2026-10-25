@@ -83,9 +83,7 @@ noRunStop
                 bne checkOtherKeys
 
                 lda pauseTune
-                sta $d418           ; toggle volume off
-sid2            sta $d418
-sid3            sta $d418
+                jsr setVolume       ; toggle volume off
                 eor #$1f
                 sta pauseTune
 pause           sta @w $0000
@@ -255,6 +253,11 @@ setTurbo        ldx origTurbo
                 beq +
                 sta $d031
 +               rts
+
+setVolume       sta $d418
+sid2            sta $d418
+sid3            sta $d418
+                rts
 
 ; held time in tenths of a second from the CIA 2 TOD clock, which keeps
 ; real time while the CPU speed changes

@@ -341,6 +341,7 @@ def run(args) -> None:
     recorder = AudioRecorder(streams.RATE_NTSC_HZ, local_address(args.host))
     player = Player(device, recorder)
     failures: list[Failure] = []
+    reference_rms = [0.0]
 
     def step(label, body):
         try:
@@ -378,6 +379,7 @@ def run(args) -> None:
                    f"mean rms {loud:.3f}, clock {rate:.3f} tune-s/s")
             if not 0.97 <= rate <= 1.03 or loud < AUDIBLE_RMS:
                 raise Failure("the reference recording is not normal playback")
+            reference_rms[0] = loud
         step(f"the first {REFERENCE_SECONDS}s play at normal speed (reference)", reference)
 
         def rewind_once():
@@ -484,9 +486,22 @@ def run(args) -> None:
         step("c) <- held longer fast forwards faster and faster", forward_long)
 
         def rewind_far():
-            landed = rewind_tap(player, "comma tapped far into the tune")
+            before = player.clock()
+            pressed = time.monotonic()
+            player.key("press", "comma")
+            time.sleep(0.15)
+            player.key("release", "comma")
+            expected = {max(before - 10, 0), max(before + 1 - 10, 0)}
+            landed_at, landed = player.wait_clock(lambda v: v in expected, 30.0)
+            detail(f"comma tapped far into the tune: {before}s -> {landed}s, "
+                   f"seek took {landed_at - pressed:.2f}s")
             if landed < 60:
                 raise Failure(f"landed at {landed}s")
+            quiet = recorder.between(pressed + 0.25, landed_at - 0.25)
+            mean_rms = sum(p[1] for p in quiet) / max(len(quiet), 1)
+            detail(f"audio during rewind: {len(quiet)} packets, mean rms {mean_rms:.4f}")
+            if len(quiet) < 5 or mean_rms >= reference_rms[0] * 0.1:
+                raise Failure("audio was not silent during rewind")
             player.check_normal_speed("after a long seek")
         step("b) a rewind far into the tune reaches its target at full CPU speed", rewind_far)
 
