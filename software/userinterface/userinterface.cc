@@ -80,7 +80,8 @@ static const char *helptext =
         "F2:         Enter Advanced Settings\n"
     #ifndef RECOVERYAPP
         "F4:         Show System Information\n"
-        "F6:         Search Assembly64\n"
+        "F6:         Search Online Archive\n"
+        "C= W:       Toggle archive server\n"
     #endif
         "\n"
         "SPACE:      Select file / directory\n"
@@ -128,6 +129,7 @@ static const char *itype[]      = { "Freeze", "Overlay on HDMI" };
 static const char *cfg_save[]   = { "No", "Ask", "Yes" };
 static const char *navstyles[] = { "Quick Search", "WASD Cursors" };
 static const char *filename_views[] = { "Stored names", "PETSCII names" };
+static const char *search_servers[] = { "Assembly64", "CommoServe", "Custom" };
 
 struct t_cfg_definition user_if_config[] = {
 #if U64
@@ -144,6 +146,8 @@ struct t_cfg_definition user_if_config[] = {
     { CFG_USERIF_ULTICOPY_NAME, CFG_TYPE_ENUM, "Ulticopy Uses disk name", "%s", en_dis, 0, 1, 1 },
     { CFG_USERIF_FILENAME_OVERFLOW_SQUEEZE, CFG_TYPE_ENUM, "Filename overflow squeeze", "%s", filename_overflow_squeeze, 0, 3, 0 },
     { CFG_USERIF_CBM_NAMES, CFG_TYPE_ENUM, "Filename view", "%s", filename_views, 0, 1, 0 },
+    { CFG_USERIF_SEARCH_SERVER, CFG_TYPE_ENUM, "Online Search Server", "%s", search_servers, 0, 2, 0 },
+    { CFG_USERIF_SEARCH_HOST, CFG_TYPE_STRING, "Online Search Host", "%s", NULL, 0, 63, (int)"hackerswithstyle.se" },
     { 0xFE, CFG_TYPE_SEP, "", "", NULL, 0, 0, 0 },
     { 0xFE, CFG_TYPE_SEP, "Temp Folder", "", NULL, 0, 0, 0 },
     { CFG_USERIF_TEMP_AUTO_CLEANUP, CFG_TYPE_ENUM, "Temp Auto Cleanup", "%s", en_dis, 0, 1, 1 },

@@ -110,6 +110,7 @@ musTune         lda #$00
                 sta sidModel
                 jsr displaySysInfo
 
+                jsr keyboard.initSeek
                 jsr fixTimer
                 jmp resetVariables
 
@@ -128,6 +129,12 @@ timerOutsideIrq
                 ; System is NTSC but SID is PAL
                 ; or system is PAL but SID is NTSC
 
+                ldx #50 - 1         ; fast forward calls play at the tune's rate, not the frame rate
+                lda sidC64Model
+                beq +
+                ldx #60 - 1
++               stx keyboard.clockRates + 1
+
                 lda #$2c            ; BIT
 playerCall      sta @w $0000
                 lda #$60            ; RTS
@@ -141,12 +148,38 @@ extraPlayer     lda afterInitDone
                 inc afterInitDone
                 jsr afterInit
 
-+               lda pauseTune
++               jsr keyboard.pollTod
+                lda keyboard.seeking
+                bne seek
+                lda pauseTune
                 bne +
                 jsr clock.countClock
                 jsr clock.displayClock
                 jsr timebar.countTimeBar
 +               jmp keyboard.handleKeyboard
+
+seek            jsr clock.countClock
+                jsr timebar.countTimeBar
+                lda clock.elapsedSec
+                cmp keyboard.seekTarget
+                lda clock.elapsedSec + 1
+                sbc keyboard.seekTarget + 1
+                bcs seekComplete
+                lda #$00
+                jsr keyboard.setVolume
+                lda #$8f            ; top speed of the machine (48, 64 or 80 MHz), badlines off
+                ldy #$01            ; and stay in the player's fast forward loop
+                jsr keyboard.setTurbo
+                jmp keyboard.fastForward
+
+seekComplete   ldy #$00
+                sty keyboard.seeking
+                sty keyboard.holdTicks
+                lda keyboard.origTurbo
+                jsr keyboard.setTurbo
+                lda #$1f
+                jsr keyboard.setVolume
+                jmp keyboard.fastForward
 
 selectSubTune   sei
                 lda #$00

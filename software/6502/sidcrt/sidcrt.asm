@@ -310,8 +310,6 @@ extraPlayer     .binclude 'player/advanced/advancedplayer.asm'
 extraPlayerEnd
 relocator       .binclude 'relocator.asm'
 memalloc        .binclude 'memalloc.asm'
-detection       .binclude 'detectionwrapper.asm'
-sidFx           .binclude 'sidfx.asm'
 songlengths     .binclude 'songlengths.asm'
 
                 .enc 'screen'
@@ -354,3 +352,13 @@ screenData7     .byte $ff, $62, 40  ; time bar
                 .byte $00 ;end
 
 zpAddressesUsed .null ZERO_PAGE_ADDRESSES_MAIN, relocator.ZERO_PAGE_ADDRESSES_RELOC, memalloc.ZERO_PAGE_ADDRESSES_MEMALLOC
+
+                .cerror * > $a000, "the code for ROML exceeds 8 KB"
+
+; Only called while the cartridge is mapped with $01 = $37, so this part can live
+; in ROMH, in the copy of BASIC the firmware puts there. A 6510 bus trace of the
+; cartridge starting PSID, RSID, BASIC and multi-song tunes never read $ABE8-$AFFF.
+                * = $ac00
+detection       .binclude 'detectionwrapper.asm'
+sidFx           .binclude 'sidfx.asm'
+                .cerror * > $b000, "the code for ROMH must end below the song lengths at $B000"
