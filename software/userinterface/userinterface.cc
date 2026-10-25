@@ -81,11 +81,11 @@ static const char *helptext =
     #ifndef RECOVERYAPP
         "F4:         Show System Information\n"
         "F6:         Search Online Archive\n"
-        "C= A:       Toggle Assembly64/CommoServe\n"
+        "C= W:       Toggle archive server\n"
     #endif
         "\n"
         "SPACE:      Select file / directory\n"
-        "C= 2:       Select all\n"
+        "C= A:       Select all\n"
         "C= N:       Deselect all\n"
         "C= C:       Copy current selection\n"
         "C= V:       Paste selection here\n"

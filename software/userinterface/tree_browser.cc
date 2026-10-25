@@ -548,7 +548,7 @@ int TreeBrowser :: handle_key(int c)
         case KEY_SPACE: // space = select
         	state->select_one();
         	break;
-        case KEY_CTRL_2: // select all
+        case KEY_CTRL_A: // select all
             state->select_all(true);
             break;
         case KEY_CTRL_N: // select none
@@ -570,7 +570,7 @@ int TreeBrowser :: handle_key(int c)
             user_interface->cfg->effectuate();
             state->refresh = true;
             break;
-        case KEY_CTRL_A: // toggle online search server
+        case KEY_CTRL_W: // toggle online search server
         {
             toggle_assembly_search_server(user_interface, false);
             int server = user_interface->cfg->get_value(CFG_USERIF_SEARCH_SERVER);

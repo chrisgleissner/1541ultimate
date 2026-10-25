@@ -149,7 +149,7 @@ int AssemblySearch :: handle_key(int c)
 {
     int ret = 0;
 
-    if (c == KEY_CTRL_A) {
+    if (c == KEY_CTRL_W) {
         toggle_assembly_search_server(user_interface, true);
         while (state->level > 0) {
             state->level_up();
