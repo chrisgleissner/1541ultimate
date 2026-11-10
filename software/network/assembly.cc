@@ -2,9 +2,7 @@
 #include <sys/socket.h>
 #include "netdb.h"
 #include "pattern.h"
-#include "u64.h"
 
-#define HOSTNAME      "hackerswithstyle.se"
 #define HOSTPORT      80
 #define URL_SEARCH    "/leet/search/aql?query="
 #define URL_PATTERNS  "/leet/search/aql/presets"
@@ -12,6 +10,20 @@
 #define URL_DOWNLOAD  "/leet/search/bin"
 
 Assembly assembly;
+
+void Assembly :: set_server(const char *host, const char *client, bool clear_presets)
+{
+    if (same_server(host, client)) {
+        return;
+    }
+    strncpy(hostname, host, sizeof(hostname) - 1);
+    hostname[sizeof(hostname) - 1] = 0;
+    strncpy(client_id, client, sizeof(client_id) - 1);
+    client_id[sizeof(client_id) - 1] = 0;
+    if (clear_presets) {
+        this->clear_presets();
+    }
+}
 
 #include "attachment_writer.h"
 void write_to_temp_a64(HTTPReqMessage *req, HTTPRespMessage *resp)
@@ -32,20 +44,14 @@ int Assembly :: connect_to_server(void)
     InitReqMessage(&this->response);
     this->response.usedAsResponseFromServer = 1;
 
-#if U64==2    
-    if (!(U64II_BLACKBOARD & 1)) {
-        return -1;
-    }
-#endif
-
     // setup the connection
-    int result = gethostbyname_r(HOSTNAME, &my_host, buffer, 1024, &ret_host, &error);
+    int result = gethostbyname_r(hostname, &my_host, buffer, 1024, &ret_host, &error);
     if (result) {
         printf("Result Get HostName: %d\n", result);
     }
 
     if (!ret_host) {
-        printf("Could not resolve host '%s'.\n", HOSTNAME);
+        printf("Could not resolve host '%s'.\n", hostname);
         return -1;
     }
 
@@ -80,20 +86,17 @@ void Assembly :: close_connection(void)
 
 JSON *Assembly :: get_presets(void)
 {
-    static const char request[] = 
-        "GET " URL_PATTERNS " HTTP/1.1\r\n"
-        "Accept-encoding: identity\r\n"
-        "Host: " HOSTNAME "\r\n"
-        "User-Agent: Assembly Query\r\n"
-        "Client-Id: Ultimate\r\n"
-        "Connection: close\r\n"
-        "\r\n";
+    mstring request("GET " URL_PATTERNS " HTTP/1.1\r\nAccept-encoding: identity\r\nHost: ");
+    request += hostname;
+    request += "\r\nUser-Agent: Assembly Query\r\nClient-Id: ";
+    request += client_id;
+    request += "\r\nConnection: close\r\n\r\n";
 
     if (presets) {
         return presets;
     }
     if (connect_to_server() >= 0) {
-        send(this->socket_fd, request, strlen(request), MSG_DONTWAIT);
+        send(this->socket_fd, request.c_str(), request.length(), MSG_DONTWAIT);
         presets = receive_json();
         return presets;
     }
@@ -124,13 +127,11 @@ JSON *Assembly :: send_query(const char *query)
 
     mstring request("GET " URL_SEARCH);
     request += encoded.c_str();
-    request += " HTTP/1.1\r\n"
-        "Accept-encoding: identity\r\n"
-        "Host: " HOSTNAME "\r\n"
-        "User-Agent: Assembly Query\r\n"
-        "Client-Id: Ultimate\r\n"
-        "Connection: close\r\n"
-        "\r\n";
+    request += " HTTP/1.1\r\nAccept-encoding: identity\r\nHost: ";
+    request += hostname;
+    request += "\r\nUser-Agent: Assembly Query\r\nClient-Id: ";
+    request += client_id;
+    request += "\r\nConnection: close\r\n\r\n";
 
     if (connect_to_server() >= 0) {
         send(this->socket_fd, request.c_str(), request.length(), MSG_DONTWAIT);
@@ -171,13 +172,11 @@ JSON *Assembly :: request_entries(const char *id, int cat)
     char buffer[64];
     sprintf(buffer, "GET " URL_ENTRIES "/%s/%d", enc_id.c_str(), cat);
     mstring request(buffer);
-    request += " HTTP/1.1\r\n"
-        "Accept-encoding: identity\r\n"
-        "Host: " HOSTNAME "\r\n"
-        "User-Agent: Assembly Query\r\n"
-        "Client-Id: Ultimate\r\n"
-        "Connection: close\r\n"
-        "\r\n";
+    request += " HTTP/1.1\r\nAccept-encoding: identity\r\nHost: ";
+    request += hostname;
+    request += "\r\nUser-Agent: Assembly Query\r\nClient-Id: ";
+    request += client_id;
+    request += "\r\nConnection: close\r\n\r\n";
 
     if (connect_to_server() >= 0) {
         send(this->socket_fd, request.c_str(), request.length(), MSG_DONTWAIT);
@@ -215,13 +214,11 @@ void Assembly :: request_binary(const char *path, const char *filename)
         request += "/";
         url_encode(filename, request);
     }
-    request += " HTTP/1.1\r\n"
-        "Accept-encoding: identity\r\n"
-        "Host: " HOSTNAME "\r\n"
-        "User-Agent: Assembly Query\r\n"
-        "Client-Id: Ultimate\r\n"
-        "Connection: close\r\n"
-        "\r\n";
+    request += " HTTP/1.1\r\nAccept-encoding: identity\r\nHost: ";
+    request += hostname;
+    request += "\r\nUser-Agent: Assembly Query\r\nClient-Id: ";
+    request += client_id;
+    request += "\r\nConnection: close\r\n\r\n";
 
     if (connect_to_server() >= 0) { // resets userContext to NULL
         send(this->socket_fd, request.c_str(), request.length(), MSG_DONTWAIT);

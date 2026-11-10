@@ -35,7 +35,10 @@ speedupCounter
                 lda #$01
                 sta speedUpFrame
 endAdjust
-+               ldx #$03
++               inc elapsedSec          ; binary seconds, the seek target is compared against it
+                bne secCounted
+                inc elapsedSec + 1
+secCounted      ldx #$03
 -               lda time,x
                 inc time,x
                 cmp limit,x
@@ -89,6 +92,8 @@ PAL             lda #50 - 1
 resetClock      lda #$00
                 sta speedUpFrame
                 sta delayFrame
+                sta elapsedSec
+                sta elapsedSec + 1
 
                 ldx #$03
                 lda #'0'
@@ -109,6 +114,8 @@ clockAdjustValues
 
 clockAdjust     .word 7
 adjustCounter   .word 0
+
+elapsedSec      .byte 0, 0
 
 framesPerSec    .byte 50 - 1
 frameCounter    .byte 0

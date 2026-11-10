@@ -46,6 +46,7 @@ public:
 #define KEY_CTRL_O 0x0F
 #define KEY_CTRL_P 0x10
 #define KEY_CTRL_V 0x16
+#define KEY_CTRL_W 0x17
 
 // Combinations that cannot use their ASCII control code, because that code is
 // already a discrete key here. C= plus a digit has no ASCII control code at

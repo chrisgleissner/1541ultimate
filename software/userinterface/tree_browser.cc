@@ -20,6 +20,7 @@
 #include "monitor_init.h"
 #include "subsys.h"
 #include "c64.h"        // MENU_C64_RESET, for the C=+R reset shortcut
+#include <string.h>
 
 #include "stream_textlog.h"
 extern StreamTextLog textLog; // the global log
@@ -548,8 +549,8 @@ int TreeBrowser :: handle_key(int c)
         	state->select_one();
         	break;
         case KEY_CTRL_A: // select all
-        	state->select_all(true);
-        	break;
+            state->select_all(true);
+            break;
         case KEY_CTRL_N: // select none
         	state->select_all(false);
         	break;
@@ -569,6 +570,15 @@ int TreeBrowser :: handle_key(int c)
             user_interface->cfg->effectuate();
             state->refresh = true;
             break;
+        case KEY_CTRL_W: // toggle online search server
+        {
+            toggle_assembly_search_server(user_interface, false);
+            int server = user_interface->cfg->get_value(CFG_USERIF_SEARCH_SERVER);
+            const char *message = server == 1 ? "Server: CommoServe" :
+                                  server == 2 ? "Server: Custom" : "Server: Assembly64";
+            window->getScreen()->set_status(message, user_interface->color_status);
+            break;
+        }
         case KEY_RETURN: // CR = select
             reset_quick_seek();
             context(0);

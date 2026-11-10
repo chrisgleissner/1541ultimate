@@ -6,6 +6,56 @@
 #include "assembly_entry.h"
 #include "assembly.h"
 
+static void set_assembly_search_server(UserInterface *ui, bool search_open)
+{
+    int server = ui->cfg->get_value(CFG_USERIF_SEARCH_SERVER);
+    const char *host = server == 1 ? "commoserve.files.commodore.net" :
+                       server == 2 ? ui->cfg->get_string(CFG_USERIF_SEARCH_HOST) : "hackerswithstyle.se";
+#if U64 == 2
+    const char *client = server == 1 ? "Commodore" : "Spiffy";
+#else
+    const char *client = server == 1 ? "Commodore" : "Ultimate";
+#endif
+    if (!assembly.same_server(host, client)) {
+        if (search_open) {
+            assembly.set_server(host, client, false);
+            assembly_gui.markRootStale();
+        } else {
+            assembly_gui.resetRoot();
+            assembly.set_server(host, client);
+        }
+    }
+}
+
+void configure_assembly_search_server(UserInterface *ui)
+{
+    set_assembly_search_server(ui, false);
+}
+
+void toggle_assembly_search_server(UserInterface *ui, bool search_open)
+{
+    int server = ui->cfg->get_value(CFG_USERIF_SEARCH_SERVER);
+    if (server == 0) {
+        server = 1;
+    } else if (server == 1) {
+        const char *custom_host = ui->cfg->get_string(CFG_USERIF_SEARCH_HOST);
+        server = custom_host && *custom_host && strcmp(custom_host, "hackerswithstyle.se") ? 2 : 0;
+    } else {
+        server = 0;
+    }
+    ui->cfg->set_value(CFG_USERIF_SEARCH_SERVER, server);
+    ui->cfg->write();
+    set_assembly_search_server(ui, search_open);
+}
+
+void AssemblyInGui :: prepareRoot(void)
+{
+    if (root_stale) {
+        resetRoot();
+        assembly.clear_presets();
+    }
+}
+
 /****************************/
 /* AssemblySearch UI Object */
 /****************************/
@@ -41,6 +91,16 @@ AssemblySearch :: AssemblySearch(UserInterface *ui, Browsable *root) : TreeBrows
     state->reload();
 }
 
+void AssemblySearch :: set_server_footer(void)
+{
+    int server = user_interface->cfg->get_value(CFG_USERIF_SEARCH_SERVER);
+    const char *name = server == 1 ? "CommoServe" :
+                       server == 2 ? user_interface->cfg->get_string(CFG_USERIF_SEARCH_HOST) : "Assembly64";
+    char status[80];
+    sprintf(status, "Server: %s", name);
+    screen->set_status(status, user_interface->color_status);
+}
+
 AssemblySearch :: ~AssemblySearch()
 {
     printf("And there goes our Assembly browser!"); 
@@ -53,6 +113,7 @@ void AssemblySearch :: init(Screen *screen, Keyboard *k) // call on root!
 	window->draw_border();
 	keyb = k;
 	state->do_refresh();
+	set_server_footer();
 }
 
 // Using the base class function deinit, which destroys the window.
@@ -87,6 +148,17 @@ static const char *queryhelp =
 int AssemblySearch :: handle_key(int c)
 {
     int ret = 0;
+
+    if (c == KEY_CTRL_W) {
+        toggle_assembly_search_server(user_interface, true);
+        while (state->level > 0) {
+            state->level_up();
+        }
+        state->refresh = true;
+        state->do_refresh();
+        set_server_footer();
+        return 0;
+    }
     
     if ((c == KEY_BREAK) || (c == KEY_ESCAPE) || (c == '`')) {
         return MENU_CLOSE; // independent of level, it closes the search.
@@ -96,10 +168,13 @@ int AssemblySearch :: handle_key(int c)
     // This could also be handled by the tree browser, if we check for context menus and do 'into' when none exist.
     if (((c == KEY_RETURN) || (c == KEY_SPACE)) && (state->level == 1)) {
         state->into();
+        set_server_footer();
         return 0;
     }
     if (state->level >= 1) {
-        return TreeBrowser :: handle_key(c);
+        ret = TreeBrowser :: handle_key(c);
+        if (ret >= MENU_NOP) set_server_footer();
+        return ret;
     }
     switch(c) {
         case KEY_F8: // exit
@@ -183,6 +258,7 @@ int AssemblySearch :: handle_key(int c)
                 printf("Unhandled key: %b\n", c);
             }
     }    
+    if (ret >= MENU_NOP) set_server_footer();
     return ret;
 }
 

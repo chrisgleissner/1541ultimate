@@ -45,6 +45,8 @@
 #define CFG_USERIF_TEMP_AUTO_CLEANUP 0x0F
 #define CFG_USERIF_TEMP_USE_CACHE_SUBFOLDER 0x10
 #define CFG_USERIF_CBM_NAMES   0x11
+#define CFG_USERIF_SEARCH_SERVER 0x12
+#define CFG_USERIF_SEARCH_HOST   0x13
 
 typedef enum {
     e_keymap_default,
